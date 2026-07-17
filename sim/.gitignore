@@ -1,0 +1,12 @@
+# Rust build output
+/target
+**/*.rs.bk
+
+# Oracle / capture scratch (regenerated; not source)
+/scripts/__pycache__
+*.bin
+*.wav
+
+# Editor / OS noise
+.DS_Store
+*.swp

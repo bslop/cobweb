@@ -1,0 +1,33 @@
+# the seed emulator — a from-scratch, instrumentation-first Atari Jaguar emulator.
+#
+# Built to REPLACE BigPEmu for the Jaguar game-porting conveyor belt:
+#   * native Linux (no Wine), true multi-instance (no global lock),
+#   * real OP-composited screenshots (not DRAM dumps that lie),
+#   * a first-class debug API designed for Claude Code,
+#   * validated against BigPEmu as a regression oracle.
+[workspace]
+resolver = "2"
+members = [
+    "crates/jag-core",
+    "crates/jag-debug",
+    "crates/jag-headless",
+    "crates/jag-instance",
+    "crates/jagemu",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Cobweb contributors"]
+rust-version = "1.74"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+# Fast dev builds of the hot emulation loop while keeping debuggability.
+[profile.dev.package."jag-core"]
+opt-level = 2

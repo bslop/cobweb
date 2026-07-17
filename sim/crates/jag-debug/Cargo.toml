@@ -1,0 +1,10 @@
+[package]
+name = "jag-debug"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Disassemblers (68k + Jaguar RISC) and debug helpers over jag-core."
+
+[dependencies]
+jag-core = { path = "../jag-core" }

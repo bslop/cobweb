@@ -1,0 +1,9 @@
+[package]
+name = "jag-instance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Multi-instance isolation: per-instance state dirs, registry, no global lock."
+
+[dependencies]

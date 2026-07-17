@@ -1,0 +1,10 @@
+[package]
+name = "jag-headless"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Headless deterministic runner + true-OP screenshot (PNG) for jag-core."
+
+[dependencies]
+jag-core = { path = "../jag-core" }

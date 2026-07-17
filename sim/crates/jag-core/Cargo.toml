@@ -1,0 +1,15 @@
+[package]
+name = "jag-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Deterministic Atari Jaguar machine core (68000 + Tom + Jerry)."
+
+[lib]
+# No external dependencies: the core is std-only and self-contained so it stays
+# trivially embeddable, offline-buildable, and deterministic.
+
+[dependencies]
+
+[dev-dependencies]

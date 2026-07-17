@@ -1,0 +1,17 @@
+[package]
+name = "jagemu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "the seed emulator CLI — the Claude-native Atari Jaguar emulator driver."
+
+[[bin]]
+name = "jagemu"
+path = "src/main.rs"
+
+[dependencies]
+jag-core = { path = "../jag-core" }
+jag-headless = { path = "../jag-headless" }
+jag-instance = { path = "../jag-instance" }
+jag-debug = { path = "../jag-debug" }

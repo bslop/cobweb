@@ -1,0 +1,40 @@
+suite complete: True   VC modulus: 524   cycles/VC-tick: 846.6
+probe      mode    ticks     cycles cyc/instr  model  note
+vcmod      A           —          —         —      —  modulus=524
+null       A          77      65189         —      —  harness overhead per repetition
+null       B          78      66036         —      —  harness overhead per repetition
+nop        A         630     533366      1.00   1.00  local issue rate baseline
+nop        B         629     532520      1.00   1.00  local issue rate baseline
+move       A         629     532520      1.00   1.00  reg-to-reg MOVE stream (U-235 replication)
+move       B         629     532520      1.00   1.00  reg-to-reg MOVE stream (U-235 replication)
+moveq      A         629     532520      1.00   1.00  fast-write stream
+moveq      B         629     532520      1.00   1.00  fast-write stream
+adddep     A         630     533366      1.00   2.00  dependent ALU chain (bubble per op)
+adddep     B         629     532520      1.00   2.00  dependent ALU chain (bubble per op)
+addind     A         629     532520      1.00   1.00  interleaved ALU chains (no bubbles)
+addind     B         629     532520      1.00   1.00  interleaved ALU chains (no bubbles)
+ldsram     A         315     266683      1.00   1.50  internal load + consume pairs
+ldsram     B         314     265837      1.00   1.50  internal load + consume pairs
+ldidx      A         315     266683      1.00   3.00  indexed internal load + consume pairs
+ldidx      B         315     266683      1.00   3.00  indexed internal load + consume pairs
+lddram     A         316     267530      1.01   2.00  sequential DRAM load stream (page hits)
+lddram     B         315     266683      1.00   2.00  sequential DRAM load stream (page hits)
+ldstride   A          80      67729      1.00   2.50  2KB-strided DRAM loads (page misses)
+ldstride   B          80      67729      1.00   2.50  2KB-strided DRAM loads (page misses)
+stdram     A         316     267530      1.01   2.00  sequential DRAM store stream
+stdram     B         315     266683      1.00   2.00  sequential DRAM store stream
+divhot     A         122     103287      1.01   6.67  DIV + immediate consume units (3 instr/unit)
+divhot     B         121     102440      1.00   6.67  DIV + immediate consume units (3 instr/unit)
+divsh      A         393     332719      1.00   1.00  DIV + 17-instr shadow units (20 instr/unit)
+divsh      B         393     332719      1.00   1.00  DIV + 17-instr shadow units (20 instr/unit)
+jr         A         468     396215      1.00   2.33  tight taken-JR loop (movei + 512x3)
+jr         B         468     396215      1.00   2.33  tight taken-JR loop (movei + 512x3)
+mainmov    A          80      67729      1.02  13.50  GPU-in-main MOVE body (+call overhead)
+mainnop    A          80      67729      1.02  13.50  GPU-in-main NOP body (+call overhead)
+
+derived CAL knobs:
+  Lat::ALU bubble (adddep - addind): 0.00
+  external fetch tax (mainmov / move): 1.02
+  DRAM seq load, cyc/load (2 instr/pair): 2.01
+  DRAM strided load, cyc/load: 2.00
+  68k bus noise (nop A/B): 1.00
