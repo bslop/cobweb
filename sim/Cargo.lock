@@ -33,3 +33,10 @@ dependencies = [
  "jag-headless",
  "jag-instance",
 ]
+
+[[package]]
+name = "jas"
+version = "0.1.0"
+dependencies = [
+ "jag-core",
+]

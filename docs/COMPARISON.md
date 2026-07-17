@@ -75,12 +75,14 @@ carries a restrictive license (provenance audit in `OSS_RELEASE.md`).
 
 ## Designed and in build order (the rest of the suite)
 
-8. **jas** — an assembler that refuses to assemble lies: every hazard above
-   as a default-on *error* with a fix-it, real diagnostics, a real
-   section/relocation model with **SRAM overlay groups as first-class
-   objects**, register-plan checking, rmac-compatibility mode — alongside
-   rmac, not against it (rmac faithfully preserves MadMac, which is exactly
-   what makes a second, hazard-aware assembler possible and compatible).
+8. **jas** — an assembler that refuses to assemble lies. **v1 shipped**
+   (`sim/crates/jas/`): the full GPU+DSP instruction set with rmac-compatible
+   syntax, and a hazard pass that errors — with fix-its — on bug-13
+   write-after-write, the indexed-store erratum, JUMP/MOVEI in a delay slot,
+   and out-of-range branches. Its encoding is proven by assembling programs
+   and running them in jsim, so assembler and simulator cannot disagree.
+   Alongside rmac, not against it. Still to come: a section/relocation model
+   with SRAM overlay groups as first-class objects, and macro/include support.
 9. **jtest** — the shadow harness productized: new code and reference run
    side-by-side on device/simulator with byte-parity gates; differential
    runs across jsim profiles, BigPEmu, and hardware.

@@ -1,0 +1,179 @@
+//! jas integration tests. Two kinds:
+//!  1. Encoding is proven by ASSEMBLING a program and RUNNING it in jsim — the
+//!     assembler and the emulator can never silently disagree about an opcode.
+//!  2. The hazard pass is proven by asserting specific programs are rejected
+//!     with the right diagnostic (and their fixed forms accepted).
+
+use jag_core::{mem, Bus, Risc, RiscKind};
+use jas::{assemble, Level, Options, Target};
+
+/// Assemble GPU source, upload to GPU SRAM, run, return the bus.
+fn run_gpu(src: &str) -> (Bus, jas::Assembled) {
+    let out = assemble(src, &Options::default());
+    assert_eq!(out.errors(), 0, "assembly errors: {:#?}", out.diags);
+    let mut bus = Bus::new();
+    for (i, b) in out.bytes.iter().enumerate() {
+        bus.write8(mem::G_RAM + i as u32, *b);
+    }
+    bus.write32(mem::G_PC, mem::G_RAM);
+    bus.write32(mem::G_CTRL, mem::RISCGO);
+    let mut gpu = Risc::new(RiscKind::Gpu);
+    gpu.run(&mut bus, 500);
+    (bus, out)
+}
+
+fn errors_of(src: &str) -> Vec<String> {
+    let out = assemble(src, &Options::default());
+    out.diags
+        .iter()
+        .filter(|d| d.level == Level::Error)
+        .map(|d| d.msg.clone())
+        .collect()
+}
+
+#[test]
+fn assembles_and_runs_arithmetic() {
+    // moveq/add/shlq/store round-trip: 5+3=8, <<2 = 32, store to DRAM.
+    let (mut bus, _) = run_gpu(
+        "        .gpu\n\
+         start:  moveq #5,r1\n\
+         \x20       moveq #3,r2\n\
+         \x20       add r1,r2\n\
+         \x20       shlq #2,r2\n\
+         \x20       movei #$00100000,r3\n\
+         \x20       store r2,(r3)\n\
+         \x20       movei #$00F02114,r4\n\
+         \x20       moveq #0,r5\n\
+         \x20       store r5,(r4)\n\
+         \x20       nop\n",
+    );
+    assert_eq!(bus.read32(0x0010_0000), 32);
+}
+
+#[test]
+fn assembles_jr_loop_with_labels() {
+    // Sum 1..5 with a JR back-edge and a filled delay slot; forward + backward
+    // label resolution both exercised.
+    let src = "        .gpu\n\
+        \x20       moveq #0,r1\n\
+        \x20       moveq #5,r2\n\
+        loop:   add r2,r1\n\
+        \x20       subq #1,r2\n\
+        \x20       cmpq #0,r2\n\
+        \x20       jr ne,loop\n\
+        \x20       nop\n\
+        \x20       movei #$00100000,r3\n\
+        \x20       store r1,(r3)\n\
+        \x20       movei #$00F02114,r4\n\
+        \x20       moveq #0,r5\n\
+        \x20       store r5,(r4)\n\
+        \x20       nop\n";
+    let (mut bus, _) = run_gpu(src);
+    assert_eq!(bus.read32(0x0010_0000), 15);
+}
+
+#[test]
+fn movei_immediate_word_order() {
+    // MOVEI must emit opcode, low16, high16 (each big-endian) so jsim loads the
+    // full 32-bit constant.
+    let out = assemble("        .gpu\n        movei #$CAFEBABE,r1\n", &Options::default());
+    assert_eq!(out.errors(), 0);
+    // bytes: [op_hi op_lo][BA BE][CA FE]
+    assert_eq!(&out.bytes[2..6], &[0xBA, 0xBE, 0xCA, 0xFE]);
+}
+
+// ── hazard pass ──────────────────────────────────────────────────────────────
+
+#[test]
+fn rejects_waw_into_load_shadow() {
+    // load into r2, then overwrite r2 before reading it = bug 13.
+    let errs = errors_of(
+        "        .gpu\n\
+         \x20       movei #$100000,r3\n\
+         \x20       load (r3),r2\n\
+         \x20       moveq #3,r2\n",
+    );
+    assert!(errs.iter().any(|e| e.contains("bug 13")), "got: {errs:?}");
+}
+
+#[test]
+fn accepts_waw_guarded_by_read() {
+    // reading r2 (or r2,r2) settles the scoreboard before the overwrite.
+    let out = assemble(
+        "        .gpu\n\
+         \x20       movei #$100000,r3\n\
+         \x20       load (r3),r2\n\
+         \x20       or r2,r2\n\
+         \x20       moveq #3,r2\n",
+        &Options::default(),
+    );
+    assert_eq!(out.errors(), 0, "{:#?}", out.diags);
+}
+
+#[test]
+fn rejects_indexed_store_of_unsettled_reg() {
+    // div into r2, then store r2 via (r14+n) without touching it = erratum.
+    let errs = errors_of(
+        "        .gpu\n\
+         \x20       movei #$100000,r14\n\
+         \x20       moveq #20,r2\n\
+         \x20       moveq #3,r1\n\
+         \x20       div r1,r2\n\
+         \x20       store r2,(r14+1)\n",
+    );
+    assert!(errs.iter().any(|e| e.contains("errata")), "got: {errs:?}");
+}
+
+#[test]
+fn rejects_movei_in_delay_slot() {
+    let errs = errors_of(
+        "        .gpu\n\
+         loop:   jr loop\n\
+         \x20       movei #1,r1\n",
+    );
+    assert!(errs.iter().any(|e| e.contains("MOVEI in a delay slot")), "got: {errs:?}");
+}
+
+#[test]
+fn rejects_two_sequential_jumps() {
+    let errs = errors_of(
+        "        .gpu\n\
+         a:      jr a\n\
+         b:      jr b\n\
+         \x20       nop\n",
+    );
+    assert!(errs.iter().any(|e| e.contains("two sequential jumps")), "got: {errs:?}");
+}
+
+#[test]
+fn rejects_far_jr() {
+    // a jr whose target is far past the 5-bit word range.
+    let mut src = String::from("        .gpu\nstart:  jr far\n        nop\n");
+    for _ in 0..40 {
+        src.push_str("        nop\n");
+    }
+    src.push_str("far:    nop\n");
+    let errs = errors_of(&src);
+    assert!(errs.iter().any(|e| e.contains("out of range")), "got: {errs:?}");
+}
+
+#[test]
+fn dsp_target_encodes_dsp_only_ops() {
+    // subqmod/mirror are DSP-only and must not error under --dsp.
+    let opts = Options { target: Target::Dsp, org: 0xF1_B000, ..Options::default() };
+    let out = assemble("        .dsp\n        subqmod #4,r2\n        mirror r3\n", &opts);
+    assert_eq!(out.errors(), 0, "{:#?}", out.diags);
+}
+
+#[test]
+fn equ_and_expressions() {
+    let out = assemble(
+        "        .gpu\n\
+         BASE    equ $F03000\n\
+         \x20       movei #BASE+16*4,r1\n",
+        &Options::default(),
+    );
+    assert_eq!(out.errors(), 0, "{:#?}", out.diags);
+    // BASE + 64 = 0xF03040 -> low $3040, high $00F0
+    assert_eq!(&out.bytes[2..6], &[0x30, 0x40, 0x00, 0xF0]);
+}

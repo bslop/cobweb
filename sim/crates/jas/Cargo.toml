@@ -1,0 +1,19 @@
+[package]
+name = "jas"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "jas — the JRISC assembler that refuses to assemble hazards"
+
+[[bin]]
+name = "jas"
+path = "src/main.rs"
+
+[lib]
+name = "jas"
+path = "src/lib.rs"
+
+[dev-dependencies]
+jag-core = { path = "../jag-core" }

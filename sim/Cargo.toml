@@ -13,6 +13,7 @@ members = [
     "crates/jag-headless",
     "crates/jag-instance",
     "crates/jagemu",
+    "crates/jas",
 ]
 
 [workspace.package]
