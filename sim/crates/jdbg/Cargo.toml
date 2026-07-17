@@ -1,0 +1,20 @@
+[package]
+name = "jdbg"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "jdbg — source-level JRISC debugger (no camera required)"
+
+[[bin]]
+name = "jdbg"
+path = "src/main.rs"
+
+[lib]
+name = "jdbg"
+path = "src/lib.rs"
+
+[dependencies]
+jag-core = { path = "../jag-core" }
+jas = { path = "../jas" }

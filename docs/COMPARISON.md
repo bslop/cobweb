@@ -73,7 +73,7 @@ Raptor/JagStudio, and U-235 are closed. Cobweb is being released openly on
 a platform Hasbro placed in the public domain in 1999 — nothing in the tree
 carries a restrictive license (provenance audit in `OSS_RELEASE.md`).
 
-## Designed and in build order (the rest of the suite)
+## The rest of the suite — all seven components now have a working v1
 
 8. **jas** — an assembler that refuses to assemble lies. **v1 shipped**
    (`sim/crates/jas/`): the full GPU+DSP instruction set with rmac-compatible
@@ -111,10 +111,14 @@ carries a restrictive license (provenance audit in `OSS_RELEASE.md`).
     and never shipped), bit-exact fixed-point intrinsics, explicit SRAM/DRAM
     placement, and a 68000-strict backend that makes the known m68k-gcc booby
     traps impossible by construction.
-12. **jdbg** — one debug frontend over Skunkboard/GameDrive *and* the
-    emulator: crash forensics with source lines, on both RISC chips. The
-    current state of the art for a hardware crash is pointing a camera at
-    the TV; that ends.
+12. **jdbg** — source-level debugging, no camera required. **v1 shipped**
+    (`sim/crates/jdbg/`): assembles JRISC through jas (keeping the
+    address→source-line map jas already produces), runs it in jsim, and lets
+    you set breakpoints and step **by source line** — not raw address, which is
+    all jagemu can do — with live register inspection and a crash report that
+    names the source line your PC died on. The emulator backend ships now; the
+    same `Session` API is what a Skunkboard/GameDrive backend implements next,
+    so one frontend drives silicon and simulator identically.
 13. **jprof** — see where the cycles go. **v1 shipped** (`sim/crates/jprof/`):
     turns jsim's per-cause stall attribution into a profile — cycles broken
     into issue vs each stall class vs bus cost, IPC, and a plain-language
