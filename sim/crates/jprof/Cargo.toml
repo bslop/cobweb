@@ -1,0 +1,21 @@
+[package]
+name = "jprof"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "jprof — where did the cycles go? per-cause stall attribution and build-to-build diff, from jsim"
+
+[[bin]]
+name = "jprof"
+path = "src/main.rs"
+
+[lib]
+name = "jprof"
+path = "src/lib.rs"
+
+[dependencies]
+jag-core = { path = "../jag-core" }
+jas = { path = "../jas" }
+jtest = { path = "../jtest" }

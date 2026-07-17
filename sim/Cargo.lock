@@ -60,6 +60,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "jprof"
+version = "0.1.0"
+dependencies = [
+ "jag-core",
+ "jas",
+ "jtest",
+]
+
+[[package]]
 name = "jtest"
 version = "0.1.0"
 dependencies = [

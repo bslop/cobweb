@@ -115,8 +115,13 @@ carries a restrictive license (provenance audit in `OSS_RELEASE.md`).
     emulator: crash forensics with source lines, on both RISC chips. The
     current state of the art for a hardware crash is pointing a camera at
     the TV; that ends.
-13. **jprof** — see the frame: 68k/GPU/Blitter/OP occupancy timelines,
-    unbiased flip-interval histograms, deterministic replay walks.
+13. **jprof** — see where the cycles go. **v1 shipped** (`sim/crates/jprof/`):
+    turns jsim's per-cause stall attribution into a profile — cycles broken
+    into issue vs each stall class vs bus cost, IPC, and a plain-language
+    bottleneck diagnosis ("12.9% taken-jump refill — run jopt"). `jprof diff`
+    shows the per-cause delta between two builds, so you can prove an
+    optimization moved the number that matters instead of guessing. Still to
+    come: per-region hotspots and full 68k/GPU/Blitter/OP frame timelines.
 14. **Documentation as a product** — every hazard, every timing fact, every
     workflow, written for developers, with hardware provenance tags, kept
     honest by CI against the simulator. Nothing untouched.

@@ -63,7 +63,7 @@ live in `calib/` (bench logs) and `sim/crates/jag-core/src/risc/timing.rs`
 | **jopt** | Scheduler, **bytes first**: every transform re-assembled through jas and proven behavior-identical in jsim before it is kept | **v1 landed** — `sim/crates/jopt/`: delay-slot filling with a jsim equivalence certificate (jas rejects a transform that becomes a hazard; jsim rejects one that changes behavior). Found a redundant-cmp + slot-fill and proved it. (Div-shadow packing, software-pipelined back edges: next.) |
 | **jcc** | The compiler: a restricted systems language → **auditable** JRISC (jas re-checks every emit for hazards), static register allocation, whole-program SRAM budget ledger | **v1 landed** — `sim/crates/jcc/`: int vars, arithmetic, if/else, while, store; compiles to hazard-clean JRISC verified by running in jsim. 6 tests. (Overlay streaming, fixed-point intrinsics, DRAM placement, 68k backend: next.) |
 | **jdbg** | One debug frontend over Skunkboard/GameDrive hardware *and* the emulator: crash forensics, source-level stepping on both chips | planned |
-| **jprof** | See the frame: 68k/GPU/Blitter/OP occupancy timelines, flip-interval histograms, deterministic replay walks | planned |
+| **jprof** | See where the cycles go: per-cause cost breakdown (issue vs stalls vs bus), IPC, plain-language bottleneck diagnosis, and build-to-build diff | **v1 landed** — `sim/crates/jprof/`: turns jsim's stall attribution into a profile that names the bottleneck (it surfaced vbcc's 26%-in-jump-refill) and proves whether an optimization moved it. 3 tests. (Per-region hotspots, frame timelines: next.) |
 
 Build order (from the wishlist): jsim → jas → jtest → jopt → jcc → jdbg/jprof.
 **The pilot project** — live kernels, a running shadow harness,
