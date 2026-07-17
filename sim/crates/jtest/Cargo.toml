@@ -1,0 +1,20 @@
+[package]
+name = "jtest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "jtest — differential verification harness for JRISC code (shadow diff, fidelity-profile diff, golden vectors)"
+
+[[bin]]
+name = "jtest"
+path = "src/main.rs"
+
+[lib]
+name = "jtest"
+path = "src/lib.rs"
+
+[dependencies]
+jag-core = { path = "../jag-core" }
+jas = { path = "../jas" }

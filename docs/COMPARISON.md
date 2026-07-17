@@ -83,9 +83,14 @@ carries a restrictive license (provenance audit in `OSS_RELEASE.md`).
    and running them in jsim, so assembler and simulator cannot disagree.
    Alongside rmac, not against it. Still to come: a section/relocation model
    with SRAM overlay groups as first-class objects, and macro/include support.
-9. **jtest** — the shadow harness productized: new code and reference run
-   side-by-side on device/simulator with byte-parity gates; differential
-   runs across jsim profiles, BigPEmu, and hardware.
+9. **jtest** — verification as a product. **v1 shipped** (`sim/crates/jtest/`):
+   runs a program (flat `.bin` or jas-assembled source) in jsim and compares a
+   captured memory region and the register file. `jtest diff` is the shadow
+   harness (candidate vs reference); `jtest profiles` runs the same code under
+   `silicon` and `bigpemu` and reports divergence — catching code that is
+   hardware-correct but emulator-wrong *before* a hardware session,
+   deterministically. `jtest golden` is a one-command regression gate. Still to
+   come: on-device dual-compute runs and BigPEmu/hardware differential.
 10. **jopt** — a superoptimizing scheduler that mechanizes the community's
     hand-scheduling playbook (slot filling with liveness proofs, DIV-shadow
     packing, software-pipelined back edges), optimizing **SRAM bytes first,
