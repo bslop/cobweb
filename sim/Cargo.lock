@@ -42,6 +42,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "jcc"
+version = "0.1.0"
+dependencies = [
+ "jag-core",
+ "jas",
+ "jtest",
+]
+
+[[package]]
 name = "jopt"
 version = "0.1.0"
 dependencies = [

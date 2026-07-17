@@ -100,12 +100,17 @@ carries a restrictive license (provenance audit in `OSS_RELEASE.md`).
     first real input it found a redundant-compare + slot-fill and proved it
     safe. Still to come: DIV-shadow packing, software-pipelined back edges, and
     a cycle-cost objective under the calibrated bus model.
-11. **jcc** — the compiler: a restricted systems language compiling to
-    auditable JRISC with explicit SRAM/DRAM placement, a whole-program SRAM
-    budget ledger, bit-exact fixed-point intrinsics, **automatic overlay
-    streaming past the 4KB/8KB ceiling** (the compiler Atari promised in
-    1995 and never shipped), and a 68000-strict backend that makes the
-    known m68k-gcc booby traps impossible by construction.
+11. **jcc** — the compiler. **v1 shipped** (`sim/crates/jcc/`): a restricted,
+    statically allocated systems language (int variables, arithmetic, if/else,
+    while, store) compiling to JRISC that is *auditable by construction* — jcc
+    feeds its own output back through jas, so any hazard it emits is a compile
+    error, not silent wrong silicon. It reports a whole-program SRAM budget
+    ledger against the 4 KB local RAM, and its output composes with jopt and
+    runs in jsim. Still to come — the headline features: **automatic overlay
+    streaming past the 4 KB/8 KB ceiling** (the compiler Atari promised in 1995
+    and never shipped), bit-exact fixed-point intrinsics, explicit SRAM/DRAM
+    placement, and a 68000-strict backend that makes the known m68k-gcc booby
+    traps impossible by construction.
 12. **jdbg** — one debug frontend over Skunkboard/GameDrive *and* the
     emulator: crash forensics with source lines, on both RISC chips. The
     current state of the art for a hardware crash is pointing a camera at

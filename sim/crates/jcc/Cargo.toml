@@ -1,0 +1,23 @@
+[package]
+name = "jcc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "jcc — a restricted systems language that compiles to auditable, hazard-checked JRISC"
+
+[[bin]]
+name = "jcc"
+path = "src/main.rs"
+
+[lib]
+name = "jcc"
+path = "src/lib.rs"
+
+[dependencies]
+jag-core = { path = "../jag-core" }
+jas = { path = "../jas" }
+
+[dev-dependencies]
+jtest = { path = "../jtest" }
