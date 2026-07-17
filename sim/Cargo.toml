@@ -15,6 +15,7 @@ members = [
     "crates/jagemu",
     "crates/jas",
     "crates/jtest",
+    "crates/jopt",
 ]
 
 [workspace.package]

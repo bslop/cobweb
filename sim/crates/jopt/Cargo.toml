@@ -1,0 +1,21 @@
+[package]
+name = "jopt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "jopt — a JRISC scheduler that only keeps transforms jsim proves equivalent (bytes first, then cycles)"
+
+[[bin]]
+name = "jopt"
+path = "src/main.rs"
+
+[lib]
+name = "jopt"
+path = "src/lib.rs"
+
+[dependencies]
+jag-core = { path = "../jag-core" }
+jas = { path = "../jas" }
+jtest = { path = "../jtest" }

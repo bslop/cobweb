@@ -91,10 +91,15 @@ carries a restrictive license (provenance audit in `OSS_RELEASE.md`).
    hardware-correct but emulator-wrong *before* a hardware session,
    deterministically. `jtest golden` is a one-command regression gate. Still to
    come: on-device dual-compute runs and BigPEmu/hardware differential.
-10. **jopt** — a superoptimizing scheduler that mechanizes the community's
-    hand-scheduling playbook (slot filling with liveness proofs, DIV-shadow
-    packing, software-pipelined back edges), optimizing **SRAM bytes first,
-    then cycles**, with machine-checked equivalence certificates.
+10. **jopt** — the scheduler that cannot ship a wrong answer. **v1 shipped**
+    (`sim/crates/jopt/`): it fills wasted delay slots, and every transform is
+    re-assembled through jas (so hazards and `jr` ranges re-validate) and run
+    in jsim against the original — kept only if the captured memory and
+    registers are byte-identical. That equivalence certificate is the whole
+    point: jopt can try aggressively because jsim catches any mistake. On its
+    first real input it found a redundant-compare + slot-fill and proved it
+    safe. Still to come: DIV-shadow packing, software-pipelined back edges, and
+    a cycle-cost objective under the calibrated bus model.
 11. **jcc** — the compiler: a restricted systems language compiling to
     auditable JRISC with explicit SRAM/DRAM placement, a whole-program SRAM
     budget ledger, bit-exact fixed-point intrinsics, **automatic overlay
