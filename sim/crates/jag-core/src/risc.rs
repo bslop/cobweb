@@ -372,6 +372,13 @@ impl Risc {
             if !self.running {
                 break;
             }
+            // Service a pending interrupt between instructions (never in a
+            // jump's delay slot, which must run before the transfer). Done before
+            // the breakpoint check so an interrupt-vector target (e.g. an ISR
+            // entry) is caught rather than executed past.
+            if self.pending_jump.is_none() {
+                self.service_interrupt(bus);
+            }
             // PC breakpoint: stop before executing the marked instruction so the
             // caller can inspect registers at exactly that point. Not taken in a
             // delay slot (the transfer must complete first).
@@ -381,11 +388,6 @@ impl Risc {
             {
                 self.bp_hit = Some(self.pc);
                 break;
-            }
-            // Service a pending interrupt between instructions (never in a
-            // jump's delay slot, which must run before the transfer).
-            if self.pending_jump.is_none() {
-                self.service_interrupt(bus);
             }
             spent += self.step_one(bus);
             // The core can stop itself by clearing RISCGO via a STORE.

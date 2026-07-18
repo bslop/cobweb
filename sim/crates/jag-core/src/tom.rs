@@ -106,11 +106,23 @@ pub struct OpState {
     /// base object's top half-line `anchor_y`.
     pub anchor_x: i32,
     pub anchor_y: u16,
+    /// Does this field's object list contain a GPU (TYPE 2) object? Only then do
+    /// we walk the list on every scanline (to reach the GPU object even on lines
+    /// outside the bitmap canvas). Bitmap-only lists — every game that renders
+    /// today — keep the canvas-gated walk, byte-for-byte unchanged.
+    pub has_gpu_object: bool,
 }
 
 impl Default for OpState {
     fn default() -> Self {
-        OpState { started: false, width: 320, height: 240, anchor_x: 0, anchor_y: 0 }
+        OpState {
+            started: false,
+            width: 320,
+            height: 240,
+            anchor_x: 0,
+            anchor_y: 0,
+            has_gpu_object: false,
+        }
     }
 }
 
@@ -162,6 +174,11 @@ const LINE_W: usize = 720;
 
 /// GPU interrupt source for the Object Processor (G_FLAGS enable bit `4+3`=7).
 const OP_INT_SOURCE: u8 = 3;
+/// Ceiling on RISC ticks a GPU object's ISR may run synchronously before the OP
+/// gives up waiting for it — generous enough for a per-frame object ISR that
+/// builds a display list or drives the co-processor handshake, but bounded so a
+/// game that never clears the latch can't hang the field.
+const GPU_OBJ_ISR_BUDGET: u32 = 2_000_000;
 
 /// Render **one display scanline** of the Object Processor output into the
 /// persistent framebuffer (`bus.tom.fb`).
@@ -181,6 +198,17 @@ pub fn op_render_line(vc: u16, cpu: &mut M68k, gpu: &mut Risc, bus: &mut Bus) {
     }
     let (width, height, anchor_x, anchor_y) =
         (bus.tom.op.width, bus.tom.op.height, bus.tom.op.anchor_x, bus.tom.op.anchor_y);
+
+    // For lists containing a GPU (TYPE 2) object, walk on every scanline so the
+    // OP reaches the object even on lines outside the bitmap canvas. Bitmap-only
+    // lists keep the canvas-gated walk below, byte-for-byte unchanged.
+    let in_canvas = vc >= anchor_y && ((vc - anchor_y) / 2) < height as u16;
+    if bus.tom.op.has_gpu_object && !in_canvas {
+        let mut line = [0u16; LINE_W];
+        let mut written = [false; LINE_W];
+        op_walk_line(vc, anchor_x, &mut line, &mut written, cpu, gpu, bus);
+        return;
+    }
 
     // Map this half-line to a screen row anchored on the base object's top.
     if vc < anchor_y {
@@ -258,6 +286,40 @@ fn op_begin_field(bus: &mut Bus, fmt: PixFmt) {
     bus.tom.op.height = height;
     bus.tom.op.anchor_x = anchor_x;
     bus.tom.op.anchor_y = anchor_y;
+    bus.tom.op.has_gpu_object = list_has_gpu_object(bus, olp);
+}
+
+/// Structural scan of the object graph for a GPU (TYPE 2) object (both BRANCH
+/// paths explored). When present, the OP must walk the list every scanline so it
+/// reaches the GPU object even on lines outside the bitmap canvas.
+fn list_has_gpu_object(bus: &Bus, olp: u32) -> bool {
+    use std::collections::HashSet;
+    let mut seen: HashSet<u32> = HashSet::new();
+    let mut stack = vec![olp];
+    while let Some(addr) = stack.pop() {
+        let addr8 = addr & !7;
+        if !seen.insert(addr8) || seen.len() > 4096 {
+            continue;
+        }
+        let o = decode_obj(bus, addr8);
+        match o.otype {
+            2 => return true,
+            4 => {}
+            3 => {
+                if o.link != 0 {
+                    stack.push(o.link);
+                }
+                stack.push(addr8 + 8);
+            }
+            0 | 1 => {
+                if o.link != 0 {
+                    stack.push(o.link);
+                }
+            }
+            _ => stack.push(addr8 + 8),
+        }
+    }
+    false
 }
 
 /// Decode an object header (first phrase always; second phrase for BITMAP/SCALED).
@@ -394,6 +456,22 @@ fn op_walk_line(
                 bus.tom.win.w16(mem::OB2, (lo >> 16) as u16);
                 bus.tom.win.w16(mem::OB3, lo as u16);
                 gpu.raise_int(OP_INT_SOURCE);
+                // Suspend the OP and run the GPU's object ISR synchronously (TRM
+                // §3.3): give the GPU cycles until it services the object
+                // interrupt (clears the source-3 latch via INT_CLR) so the ISR's
+                // side effects — OBF, dynamic list edits, the co-processor
+                // handshake — are in place before the OP continues to the next
+                // phrase. Bounded so an unhandled object can't hang the field.
+                let op_enabled = gpu.running && gpu.flags & (1 << (4 + OP_INT_SOURCE)) != 0;
+                if op_enabled {
+                    let mut spent = 0u32;
+                    while spent < GPU_OBJ_ISR_BUDGET
+                        && gpu.int_latch & (1 << OP_INT_SOURCE) != 0
+                    {
+                        gpu.run(bus, 256);
+                        spent += 256;
+                    }
+                }
                 addr = addr8 + 8;
             }
             3 => {
