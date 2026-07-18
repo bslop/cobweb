@@ -46,11 +46,32 @@ fn main() -> ExitCode {
             "-c" => opts.object_mode = true,   // emit a relocatable object (.jo)
             "--no-hazard-check" => opts.check_hazards = false,
             "-Werror" => opts.warnings_as_errors = true,
+            "--gas" => opts.gas = Some(true),   // force the GNU-as frontend
+            "--no-gas" => opts.gas = Some(false),
+            "--emit-gas" => {
+                // debug: print the GAS→native normalization and exit
+                let inp = it.clone().find(|a| !a.starts_with('-')).cloned();
+                if let Some(p) = inp.or_else(|| input.clone()) {
+                    if let Ok(s) = std::fs::read_to_string(&p) {
+                        print!("{}", jas::gas::normalize(&s));
+                        return ExitCode::SUCCESS;
+                    }
+                }
+                eprintln!("jas: --emit-gas needs an input file");
+                return ExitCode::FAILURE;
+            }
             "-I" => {
                 if let Some(d) = it.next() {
                     opts.include_dirs.push(d.clone());
                 }
             }
+            s if s.starts_with("-I") => opts.include_dirs.push(s[2..].to_string()),
+            "-D" => {
+                if let Some(d) = it.next() {
+                    opts.defines.push(d.clone());
+                }
+            }
+            s if s.starts_with("-D") => opts.defines.push(s[2..].to_string()),
             s if s.starts_with('-') => {
                 eprintln!("jas: unknown option `{s}`");
                 return ExitCode::FAILURE;

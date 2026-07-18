@@ -86,6 +86,31 @@ fn areg(s: &str) -> Option<u16> {
     let r: u16 = n.parse().ok()?;
     (r < 8).then_some(r)
 }
+/// Index of the `(` that matches the final `)` of `s` (which must end in `)`),
+/// scanning right-to-left with paren depth. Lets `EXPR(An)` split correctly even
+/// when `EXPR` itself contains parentheses, e.g. `(640-16)(a1)` → open at the
+/// `(a1)` group.
+fn matching_open(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    if bytes.last() != Some(&b')') {
+        return None;
+    }
+    let mut depth = 0i32;
+    for i in (0..bytes.len()).rev() {
+        match bytes[i] {
+            b')' => depth += 1,
+            b'(' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn anyreg_idx(s: &str) -> Option<u16> {
     // index register token for d8(An,Xn): Dn -> 0nnn, An -> 1nnn, size .w/.l
     let s = s.trim();
@@ -131,7 +156,21 @@ fn parse_ea(op: &str, sz: Sz, asm: &Assembler) -> Result<Ea, EncodeErr> {
     }
     // immediate
     if let Some(imm) = s.strip_prefix('#') {
-        let v = asm.eval_pub(imm.trim()).map_err(msg)?;
+        let imm = imm.trim();
+        // A long immediate that is the address of an external symbol relocates
+        // (e.g. `move.l #_vi_isr,vec` installing a handler address).
+        if sz == Sz::L {
+            if let Some((sym, addend)) = asm.reloc_symbol_pub(imm) {
+                return Ok(Ea {
+                    mode: 7,
+                    reg: 4,
+                    ext: vec![(addend >> 16) as u16, addend as u16],
+                    reloc: Some((sym, addend)),
+                    reloc_ext_off: 0,
+                });
+            }
+        }
+        let v = asm.eval_pub(imm).map_err(msg)?;
         let ext = match sz {
             Sz::L => vec![(v >> 16) as u16, v as u16],
             _ => vec![v as u16],
@@ -144,8 +183,14 @@ fn parse_ea(op: &str, sz: Sz, asm: &Assembler) -> Result<Ea, EncodeErr> {
             return Ok(none(4, a));
         }
     }
-    // (An)+ / (An) / (d,An,Xn) / (d,An)
-    if s.starts_with('(') && s.ends_with(')') || s.ends_with(")+") {
+    // (An)+ / (An) / (d,An,Xn) / (d,An) — only when the whole operand is ONE
+    // parenthesized group (so `(640-16)(a1)` falls through to the d16(An) form
+    // below, where the leading `(` belongs to the displacement expression).
+    let whole_group = {
+        let body = s.trim_end_matches('+');
+        body.starts_with('(') && body.ends_with(')') && matching_open(body) == Some(0)
+    };
+    if whole_group || s.ends_with(")+") {
         let postinc = s.ends_with(")+");
         let body = s.trim_end_matches('+');
         let inner = &body[1..body.len() - 1];
@@ -155,6 +200,12 @@ fn parse_ea(op: &str, sz: Sz, asm: &Assembler) -> Result<Ea, EncodeErr> {
                 if let Some(a) = areg(one) {
                     return Ok(none(if postinc { 3 } else { 2 }, a));
                 }
+            }
+            [an, xn] if areg(an).is_some() && anyreg_idx(xn).is_some() => {
+                // (An, Xn) — base + index, zero displacement (GAS drops the 0)
+                let a = areg(an).unwrap();
+                let brief = anyreg_idx(xn).unwrap();
+                return Ok(Ea { mode: 6, reg: a, ext: vec![brief], reloc: None, reloc_ext_off: 0 });
             }
             [d, an] => {
                 // (d16, An)
@@ -180,9 +231,11 @@ fn parse_ea(op: &str, sz: Sz, asm: &Assembler) -> Result<Ea, EncodeErr> {
         }
         return Err(msg(format!("unsupported addressing `{s}`")));
     }
-    // d16(An) / d8(An,Xn) / d16(PC) / d8(PC,Xn) — classic paren-suffix form
-    if let Some(open) = s.find('(') {
-        if s.ends_with(')') {
+    // d16(An) / d8(An,Xn) / d16(PC) / d8(PC,Xn) — classic paren-suffix form. The
+    // register group is the LAST parenthesized group; the displacement (which may
+    // itself be a parenthesized expression, e.g. `(640-16)(a1)`) precedes it.
+    if s.ends_with(')') {
+        if let Some(open) = matching_open(s) {
             let disp_str = &s[..open];
             let inner = &s[open + 1..s.len() - 1];
             let parts: Vec<&str> = inner.splitn(2, ',').map(|x| x.trim()).collect();
@@ -215,9 +268,21 @@ fn parse_ea(op: &str, sz: Sz, asm: &Assembler) -> Result<Ea, EncodeErr> {
         }
     }
 
-    // absolute — number or symbol. Symbol may be extern (reloc) or defined.
-    // Prefer abs.l (32-bit) so externs relocate cleanly.
+    // absolute — number or symbol, with an optional explicit size override:
+    // `EXPR.w` forces abs.w (one sign-extended word), `EXPR.l` forces abs.l.
+    let (s, forced) = if let Some(b) = s.strip_suffix(".w").or_else(|| s.strip_suffix(".W")) {
+        (b.trim_end(), Some(false))
+    } else if let Some(b) = s.strip_suffix(".l").or_else(|| s.strip_suffix(".L")) {
+        (b.trim_end(), Some(true))
+    } else {
+        (s, None)
+    };
+    // Symbol may be extern (reloc) or defined. Prefer abs.l so externs relocate
+    // cleanly (unless `.w` was requested explicitly).
     if let Some((sym, addend)) = asm.reloc_symbol_pub(s) {
+        if forced == Some(false) {
+            return Ok(Ea { mode: 7, reg: 0, ext: vec![addend as u16], reloc: Some((sym, addend)), reloc_ext_off: 0 });
+        }
         return Ok(Ea {
             mode: 7,
             reg: 1,
@@ -227,8 +292,12 @@ fn parse_ea(op: &str, sz: Sz, asm: &Assembler) -> Result<Ea, EncodeErr> {
         });
     }
     let v = asm.eval_pub(s).map_err(msg)?;
-    if v <= 0x7FFF || v >= 0xFFFF_8000 {
-        // fits abs.w (sign-extended)
+    let use_word = match forced {
+        Some(w) => !w, // forced .w → true, .l → false
+        None => v <= 0x7FFF || v >= 0xFFFF_8000,
+    };
+    if use_word {
+        // abs.w (sign-extended)
         Ok(Ea { mode: 7, reg: 0, ext: vec![v as u16], reloc: None, reloc_ext_off: 0 })
     } else {
         Ok(Ea { mode: 7, reg: 1, ext: vec![(v >> 16) as u16, v as u16], reloc: None, reloc_ext_off: 0 })
@@ -285,8 +354,13 @@ pub(crate) fn encode(mnem: &str, args: &str, here: u32, asm: &Assembler) -> Resu
         return Ok(one(w));
     }
 
-    // ── branches: bra/bsr/bcc (+ .b/.w) ──────────────────────────────────────
-    let (bbase, _bsz) = parse_size(&low, Sz::W);
+    // ── branches: bra/bsr/bcc (+ .b/.s/.w) ───────────────────────────────────
+    // Strip a trailing size (`.b`/`.s`/`.w`/`.l`) for the mnemonic base; the
+    // short (`.s`/`.b`) vs word (`.w`) choice is re-read from `low` below.
+    let bbase: String = match low.rsplit_once('.') {
+        Some((b, s)) if matches!(s, "b" | "s" | "w" | "l") => b.to_string(),
+        _ => low.clone(),
+    };
     if bbase == "bra" || bbase == "bsr" || bbase.starts_with('b') && cc_field(&bbase[1..]).is_some() {
         let target = args.trim();
         // extern target -> reloc via absolute? 68000 branches are PC-relative;
@@ -306,19 +380,28 @@ pub(crate) fn encode(mnem: &str, args: &str, here: u32, asm: &Assembler) -> Resu
                 reloc: Some((1, RelKind::Word, sym, addend)),
             });
         }
+        // The form (and thus the size) is fixed by the suffix, independent of the
+        // displacement: `.s`/`.b` → short (1 word), `.w` or no suffix → 16-bit
+        // (2 words). Not auto-relaxing keeps sizing identical across passes, so a
+        // forward reference — unbound (0) in pass 1 — never changes byte count.
+        let force_short = low.ends_with(".s") || low.ends_with(".b");
         let dest = asm.eval_pub(target).map_err(msg)?;
         let disp = dest as i64 - (here as i64 + 2);
-        // An explicit size forces the form: `.w` → 16-bit, `.s`/`.b` → short. This
-        // lets a code generator sidestep short/long relaxation entirely by always
-        // requesting `.w`. Without a suffix, auto-select (short when it fits).
-        let force_word = low.ends_with(".w");
-        let force_short = low.ends_with(".s") || low.ends_with(".b");
-        if !force_word && (force_short || ((-128..=127).contains(&disp) && disp != 0)) {
+        // Pass 1 only sizes: emit right-sized placeholders, never range-check a
+        // displacement whose target isn't bound yet.
+        if asm.pass() == 1 {
+            return Ok(if force_short {
+                one(opbase)
+            } else {
+                M68kEnc { words: vec![opbase, 0], reloc: None }
+            });
+        }
+        if force_short {
             if disp == 0 {
                 return Err(msg("short branch to next instruction (disp 0) — use .w"));
             }
             if !(-128..=127).contains(&disp) {
-                return Err(msg("short branch displacement out of range"));
+                return Err(msg("short branch displacement out of range — use .w"));
             }
             return Ok(one(opbase | (disp as u8 as u16)));
         }
@@ -469,6 +552,15 @@ pub(crate) fn encode(mnem: &str, args: &str, here: u32, asm: &Assembler) -> Resu
     }
 
     // ── immediate arithmetic/logic: addi subi andi ori eori cmpi ──────────────
+    // GAS spells these as plain `add`/`sub`/`and`/`or`/`eor`/`cmp` with an
+    // immediate source; route them here unless the destination is an address
+    // register (which needs adda/suba/cmpa, handled below).
+    let (imm_src, areg_dst) = {
+        let p = crate::split_args(args);
+        let imm = p.first().map(|a| a.trim_start().starts_with('#')).unwrap_or(false);
+        let ad = p.get(1).map(|d| areg(d.trim()).is_some()).unwrap_or(false);
+        (imm, ad)
+    };
     if let Some(opbase) = match base.as_str() {
         "ori" => Some(0x0000u16),
         "andi" => Some(0x0200),
@@ -476,6 +568,12 @@ pub(crate) fn encode(mnem: &str, args: &str, here: u32, asm: &Assembler) -> Resu
         "addi" => Some(0x0600),
         "eori" => Some(0x0A00),
         "cmpi" => Some(0x0C00),
+        "or" if imm_src && !areg_dst => Some(0x0000),
+        "and" if imm_src && !areg_dst => Some(0x0200),
+        "sub" if imm_src && !areg_dst => Some(0x0400),
+        "add" if imm_src && !areg_dst => Some(0x0600),
+        "eor" if imm_src && !areg_dst => Some(0x0A00),
+        "cmp" if imm_src && !areg_dst => Some(0x0C00),
         _ => None,
     } {
         let (imm, ea_s) = split2(args)?;
@@ -519,6 +617,15 @@ pub(crate) fn encode(mnem: &str, args: &str, here: u32, asm: &Assembler) -> Resu
                 let ea = parse_ea(&b, sz, asm)?;
                 let op = opbase | (dn << 9) | (0b100 << 6) | (sz.field() << 6) | ea.field();
                 return Ok(with_src(op, &ea));
+            }
+        }
+        // `add`/`sub`/`cmp` with an address-register destination is really the
+        // `adda`/`suba`/`cmpa` form (GAS spells them all `add`/`sub`/`cmp`).
+        if let Some(an) = areg(&b) {
+            if matches!(base.as_str(), "add" | "sub" | "cmp") {
+                let ea = parse_ea(&a, sz, asm)?;
+                let opmode = if sz == Sz::L { 0b111 } else { 0b011 };
+                return Ok(with_src(opbase | (an << 9) | (opmode << 6) | ea.field(), &ea));
             }
         }
         return Err(msg(format!("`{base}` needs a data register on one side (v1)")));

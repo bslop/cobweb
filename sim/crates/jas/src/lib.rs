@@ -15,6 +15,7 @@
 //! assembler and the emulator can never silently disagree about an opcode.
 
 mod encode;
+pub mod gas;
 pub mod hazard;
 pub mod m68k;
 pub mod object;
@@ -145,6 +146,13 @@ pub struct Options {
     /// Start in 68000 mode (for pure-68k source files with no `.68000`
     /// directive — rmac's default CPU is the 68k).
     pub start_m68k: bool,
+    /// GAS dialect: `None` = rmac/Motorola (default), `Some(true)` = force the
+    /// GNU-`as` frontend, `Some(false)` = never (even if it looks like GAS). The
+    /// CLI maps `--gas`/`--no-gas`; the default auto-detects per file.
+    pub gas: Option<bool>,
+    /// Command-line `-D` preprocessor defines (`NAME` or `NAME=VALUE`), seeding
+    /// the `#if`/`#ifdef` symbol table for cpp-style `.S` sources.
+    pub defines: Vec<String>,
 }
 
 impl Default for Options {
@@ -157,6 +165,8 @@ impl Default for Options {
             include_dirs: Vec::new(),
             object_mode: false,
             start_m68k: false,
+            gas: None,
+            defines: Vec::new(),
         }
     }
 }
@@ -164,16 +174,29 @@ impl Default for Options {
 /// Assemble `source`. Returns the emitted bytes plus diagnostics; the caller
 /// decides whether to write output when `errors() > 0` (usually: don't).
 pub fn assemble(source: &str, opts: &Options) -> Assembled {
+    // GAS dialect: rewrite GNU-`as` syntax to jas-native. The lexical half
+    // (comments, `%` registers) runs first so the front pass sees clean tokens;
+    // numeric-label resolution runs *after* expansion so each macro expansion's
+    // `9:` becomes a distinct label. `gas: Some(_)` forces; `None` auto-detects.
+    let use_gas = opts.gas.unwrap_or_else(|| gas::looks_like_gas(source));
+    let lexed;
+    let source = if use_gas {
+        lexed = gas::normalize_lexical(source);
+        lexed.as_str()
+    } else {
+        source
+    };
     // Front pass: expand includes / macros / rept / conditionals.
     let mut inc = preprocess::FsIncludes {
         dirs: opts.include_dirs.iter().map(PathBuf::from).collect(),
     };
-    let expanded = match preprocess::run(source, &mut inc) {
+    let expanded = match preprocess::run(source, &mut inc, &opts.defines) {
         Ok(s) => s,
         Err(diags) => {
             return Assembled { diags, ..Default::default() };
         }
     };
+    let expanded = if use_gas { gas::resolve_numeric(&expanded) } else { expanded };
     let mut asm = Assembler::new(opts);
     asm.run(&expanded);
     let mut out = asm.finish();
@@ -372,7 +395,10 @@ impl<'a> Assembler<'a> {
         } else {
             self.symbols.insert(name.clone(), self.pc);
         }
-        if !label.starts_with('.') {
+        // GAS numeric locals (normalized to the reserved `L__gasnum_` prefix)
+        // are file-global but must NOT reset the `.local` scope — a `3:` sitting
+        // between other code shouldn't rebind the surrounding `.name` labels.
+        if !label.starts_with('.') && !label.starts_with("L__gasnum_") {
             self.scope = label.to_string();
         }
     }
@@ -449,6 +475,32 @@ impl<'a> Assembler<'a> {
                     let a = v.max(1);
                     while self.pc % a != 0 {
                         self.put_byte(0, line);
+                    }
+                }
+            }
+            // GAS `.balign N` aligns the PC to an N-*byte* boundary (same as our
+            // `.align` — jas's align is byte-granular, not power-of-two-exponent).
+            ".balign" => {
+                if let Some(v) = self.eval_or_err(line.args, line.n) {
+                    let a = v.max(1);
+                    while self.pc % a != 0 {
+                        self.put_byte(0, line);
+                    }
+                }
+            }
+            // GAS `.section NAME [,flags]` — advisory in single-file mode, like the
+            // bare `.text`/`.data`/`.bss` switches below.
+            ".section" => {}
+            // `.incbin "file"[,skip[,count]]` — splice a binary blob into the image.
+            ".incbin" => self.emit_incbin(line),
+            ".ascii" | ".asciz" | ".string" => self.emit_ascii(line, op != ".ascii"),
+            ".space" | ".skip" | ".zero" => {
+                // `.space N[,fill]` / `.zero N` — N fill bytes (default 0).
+                let parts = split_args(line.args);
+                if let Some(n) = parts.first().and_then(|p| self.eval_or_err(p, line.n)) {
+                    let fill = parts.get(1).and_then(|p| self.eval_or_err(p, line.n)).unwrap_or(0) as u8;
+                    for _ in 0..n {
+                        self.put_byte(fill, line);
                     }
                 }
             }
@@ -543,6 +595,57 @@ impl<'a> Assembler<'a> {
         }
     }
 
+    /// `.incbin "file"[,skip[,count]]` — splice raw bytes from `file` into the
+    /// output. The path is resolved against the include directories (which the
+    /// CLI seeds with the source file's own directory).
+    fn emit_incbin(&mut self, line: &Line) {
+        let parts = split_args(line.args);
+        let Some(raw) = parts.first() else {
+            self.err(line.n, "`.incbin` expects a filename");
+            return;
+        };
+        let name = raw.trim().trim_matches('"');
+        let skip = parts.get(1).and_then(|p| self.eval_or_err(p, line.n)).unwrap_or(0) as usize;
+        let count = parts.get(2).and_then(|p| self.eval_or_err(p, line.n)).map(|c| c as usize);
+        // resolve against include dirs, then the current directory
+        let mut found = None;
+        for d in &self.opts.include_dirs {
+            let cand = PathBuf::from(d).join(name);
+            if cand.is_file() {
+                found = Some(cand);
+                break;
+            }
+        }
+        let path = found.unwrap_or_else(|| PathBuf::from(name));
+        match std::fs::read(&path) {
+            Ok(data) => {
+                let start = skip.min(data.len());
+                let end = count.map(|c| (start + c).min(data.len())).unwrap_or(data.len());
+                for &b in &data[start..end] {
+                    self.put_byte(b, line);
+                }
+            }
+            Err(e) => self.err(line.n, format!("`.incbin`: cannot read {}: {e}", path.display())),
+        }
+    }
+
+    /// `.ascii "str"` / `.asciz "str"` (NUL-terminated) — emit the string bytes.
+    fn emit_ascii(&mut self, line: &Line, nul_terminate: bool) {
+        for item in split_args(line.args) {
+            let s = item.trim();
+            let Some(inner) = s.strip_prefix('"').and_then(|x| x.strip_suffix('"')) else {
+                self.err(line.n, "`.ascii` expects a quoted string");
+                continue;
+            };
+            for b in unescape_str(inner) {
+                self.put_byte(b, line);
+            }
+            if nul_terminate {
+                self.put_byte(0, line);
+            }
+        }
+    }
+
     /// `.ds[.size] count` — reserve `count*size` zero bytes.
     fn emit_ds(&mut self, line: &Line, size: u32) {
         if let Some(count) = self.eval_or_err(line.args.trim(), line.n) {
@@ -554,6 +657,14 @@ impl<'a> Assembler<'a> {
 
     fn emit_data(&mut self, line: &Line, size: u32, swapped: bool) {
         for item in split_args(line.args) {
+            // string literal in a `.byte`/`dc.b` list → raw bytes
+            let t = item.trim();
+            if t.starts_with('"') && t.ends_with('"') && t.len() >= 2 {
+                for b in unescape_str(&t[1..t.len() - 1]) {
+                    self.put_byte(b, line);
+                }
+                continue;
+            }
             // relocatable longword (a table of external addresses)
             if size == 4 {
                 if let Some((sym, addend)) = self.reloc_symbol(item.trim()) {
@@ -801,6 +912,13 @@ impl<'a> Assembler<'a> {
         };
         self.symbols.get(&q).copied()
     }
+
+    /// Which pass is running (1 = sizing, 2 = emitting). The m68k encoder uses
+    /// this to size a forward branch without range-checking a displacement whose
+    /// target isn't bound yet.
+    pub(crate) fn pass(&self) -> u8 {
+        self.pass
+    }
 }
 
 /// Encoder error variants.
@@ -814,8 +932,10 @@ pub(crate) enum EncodeErr {
 /// blank or comment-only line. Handles `name equ expr` and `name = expr` by
 /// synthesizing a label + a fake directive so the assembler binds the symbol.
 fn parse_line(raw: &str, n: usize) -> Option<Line<'_>> {
-    // strip comment (`;` anywhere; also a leading `*` comment line, MadMac style)
-    let no_comment = match raw.find(';') {
+    // strip comment (`;` or `//` anywhere; also a leading `*` comment line,
+    // MadMac style). `//` covers cpp'd `.S` sources that use C++ comments.
+    let cut = [raw.find(';'), raw.find("//")].into_iter().flatten().min();
+    let no_comment = match cut {
         Some(i) => &raw[..i],
         None => raw,
     };
@@ -921,27 +1041,59 @@ fn is_pseudo(op: &str) -> bool {
     )
 }
 
+/// Decode C-style escapes in a `.ascii`/`.asciz` string body into raw bytes.
+pub(crate) fn unescape_str(s: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    let b: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == '\\' && i + 1 < b.len() {
+            match b[i + 1] {
+                'n' => out.push(b'\n'),
+                't' => out.push(b'\t'),
+                'r' => out.push(b'\r'),
+                '0' => out.push(0),
+                '\\' => out.push(b'\\'),
+                '"' => out.push(b'"'),
+                other => out.push(other as u8),
+            }
+            i += 2;
+        } else {
+            out.push(b[i] as u8);
+            i += 1;
+        }
+    }
+    out
+}
+
 pub(crate) fn split_args(s: &str) -> Vec<String> {
-    // split on commas not inside parens
+    // split on commas not inside parens or a quoted string
     let mut out = Vec::new();
     let mut depth = 0i32;
+    let mut in_str = false;
+    let mut prev = ' ';
     let mut cur = String::new();
     for c in s.chars() {
         match c {
-            '(' => {
+            '"' if prev != '\\' => {
+                in_str = !in_str;
+                cur.push(c);
+            }
+            '(' if !in_str => {
                 depth += 1;
                 cur.push(c);
             }
-            ')' => {
+            ')' if !in_str => {
                 depth -= 1;
                 cur.push(c);
             }
-            ',' if depth == 0 => {
+            ',' if depth == 0 && !in_str => {
                 out.push(cur.trim().to_string());
                 cur.clear();
             }
             _ => cur.push(c),
         }
+        prev = c;
     }
     if !cur.trim().is_empty() {
         out.push(cur.trim().to_string());
@@ -1024,6 +1176,18 @@ fn expr_lex(s: &str) -> Result<Vec<ETok>, String> {
                     }
                     let v = u32::from_str_radix(&b[i + 2..j].iter().collect::<String>(), 16)
                         .map_err(|_| "bad hex literal".to_string())?;
+                    out.push(ETok::Num(v));
+                    i = j;
+                } else if c == '0' && i + 1 < b.len() && (b[i + 1] == 'b' || b[i + 1] == 'B')
+                    && i + 2 < b.len() && (b[i + 2] == '0' || b[i + 2] == '1')
+                {
+                    // `0b1010` binary literal (GAS spelling; `%` is the reg prefix there)
+                    let mut j = i + 2;
+                    while j < b.len() && (b[j] == '0' || b[j] == '1') {
+                        j += 1;
+                    }
+                    let v = u32::from_str_radix(&b[i + 2..j].iter().collect::<String>(), 2)
+                        .map_err(|_| "bad binary literal".to_string())?;
                     out.push(ETok::Num(v));
                     i = j;
                 } else {

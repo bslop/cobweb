@@ -67,11 +67,23 @@ const MAX_DEPTH: usize = 64;
 
 /// Preprocess `src`. `line0` is the 1-based line the source starts at (for
 /// nested includes it's 1; kept simple — diagnostics use best-effort lines).
-pub fn run(src: &str, inc: &mut dyn Includes) -> Result<String, Vec<Diag>> {
+pub fn run(src: &str, inc: &mut dyn Includes, defines: &[String]) -> Result<String, Vec<Diag>> {
+    let mut syms = HashMap::new();
+    for d in defines {
+        match d.split_once('=') {
+            Some((n, v)) => {
+                let val = v.trim().parse::<i64>().unwrap_or(1);
+                syms.insert(n.trim().to_string(), val);
+            }
+            None => {
+                syms.insert(d.trim().to_string(), 1);
+            }
+        }
+    }
     let mut pp = Pp {
         inc,
         macros: HashMap::new(),
-        syms: HashMap::new(),
+        syms,
         out: Vec::new(),
         diags: Vec::new(),
         uniq: 0,
@@ -91,9 +103,58 @@ fn strip(line: &str) -> &str {
     line.split(';').next().unwrap_or("").trim()
 }
 
+/// Canonical directive name for a first-token, accepting both the rmac `.name`
+/// and the C-preprocessor `#name` spellings. Returns `""` for non-directives.
+fn norm_directive(tok: &str) -> &'static str {
+    match tok.trim_start_matches(['#', '.']) {
+        "macro" => ".macro",
+        "rept" => ".rept",
+        "if" => ".if",
+        "ifdef" => ".ifdef",
+        "ifndef" => ".ifndef",
+        "elif" => ".elif",
+        "else" => ".else",
+        "endif" => ".endif",
+        "include" => ".include",
+        "define" => ".define",
+        "undef" => ".undef",
+        _ => "",
+    }
+}
+
 /// First whitespace-separated token of a line's code part.
 fn first_token(line: &str) -> &str {
     strip(line).split_whitespace().next().unwrap_or("")
+}
+
+/// Index of the label-terminating `:` (or the second `:` of a `::`) when `s`
+/// begins with an assembler label `ident:`. Returns None otherwise.
+fn find_label_colon(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    if b.is_empty() || !(b[0].is_ascii_alphabetic() || b[0] == b'_' || b[0] == b'.') {
+        return None;
+    }
+    let mut i = 0;
+    while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'.' || b[i] == b'$') {
+        i += 1;
+    }
+    if i < b.len() && b[i] == b':' {
+        if i + 1 < b.len() && b[i + 1] == b':' {
+            Some(i + 1)
+        } else {
+            Some(i)
+        }
+    } else {
+        None
+    }
+}
+
+/// The argument part of a directive line: everything after the first token
+/// (the `#if`/`.ifdef`/`#include`/... keyword).
+fn directive_arg(code: &str) -> String {
+    let mut it = code.splitn(2, |c: char| c.is_whitespace());
+    let _kw = it.next();
+    it.next().unwrap_or("").trim().to_string()
 }
 
 impl Pp<'_> {
@@ -114,8 +175,9 @@ impl Pp<'_> {
             let code = strip(raw);
             let tok = first_token(raw).to_ascii_lowercase();
 
-            // block collectors need lookahead
-            match tok.as_str() {
+            // block collectors need lookahead. Both rmac (`.if`) and cpp (`#if`)
+            // spellings map to the same machinery via `norm_directive`.
+            match norm_directive(&tok) {
                 ".macro" => {
                     i = self.collect_macro(lines, i, base);
                     continue;
@@ -125,11 +187,24 @@ impl Pp<'_> {
                     continue;
                 }
                 ".if" | ".ifdef" | ".ifndef" => {
-                    i = self.collect_if(lines, i, base, &tok);
+                    i = self.collect_if(lines, i, base, norm_directive(&tok));
                     continue;
                 }
                 ".include" => {
                     self.do_include(code, base + i);
+                    i += 1;
+                    continue;
+                }
+                ".define" => {
+                    self.do_define(code, base + i);
+                    i += 1;
+                    continue;
+                }
+                ".undef" => {
+                    let name = code.trim_start_matches(['#', '.']).trim();
+                    let name = name.strip_prefix("undef").unwrap_or(name).trim();
+                    self.syms.remove(name);
+                    self.macros.remove(name);
                     i += 1;
                     continue;
                 }
@@ -139,21 +214,19 @@ impl Pp<'_> {
             // record .equ/.set/= for later .if / .rept evaluation
             self.record_symbol(code);
 
-            // macro invocation?
-            let inv = first_token(raw);
-            // an invocation is a bare first token (no label colon) that names a macro
-            if !raw.starts_with([' ', '\t']) {
-                // could be `label: macroname ...` — handle label then rest
-            }
-            if self.macros.contains_key(inv) && !raw.trim_start().starts_with('.') {
-                self.expand_macro(inv, code, base + i);
-                i += 1;
-                continue;
-            }
-            // indented macro call: `    macroname args`
-            let indented_first = raw.trim_start().split_whitespace().next().unwrap_or("");
-            if self.macros.contains_key(indented_first) && raw.starts_with([' ', '\t']) {
-                self.expand_macro(indented_first, code, base + i);
+            // macro invocation? The macro name is the first token, optionally
+            // after a leading `label:` (which we emit before expanding).
+            let trimmed = code.trim_start();
+            let (label, after_label) = match find_label_colon(trimmed) {
+                Some(c) => (Some(&trimmed[..=c]), trimmed[c + 1..].trim_start()),
+                None => (None, trimmed),
+            };
+            let mac_name = after_label.split_whitespace().next().unwrap_or("");
+            if self.macros.contains_key(mac_name) && !after_label.starts_with('.') {
+                if let Some(lbl) = label {
+                    self.out.push(lbl.to_string());
+                }
+                self.expand_macro(mac_name, after_label, base + i);
                 i += 1;
                 continue;
             }
@@ -202,13 +275,20 @@ impl Pp<'_> {
         let args: Vec<String> =
             crate::split_args(after).into_iter().map(|s| s.trim().to_string()).collect();
         let mac = self.macros.get(name).unwrap();
-        // build substitution map
+        // build substitution map — named params (`\name`) plus positional
+        // (`\1`, `\2`, …). GAS macros may use positionals with no named params
+        // declared, so cover every supplied argument, not just declared ones.
         let mut subs: Vec<(String, String)> = Vec::new();
-        for (idx, p) in mac.params.iter().enumerate() {
+        let n = mac.params.len().max(args.len());
+        for idx in 0..n {
             let val = args.get(idx).cloned().unwrap_or_default();
             subs.push((format!("\\{}", idx + 1), val.clone()));
-            subs.push((format!("\\{p}"), val));
+            if let Some(p) = mac.params.get(idx) {
+                subs.push((format!("\\{p}"), val));
+            }
         }
+        // Highest-numbered positionals first so `\10` isn't clipped by `\1`.
+        subs.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
         let body = mac.body.clone();
         if self.depth > MAX_DEPTH {
             self.err(at, "macro expansion too deep");
@@ -264,50 +344,128 @@ impl Pp<'_> {
     }
 
     fn collect_if(&mut self, lines: &[String], start: usize, base: usize, kind: &str) -> usize {
-        let header = strip(&lines[start]);
-        let cond = header[kind.len()..].trim();
-        let taken = match kind {
-            ".ifdef" => self.syms.contains_key(cond) || self.macros.contains_key(cond),
-            ".ifndef" => !(self.syms.contains_key(cond) || self.macros.contains_key(cond)),
-            _ => self.eval(cond).unwrap_or(0) != 0,
-        };
-        // split into then/else at the matching .else/.endif
-        let mut then_body = Vec::new();
-        let mut else_body = Vec::new();
-        let mut in_else = false;
+        // A branch guard: `Some(true/false)` for if/elif, `None` for else.
+        struct Branch {
+            guard: Option<bool>,
+            body: Vec<String>,
+        }
+        let cond0 = directive_arg(strip(&lines[start]));
+        let mut branches = vec![Branch { guard: Some(self.cond_true(kind, &cond0)), body: Vec::new() }];
         let mut depth = 1;
         let mut i = start + 1;
         while i < lines.len() {
-            let t = first_token(&lines[i]).to_ascii_lowercase();
-            if matches!(t.as_str(), ".if" | ".ifdef" | ".ifndef") {
+            let raw_tok = first_token(&lines[i]).to_ascii_lowercase();
+            let d = norm_directive(&raw_tok);
+            if matches!(d, ".if" | ".ifdef" | ".ifndef") {
                 depth += 1;
-            } else if t == ".endif" {
+            } else if d == ".endif" {
                 depth -= 1;
                 if depth == 0 {
                     break;
                 }
-            } else if t == ".else" && depth == 1 {
-                in_else = true;
+            } else if d == ".elif" && depth == 1 {
+                let cond = directive_arg(strip(&lines[i]));
+                branches.push(Branch { guard: Some(self.cond_true(".if", &cond)), body: Vec::new() });
+                i += 1;
+                continue;
+            } else if d == ".else" && depth == 1 {
+                branches.push(Branch { guard: None, body: Vec::new() });
                 i += 1;
                 continue;
             }
-            if in_else {
-                else_body.push(lines[i].clone());
-            } else {
-                then_body.push(lines[i].clone());
-            }
+            branches.last_mut().unwrap().body.push(lines[i].clone());
             i += 1;
         }
         if i >= lines.len() {
-            self.err(base + start, "`.if` has no `.endif`");
+            self.err(base + start, "`.if`/`#if` has no `.endif`");
         }
-        let body = if taken { then_body } else { else_body };
-        self.process(&body, base + start + 1);
+        // First branch whose guard is true; else the `.else` branch.
+        let chosen = branches
+            .iter()
+            .find(|b| b.guard == Some(true))
+            .or_else(|| branches.iter().find(|b| b.guard.is_none()));
+        if let Some(b) = chosen {
+            let body = b.body.clone();
+            self.process(&body, base + start + 1);
+        }
         i + 1
     }
 
+    /// Evaluate a conditional's truth for `.if`/`.ifdef`/`.ifndef`.
+    fn cond_true(&self, kind: &str, cond: &str) -> bool {
+        match kind {
+            ".ifdef" => self.is_defined(cond),
+            ".ifndef" => !self.is_defined(cond),
+            _ => self.eval(&self.expand_defined(cond)).unwrap_or(0) != 0,
+        }
+    }
+
+    fn is_defined(&self, name: &str) -> bool {
+        let name = name.trim();
+        self.syms.contains_key(name) || self.macros.contains_key(name)
+    }
+
+    /// Replace `defined(NAME)` / `defined NAME` with `1`/`0` so the numeric
+    /// expression evaluator can handle a C `#if defined(...)` condition.
+    fn expand_defined(&self, cond: &str) -> String {
+        let mut out = String::with_capacity(cond.len());
+        let b: Vec<char> = cond.chars().collect();
+        let mut i = 0;
+        while i < b.len() {
+            if cond[i..].starts_with("defined") && (i == 0 || !b[i - 1].is_alphanumeric()) {
+                let mut j = i + "defined".len();
+                while j < b.len() && b[j].is_whitespace() {
+                    j += 1;
+                }
+                let paren = b.get(j) == Some(&'(');
+                if paren {
+                    j += 1;
+                }
+                while j < b.len() && b[j].is_whitespace() {
+                    j += 1;
+                }
+                let mut k = j;
+                while k < b.len() && (b[k].is_alphanumeric() || b[k] == '_') {
+                    k += 1;
+                }
+                let name: String = b[j..k].iter().collect();
+                if paren {
+                    while k < b.len() && b[k].is_whitespace() {
+                        k += 1;
+                    }
+                    if b.get(k) == Some(&')') {
+                        k += 1;
+                    }
+                }
+                out.push(if self.is_defined(&name) { '1' } else { '0' });
+                i = k;
+                continue;
+            }
+            out.push(b[i]);
+            i += 1;
+        }
+        out
+    }
+
+    /// `#define NAME [VALUE]` / `.define NAME VALUE`. A bodyless define is `1`;
+    /// an integer body is recorded for `#if`. Non-integer bodies define the name
+    /// as present (value 1) so `#ifdef`/`defined()` still see it.
+    fn do_define(&mut self, code: &str, _at: usize) {
+        let rest = code.trim_start_matches(['#', '.']).trim();
+        let rest = rest.strip_prefix("define").unwrap_or(rest).trim();
+        let mut it = rest.splitn(2, |c: char| c.is_whitespace());
+        let name = it.next().unwrap_or("").trim();
+        if name.is_empty() || !is_ident(name) {
+            return;
+        }
+        let val = it.next().map(str::trim).filter(|s| !s.is_empty());
+        let v = val.and_then(|v| self.eval(v)).unwrap_or(1);
+        self.syms.insert(name.to_string(), v);
+    }
+
     fn do_include(&mut self, code: &str, at: usize) {
-        let arg = code[".include".len()..].trim().trim_matches(['"', '<', '>', '\'']);
+        let arg = directive_arg(code);
+        let arg = arg.trim().trim_matches(['"', '<', '>', '\'']);
         match self.inc.read(arg) {
             Some(text) => {
                 let lines: Vec<String> = text.lines().map(|s| s.to_string()).collect();
@@ -534,7 +692,7 @@ mod tests {
     use super::*;
 
     fn pp(src: &str) -> String {
-        run(src, &mut NoIncludes).unwrap()
+        run(src, &mut NoIncludes, &[]).unwrap()
     }
 
     #[test]
