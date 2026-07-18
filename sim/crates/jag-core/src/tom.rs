@@ -372,27 +372,28 @@ fn op_walk_line(
             2 => {
                 // GPU object (TRM §3.3): hand the phrase to the GPU so it can act
                 // on the OP's behalf (palette load, perspective, dynamic list
-                // building). Active only when VC==YPOS (or the 0x7FF wildcard);
-                // on inactive lines the OP just falls through to the next phrase.
-                // When active we (a) latch the phrase into OB0–3, (b) raise the
-                // GPU "object" interrupt (source 3), and (c) suspend the OP until
-                // the ISR writes OBF — modelled by running the GPU synchronously
-                // here (spec §3.3 emulator note). Afterwards execution continues
-                // with the NEXT phrase in memory, not a LINK.
-                if vc32 == o.ypos || o.ypos == 0x7FF {
-                    let hi = peek32(bus, addr8);
-                    let lo = peek32(bus, addr8 + 4);
-                    bus.tom.win.w16(mem::OB0, (hi >> 16) as u16);
-                    bus.tom.win.w16(mem::OB1, hi as u16);
-                    bus.tom.win.w16(mem::OB2, (lo >> 16) as u16);
-                    bus.tom.win.w16(mem::OB3, lo as u16);
-                    // Raise the OP interrupt (source 3); the scheduler's regular
-                    // GPU slice services it. The remaining half of task #15 — the
-                    // GPU renders each scanline into the line buffer (LBUF) and the
-                    // OP reads it back to the display — still has to land before
-                    // GPU-object games (Atari Karts et al.) actually draw.
-                    gpu.raise_int(OP_INT_SOURCE);
-                }
+                // building). We (a) latch the phrase into OB0–3, (b) raise the GPU
+                // "object" interrupt (source 3) — serviced by the scheduler's GPU
+                // slice — then continue with the NEXT phrase in memory, not a LINK.
+                //
+                // A GPU object fires whenever the OP *reaches* it; the enclosing
+                // list structure does the VC gating. jsim used to also gate on the
+                // object's own YPOS (`vc==ypos`), but that is wrong: real lists
+                // route to a GPU object via a BREQ BRANCH (e.g. Atari Karts fires
+                // its object from a `vc==506` branch while the object's own YPOS is
+                // 0) — the YPOS gate made the two conditions mutually exclusive so
+                // the interrupt never fired. The TRM's per-object YPOS rule is
+                // flagged UNVERIFIED in the spec; firing on reach matches real
+                // display lists. (The remaining half of task #15 — the GPU
+                // rendering each scanline into the line buffer and the OP reading
+                // it back — still has to land before these games actually draw.)
+                let hi = peek32(bus, addr8);
+                let lo = peek32(bus, addr8 + 4);
+                bus.tom.win.w16(mem::OB0, (hi >> 16) as u16);
+                bus.tom.win.w16(mem::OB1, hi as u16);
+                bus.tom.win.w16(mem::OB2, (lo >> 16) as u16);
+                bus.tom.win.w16(mem::OB3, lo as u16);
+                gpu.raise_int(OP_INT_SOURCE);
                 addr = addr8 + 8;
             }
             3 => {
