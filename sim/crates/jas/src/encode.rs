@@ -11,7 +11,7 @@ fn word(op: u8, r1: u16, r2: u16) -> (u8, Vec<u16>) {
     (op, vec![((op as u16) << 10) | ((r1 & 0x1F) << 5) | (r2 & 0x1F)])
 }
 
-fn parse_cc(s: &str) -> Option<u16> {
+pub(crate) fn builtin_cc(s: &str) -> Option<u16> {
     Some(match s.trim().to_ascii_lowercase().as_str() {
         "t" | "" | "always" => 0x00,
         "ne" | "nz" => 0x01,
@@ -291,7 +291,7 @@ fn encode_jump(args: &str, asm: &Assembler) -> R {
     let (cc, addr) = match parts.len() {
         1 => (0u16, parts[0].clone()),
         2 => (
-            parse_cc(&parts[0]).ok_or_else(|| msg(format!("unknown condition `{}`", parts[0])))?,
+            asm.resolve_cc(&parts[0]).ok_or_else(|| msg(format!("unknown condition `{}`", parts[0])))?,
             parts[1].clone(),
         ),
         _ => return Err(msg("jump expects `cc,(rN)` or `(rN)`")),
@@ -309,7 +309,7 @@ fn encode_jr(args: &str, asm: &Assembler) -> R {
     let (cc, target) = match parts.len() {
         1 => (0u16, parts[0].clone()),
         2 => (
-            parse_cc(&parts[0]).ok_or_else(|| msg(format!("unknown condition `{}`", parts[0])))?,
+            asm.resolve_cc(&parts[0]).ok_or_else(|| msg(format!("unknown condition `{}`", parts[0])))?,
             parts[1].clone(),
         ),
         _ => return Err(msg("jr expects `cc,label` or `label`")),

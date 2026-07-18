@@ -178,6 +178,8 @@ struct Assembler<'a> {
     symbols: HashMap<String, u32>,
     /// register aliases from `.equr` (name -> register number)
     regaliases: HashMap<String, u16>,
+    /// condition-code aliases from `.ccdef` (name -> 5-bit cc)
+    ccaliases: HashMap<String, u16>,
     globals: Vec<String>,
     emitted: Vec<Emitted>,
     bytes: Vec<u8>,
@@ -197,6 +199,7 @@ impl<'a> Assembler<'a> {
             org_set: false,
             symbols: HashMap::new(),
             regaliases: HashMap::new(),
+            ccaliases: HashMap::new(),
             globals: Vec::new(),
             emitted: Vec::new(),
             bytes: Vec::new(),
@@ -215,6 +218,7 @@ impl<'a> Assembler<'a> {
             self.pc = self.org;
             self.scope.clear();
             self.regaliases.clear();
+            self.ccaliases.clear();
             if pass == 2 {
                 self.emitted.clear();
                 self.bytes.clear();
@@ -271,6 +275,14 @@ impl<'a> Assembler<'a> {
                     self.regaliases.insert(name.to_string(), r);
                 } else {
                     self.err(line.n, format!("`.equr {name}` needs a register, found `{}`", line.args));
+                }
+            }
+            return;
+        }
+        if line.op == Some(".ccdef") {
+            if let Some(name) = line.label {
+                if let Some(v) = self.eval_or_err(line.args, line.n) {
+                    self.ccaliases.insert(name.to_string(), (v & 0x1F) as u16);
                 }
             }
             return;
@@ -398,6 +410,19 @@ impl<'a> Assembler<'a> {
             ".equrundef" | ".equundef" => {
                 for name in line.args.split(',') {
                     self.regaliases.remove(name.trim());
+                }
+            }
+            ".ccdef" => {
+                let parts = split_args(line.args);
+                if parts.len() == 2 {
+                    if let Some(v) = self.eval_or_err(&parts[1], line.n) {
+                        self.ccaliases.insert(parts[0].trim().to_string(), (v & 0x1F) as u16);
+                    }
+                }
+            }
+            ".ccundef" => {
+                for name in line.args.split(',') {
+                    self.ccaliases.remove(name.trim());
                 }
             }
             ".dc" => self.emit_data(line, 2, false),
@@ -566,6 +591,19 @@ impl<'a> Assembler<'a> {
         (n < 32).then_some(n)
     }
 
+    /// Resolve a condition operand: a builtin cc name, a `.ccdef` alias, or a
+    /// constant expression (masked to 5 bits).
+    pub(crate) fn resolve_cc(&self, s: &str) -> Option<u16> {
+        let s = s.trim();
+        if let Some(cc) = encode::builtin_cc(s) {
+            return Some(cc);
+        }
+        if let Some(&cc) = self.ccaliases.get(s) {
+            return Some(cc);
+        }
+        self.eval(s).ok().map(|v| (v & 0x1F) as u16)
+    }
+
     fn lookup(&self, name: &str) -> Option<u32> {
         let q = if name.starts_with('.') {
             format!("{}{}", self.scope, name)
@@ -621,6 +659,10 @@ fn parse_line(raw: &str, n: usize) -> Option<Line<'_>> {
                 // register alias: NAME .equr rN
                 return Some(Line { n, label: Some(first), op: Some(".equr"), args: kw_value(after) });
             }
+            if al.starts_with(".ccdef") {
+                // condition-code alias: NAME .ccdef $15
+                return Some(Line { n, label: Some(first), op: Some(".ccdef"), args: ccdef_value(after) });
+            }
         }
     } else {
         rest = rest.trim_start();
@@ -632,6 +674,11 @@ fn parse_line(raw: &str, n: usize) -> Option<Line<'_>> {
     }
     let (op, args) = split_op(rest);
     Some(Line { n, label, op: Some(op), args })
+}
+
+fn ccdef_value(after: &str) -> &str {
+    let a = after.trim_start();
+    a.strip_prefix(".ccdef").map(|r| r.trim_start_matches([',', ' ', '\t']).trim()).unwrap_or(a)
 }
 
 fn kw_value(after: &str) -> &str {
