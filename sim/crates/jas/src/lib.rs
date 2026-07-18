@@ -16,6 +16,7 @@
 
 mod encode;
 pub mod hazard;
+pub mod m68k;
 pub mod object;
 pub mod preprocess;
 
@@ -186,6 +187,8 @@ pub fn assemble(source: &str, opts: &Options) -> Assembled {
 struct Line<'a> {
     n: usize,
     label: Option<&'a str>,
+    /// `::` double-colon label (auto-exported global)
+    label_global: bool,
     /// mnemonic or directive (lowercased)
     op: Option<&'a str>,
     /// the raw operand text (everything after the mnemonic)
@@ -215,6 +218,8 @@ struct Assembler<'a> {
     diags: Vec<Diag>,
     /// current scope for `.local` labels (last global label seen)
     scope: String,
+    /// true inside a `.68000` section (route instructions to the 68k encoder)
+    m68k_mode: bool,
     pass: u8,
 }
 
@@ -237,6 +242,7 @@ impl<'a> Assembler<'a> {
             bytes: Vec::new(),
             diags: Vec::new(),
             scope: String::new(),
+            m68k_mode: false,
             pass: 0,
         }
     }
@@ -252,6 +258,7 @@ impl<'a> Assembler<'a> {
             self.regaliases.clear();
             self.ccaliases.clear();
             self.relocs.clear();
+            self.m68k_mode = false;
             if pass == 2 {
                 self.emitted.clear();
                 self.bytes.clear();
@@ -324,6 +331,9 @@ impl<'a> Assembler<'a> {
         }
         if let Some(label) = line.label {
             self.define_label(label, line.n);
+            if line.label_global && self.pass == 2 && !label.starts_with('.') {
+                self.globals.push(label.to_string());
+            }
         }
         let Some(op) = line.op else { return };
         // Directive?
@@ -374,16 +384,22 @@ impl<'a> Assembler<'a> {
                 return self.emit_dcb(line, suffix_size(rest.trim_start_matches('.')));
             }
         }
-        if let Some(rest) = opl.strip_prefix(".ds") {
+        if let Some(rest) = opl.strip_prefix(".ds").or_else(|| opl.strip_prefix("ds")) {
             // guard: don't swallow `.dsp`
             if rest.is_empty() || rest.starts_with('.') {
                 return self.emit_ds(line, suffix_size(rest.trim_start_matches('.')));
             }
         }
         match opl.as_str() {
-            ".gpu" => self.target = Target::Gpu,
-            ".dsp" => self.target = Target::Dsp,
-            ".68000" | ".68k" => { /* leaving RISC scope — data/host, no encode */ }
+            ".gpu" => {
+                self.target = Target::Gpu;
+                self.m68k_mode = false;
+            }
+            ".dsp" => {
+                self.target = Target::Dsp;
+                self.m68k_mode = false;
+            }
+            ".68000" | ".68k" | ".m68k" => self.m68k_mode = true,
             ".org" | "org" => {
                 if let Some(v) = self.eval_or_err(line.args, line.n) {
                     self.pc = v;
@@ -609,7 +625,39 @@ impl<'a> Assembler<'a> {
         self.pc += (words.len() as u32) * 2;
     }
 
+    fn emit_m68k(&mut self, enc: m68k::M68kEnc, line: usize) {
+        let n = enc.words.len() as u32;
+        if self.pass == 2 {
+            let base = self.bytes.len() as u32;
+            for w in &enc.words {
+                self.bytes.extend_from_slice(&w.to_be_bytes());
+            }
+            if let Some((woff, kind, symbol, addend)) = enc.reloc {
+                self.relocs.push(Reloc { offset: base + woff * 2, kind, symbol, addend });
+            }
+            self.emitted.push(Emitted {
+                addr: self.pc,
+                words: enc.words,
+                line,
+                op: None,
+                target: self.target,
+            });
+        }
+        self.pc += n * 2;
+    }
+
     fn instruction(&mut self, mnem: &str, line: &Line) {
+        if self.m68k_mode {
+            match m68k::encode(mnem, line.args, self.pc, self) {
+                Ok(enc) => self.emit_m68k(enc, line.n),
+                Err(EncodeErr::Unknown) => {
+                    self.err(line.n, format!("unknown 68000 instruction `{mnem}`"))
+                }
+                Err(EncodeErr::Message(m)) => self.err(line.n, m),
+                Err(EncodeErr::Fix(m, f)) => self.err_fix(line.n, m, f),
+            }
+            return;
+        }
         *self.pending_reloc.borrow_mut() = None;
         match encode::encode(mnem, line.args, self) {
             Ok((op, words)) => {
@@ -711,6 +759,10 @@ impl<'a> Assembler<'a> {
 
     /// Evaluate a MOVEI immediate, recording a relocation if it references an
     /// external symbol (returns the addend as the placeholder value).
+    pub(crate) fn reloc_symbol_pub(&self, expr: &str) -> Option<(String, i64)> {
+        self.reloc_symbol(expr)
+    }
+
     pub(crate) fn movei_imm(&self, expr: &str) -> Result<u32, String> {
         let e = expr.strip_prefix('#').unwrap_or(expr).trim();
         if let Some((sym, addend)) = self.reloc_symbol(e) {
@@ -754,12 +806,18 @@ fn parse_line(raw: &str, n: usize) -> Option<Line<'_>> {
     let leading_ws = raw.starts_with([' ', '\t']);
     let mut rest = trimmed;
     let mut label = None;
+    let mut label_global = false;
 
     // Label: `name:` (any column) or a bare name in column 0.
     if !leading_ws {
         if let Some(colon) = find_label_colon(rest) {
             label = Some(rest[..colon].trim());
-            rest = rest[colon + 1..].trim_start();
+            if rest[colon..].starts_with("::") {
+                label_global = true;
+                rest = rest[colon + 2..].trim_start();
+            } else {
+                rest = rest[colon + 1..].trim_start();
+            }
         } else {
             // possibly `name equ expr` / `name = expr`
             let first = rest.split_whitespace().next().unwrap_or("");
@@ -769,15 +827,15 @@ fn parse_line(raw: &str, n: usize) -> Option<Line<'_>> {
                 || al.starts_with(".equ\t") || al.starts_with(".set")
             {
                 // symbol definition: op "=", args = value
-                return Some(Line { n, label: Some(first), op: Some("="), args: kw_value(after) });
+                return Some(Line { n, label: Some(first), label_global: false, op: Some("="), args: kw_value(after) });
             }
             if al.starts_with(".equr") {
                 // register alias: NAME .equr rN
-                return Some(Line { n, label: Some(first), op: Some(".equr"), args: kw_value(after) });
+                return Some(Line { n, label: Some(first), label_global: false, op: Some(".equr"), args: kw_value(after) });
             }
             if al.starts_with(".ccdef") {
                 // condition-code alias: NAME .ccdef $15
-                return Some(Line { n, label: Some(first), op: Some(".ccdef"), args: ccdef_value(after) });
+                return Some(Line { n, label: Some(first), label_global: false, op: Some(".ccdef"), args: ccdef_value(after) });
             }
         }
     } else {
@@ -786,10 +844,10 @@ fn parse_line(raw: &str, n: usize) -> Option<Line<'_>> {
 
     let rest = rest.trim();
     if rest.is_empty() {
-        return label.map(|l| Line { n, label: Some(l), op: None, args: "" });
+        return label.map(|l| Line { n, label: Some(l), label_global, op: None, args: "" });
     }
     let (op, args) = split_op(rest);
-    Some(Line { n, label, op: Some(op), args })
+    Some(Line { n, label, label_global, op: Some(op), args })
 }
 
 fn ccdef_value(after: &str) -> &str {
@@ -838,7 +896,7 @@ fn split_op(s: &str) -> (&str, &str) {
 fn is_pseudo(op: &str) -> bool {
     matches!(
         op.to_ascii_lowercase().as_str(),
-        "dc.w" | "dc.l" | "dc.i" | "dc.b" | "equ" | "org" | "="
+        "dc.w" | "dc.l" | "dc.i" | "dc.b" | "dcb.w" | "dcb.l" | "dcb.b" | "ds.w" | "ds.l" | "ds.b" | "equ" | "org" | "="
     )
 }
 

@@ -177,3 +177,86 @@ fn equ_and_expressions() {
     // BASE + 64 = 0xF03040 -> low $3040, high $00F0
     assert_eq!(&out.bytes[2..6], &[0x30, 0x40, 0x00, 0xF0]);
 }
+
+// ── 68000 mode (validated in jag-core's interpreter) ─────────────────────────
+
+use jag_core::{Debugger, M68k};
+
+/// Assemble a 68000 program (org $4000 in DRAM), run it in the interpreter for
+/// `steps`, return the bus.
+fn run_68k(src: &str, steps: u32) -> Bus {
+    let opts = Options { target: Target::Gpu, org: 0x4000, check_hazards: false, ..Default::default() };
+    let out = assemble(src, &opts);
+    assert_eq!(out.errors(), 0, "68k assembly errors: {:#?}", out.diags);
+    let mut bus = Bus::new();
+    for (i, b) in out.bytes.iter().enumerate() {
+        bus.write8(0x4000 + i as u32, *b);
+    }
+    let mut cpu = M68k::new();
+    cpu.reset(&mut bus);
+    cpu.a[7] = 0x1F_0000; // stack
+    cpu.set_pc(0x4000);
+    let mut dbg = Debugger::new();
+    for _ in 0..steps {
+        cpu.step(&mut bus, &mut dbg);
+    }
+    bus
+}
+
+#[test]
+fn m68k_moveq_and_store() {
+    // moveq #7,d0 ; move.l d0,$100000
+    let mut bus = run_68k("        .68000\n        moveq #7,d0\n        move.l d0,$100000\n        nop\n", 3);
+    assert_eq!(bus.read32(0x0010_0000), 7);
+}
+
+#[test]
+fn m68k_arithmetic_and_addressing() {
+    // build 40 in d1 via adds, store through (a0)
+    let mut bus = run_68k(
+        "        .68000\n\
+         \x20       movea.l #$100000,a0\n\
+         \x20       moveq #10,d1\n\
+         \x20       add.l d1,d1\n\
+         \x20       addq.l #4,d1\n\
+         \x20       move.l d1,(a0)\n\
+         \x20       nop\n",
+        5,
+    );
+    assert_eq!(bus.read32(0x0010_0000), 24); // 10+10+4
+}
+
+#[test]
+fn m68k_branch_loop() {
+    // sum 1..5 in d0 with a dbra loop
+    let mut bus = run_68k(
+        "        .68000\n\
+         \x20       moveq #0,d0\n\
+         \x20       moveq #5,d1\n\
+         loop:   add.l d1,d0\n\
+         \x20       subq.l #1,d1\n\
+         \x20       bne loop\n\
+         \x20       move.l d0,$100000\n\
+         \x20       nop\n",
+        40,
+    );
+    assert_eq!(bus.read32(0x0010_0000), 15);
+}
+
+#[test]
+fn m68k_movem_roundtrip() {
+    // save d0-d2 to stack, clobber, restore, store d1
+    let mut bus = run_68k(
+        "        .68000\n\
+         \x20       moveq #11,d0\n\
+         \x20       moveq #22,d1\n\
+         \x20       moveq #33,d2\n\
+         \x20       movem.l d0-d2,-(a7)\n\
+         \x20       moveq #0,d1\n\
+         \x20       movem.l (a7)+,d0-d2\n\
+         \x20       move.l d1,$100000\n\
+         \x20       nop\n",
+        20,
+    );
+    assert_eq!(bus.read32(0x0010_0000), 22);
+}
