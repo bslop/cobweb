@@ -648,16 +648,51 @@ fn cmd_break(args: &[String]) -> Result<(), String> {
             .collect();
         format!("[{}]", items.join(","))
     });
+    // --trace N: after a RISC breakpoint, single-step the core N instructions and
+    // record the PC path (with disassembly) to trace where control flows next.
+    let trace = if hit.is_some() && core != "68k" {
+        if let Some(n) = flag_val(args, "--trace").map(parse_u32).transpose()? {
+            let is_dsp = core == "dsp";
+            let pcs = jag.trace_risc(is_dsp, n as usize);
+            let items: Vec<String> = pcs
+                .iter()
+                .map(|&pc| {
+                    let (text, _) = jag_debug::disasm_jrisc(
+                        m16(&jag.bus, pc),
+                        m16(&jag.bus, pc.wrapping_add(2)),
+                        m16(&jag.bus, pc.wrapping_add(4)),
+                        pc,
+                        is_dsp,
+                    );
+                    format!("{{\"pc\":\"0x{pc:06X}\",\"text\":{}}}", jstr(&text))
+                })
+                .collect();
+            Some(format!("[{}]", items.join(",")))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let _ = &trace;
     println!(
-        "{{\"ok\":true,\"path\":{},\"core\":{},\"stop\":{},\"hit_pc\":{},\"disasm\":{},\"state\":{}}}",
+        "{{\"ok\":true,\"path\":{},\"core\":{},\"stop\":{},\"hit_pc\":{},\"disasm\":{},\"trace\":{},\"state\":{}}}",
         jstr(&path),
         jstr(core),
         jstr(kind),
         hit.map(|p| format!("\"0x{p:06X}\"")).unwrap_or_else(|| "null".to_string()),
         disasm.unwrap_or_else(|| "null".to_string()),
+        trace.unwrap_or_else(|| "null".to_string()),
         state_json(&jag)
     );
     Ok(())
+}
+
+/// Read a big-endian 16-bit word from the bus (side-effect-free).
+fn m16(bus: &jag_core::Bus, addr: u32) -> u16 {
+    let mut b = [0u8; 2];
+    bus.peek(addr, &mut b);
+    u16::from_be_bytes(b)
 }
 
 // ── BigPEmu oracle: dump identical state for parity diffing ─────────────────

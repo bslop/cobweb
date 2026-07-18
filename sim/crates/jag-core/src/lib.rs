@@ -142,6 +142,36 @@ impl Jaguar {
         self.sched.frame
     }
 
+    /// Single-step one RISC core (GPU if `is_dsp` false, else DSP) `n` times from
+    /// its current state, returning the PC executed at each step. Breakpoints on
+    /// that core are suspended for the trace (so it steps past the one it stopped
+    /// on). The 68k/other core do not advance — this traces the core's own
+    /// instruction flow (e.g. an interrupt handler) in isolation. Used by the
+    /// debugger's post-breakpoint trace.
+    pub fn trace_risc(&mut self, is_dsp: bool, n: usize) -> Vec<u32> {
+        let mut out = Vec::with_capacity(n);
+        let saved = if is_dsp {
+            std::mem::take(&mut self.dsp.breakpoints)
+        } else {
+            std::mem::take(&mut self.gpu.breakpoints)
+        };
+        for _ in 0..n {
+            if is_dsp {
+                out.push(self.dsp.pc);
+                self.dsp.run(&mut self.bus, 1);
+            } else {
+                out.push(self.gpu.pc);
+                self.gpu.run(&mut self.bus, 1);
+            }
+        }
+        if is_dsp {
+            self.dsp.breakpoints = saved;
+        } else {
+            self.gpu.breakpoints = saved;
+        }
+        out
+    }
+
     /// Return the **true Object-Processor scan-out** for the current frame — the
     /// actual displayed image, not the DRAM the 68000 wrote. The OP composites
     /// this one line at a time as the scheduler crosses each scanline (see
