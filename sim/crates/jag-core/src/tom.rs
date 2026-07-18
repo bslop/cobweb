@@ -160,6 +160,9 @@ fn cry16_to_rgb(px: u16) -> (u8, u8, u8) {
 /// = 720 × 16-bit). All horizontal compositing clamps to this.
 const LINE_W: usize = 720;
 
+/// GPU interrupt source for the Object Processor (G_FLAGS enable bit `4+3`=7).
+const OP_INT_SOURCE: u8 = 3;
+
 /// Render **one display scanline** of the Object Processor output into the
 /// persistent framebuffer (`bus.tom.fb`).
 ///
@@ -335,7 +338,7 @@ fn op_walk_line(
     line: &mut [u16; LINE_W],
     written: &mut [bool; LINE_W],
     cpu: &mut M68k,
-    _gpu: &mut Risc,
+    gpu: &mut Risc,
     bus: &mut Bus,
 ) {
     let olp = ((bus.tom.win.r16(mem::OLPH) as u32) << 16) | bus.tom.win.r16(mem::OLP) as u32;
@@ -367,11 +370,15 @@ fn op_walk_line(
                 addr = bank | o.link;
             }
             2 => {
-                // GPU object: active only on its YPOS scanline (or the 0x7FF
-                // wildcard). When active, latch the phrase into OB0–3 for a GPU
-                // ISR and suspend the list; otherwise fall through to the next
-                // phrase so following objects still render. (Running the GPU's
-                // per-scanline line-buffer fill is task #15.)
+                // GPU object (TRM §3.3): hand the phrase to the GPU so it can act
+                // on the OP's behalf (palette load, perspective, dynamic list
+                // building). Active only when VC==YPOS (or the 0x7FF wildcard);
+                // on inactive lines the OP just falls through to the next phrase.
+                // When active we (a) latch the phrase into OB0–3, (b) raise the
+                // GPU "object" interrupt (source 3), and (c) suspend the OP until
+                // the ISR writes OBF — modelled by running the GPU synchronously
+                // here (spec §3.3 emulator note). Afterwards execution continues
+                // with the NEXT phrase in memory, not a LINK.
                 if vc32 == o.ypos || o.ypos == 0x7FF {
                     let hi = peek32(bus, addr8);
                     let lo = peek32(bus, addr8 + 4);
@@ -379,7 +386,12 @@ fn op_walk_line(
                     bus.tom.win.w16(mem::OB1, hi as u16);
                     bus.tom.win.w16(mem::OB2, (lo >> 16) as u16);
                     bus.tom.win.w16(mem::OB3, lo as u16);
-                    break;
+                    // Raise the OP interrupt (source 3); the scheduler's regular
+                    // GPU slice services it. The remaining half of task #15 — the
+                    // GPU renders each scanline into the line buffer (LBUF) and the
+                    // OP reads it back to the display — still has to land before
+                    // GPU-object games (Atari Karts et al.) actually draw.
+                    gpu.raise_int(OP_INT_SOURCE);
                 }
                 addr = addr8 + 8;
             }
