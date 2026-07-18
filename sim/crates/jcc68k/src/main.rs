@@ -19,6 +19,7 @@ fn main() {
     let mut whole_program = false;
     let mut preprocess_only = false;
     let mut include_dirs: Vec<String> = Vec::new();
+    let mut defines: Vec<String> = Vec::new();
     let mut org = 0x4000u32;
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -37,6 +38,13 @@ fn main() {
                 let dir = if a.len() > 2 { a[2..].to_string() } else { it.next().cloned().unwrap_or_default() };
                 include_dirs.push(dir);
             }
+            _ if a.starts_with("-D") => {
+                let def = if a.len() > 2 { a[2..].to_string() } else { it.next().cloned().unwrap_or_default() };
+                defines.push(def);
+            }
+            _ if a.starts_with("-U") => {
+                // Not tracked as a predefine; ignore (undefs handled in-source).
+            }
             _ if a.starts_with('-') => fail(&format!("unknown flag {a}")),
             _ => input = Some(a.clone()),
         }
@@ -46,7 +54,7 @@ fn main() {
     let path = std::path::PathBuf::from(&input);
 
     if preprocess_only {
-        let pp = jcc68k::preprocess_only(&src, &path, &include_dirs)
+        let pp = jcc68k::preprocess_only_with(&src, &path, &include_dirs, &defines)
             .unwrap_or_else(|e| fail(&format!("{input}: {e}")));
         match output {
             Some(o) => std::fs::write(&o, pp).unwrap_or_else(|e| fail(&format!("{o}: {e}"))),
@@ -56,7 +64,7 @@ fn main() {
     }
 
     // Preprocess then compile.
-    let user = jcc68k::compile_file(&src, &path, &include_dirs)
+    let user = jcc68k::compile_file_with(&src, &path, &include_dirs, &defines)
         .unwrap_or_else(|e| fail(&format!("{input}: {e}")));
     let asm = if whole_program || to_bin {
         format!("{}\n{}\n{}", jcc68k::startup(), user, jcc68k::runtime())

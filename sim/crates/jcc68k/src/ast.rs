@@ -223,11 +223,22 @@ pub struct Local {
     pub offset: i32, // relative to the frame pointer A6 (negative = locals)
 }
 
+/// One emitted piece of a global (file-scope) initializer. A global's image is
+/// a flat sequence of these, emitted in order (big-endian).
+#[derive(Clone, Debug)]
+pub enum InitByte {
+    /// A literal data byte.
+    Byte(u8),
+    /// A 32-bit big-endian address of another global symbol, plus a byte addend
+    /// (e.g. `&arr[2]` → `Addr("arr", 8)`). Emitted as `.dc.l _sym+addend`.
+    Addr(String, i64),
+}
+
 pub struct Global {
     pub name: String,
     pub ty: Type,
-    /// Initializer bytes (little/big handled by codegen); None = .bss (zeroed).
-    pub init: Option<Vec<u8>>,
+    /// Initializer image (literal bytes and/or symbol relocations); None = .bss.
+    pub init: Option<Vec<InitByte>>,
     pub is_static: bool,
     pub is_extern: bool,
 }

@@ -27,13 +27,33 @@ pub fn compile(src: &str) -> Result<String, String> {
 /// (whose on-disk location is `path`, for relative includes) with the given
 /// `-I` include directories, then compiles the result.
 pub fn compile_file(src: &str, path: &std::path::Path, include_dirs: &[String]) -> Result<String, String> {
-    let pp = preprocess::preprocess(src, path, include_dirs)?;
+    compile_file_with(src, path, include_dirs, &[])
+}
+
+/// Like [`compile_file`], with command-line `-D` macros (`NAME` or `NAME=BODY`).
+pub fn compile_file_with(
+    src: &str,
+    path: &std::path::Path,
+    include_dirs: &[String],
+    defines: &[String],
+) -> Result<String, String> {
+    let pp = preprocess::preprocess_with(src, path, include_dirs, defines)?;
     compile(&pp)
 }
 
 /// Preprocess C source (exposed for tooling / `-E`).
 pub fn preprocess_only(src: &str, path: &std::path::Path, include_dirs: &[String]) -> Result<String, String> {
     preprocess::preprocess(src, path, include_dirs)
+}
+
+/// Preprocess with command-line `-D` macros (for `-E` + `-D`).
+pub fn preprocess_only_with(
+    src: &str,
+    path: &std::path::Path,
+    include_dirs: &[String],
+    defines: &[String],
+) -> Result<String, String> {
+    preprocess::preprocess_with(src, path, include_dirs, defines)
 }
 
 /// A complete, assemblable program: startup (`_start`) → the compiled unit →

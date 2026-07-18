@@ -16,6 +16,10 @@ use std::fmt::Write;
 pub struct Gen {
     out: String,
     label: usize,
+    /// Per-translation-unit tag making string-pool labels unique across objects
+    /// (they're referenced from code but defined in `.data`, so they can't be
+    /// function-scoped `.L` locals). Derived from a hash of the unit's content.
+    str_prefix: String,
     // per-function
     frame: HashMap<String, i32>,
     types: HashMap<String, Type>,
@@ -25,10 +29,28 @@ pub struct Gen {
     cont_labels: Vec<String>,
 }
 
+/// A short, stable per-unit tag from the program's strings and symbol names, so
+/// two distinct translation units don't emit colliding string-pool labels.
+fn unit_tag(prog: &Program) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for s in &prog.strings {
+        s.hash(&mut h);
+    }
+    for f in &prog.functions {
+        f.name.hash(&mut h);
+    }
+    for g in &prog.globals {
+        g.name.hash(&mut h);
+    }
+    format!("{:08x}", h.finish() as u32)
+}
+
 pub fn generate(prog: &Program) -> Result<String, String> {
     let mut g = Gen {
         out: String::new(),
         label: 0,
+        str_prefix: format!("__str_{}", unit_tag(prog)),
         frame: HashMap::new(),
         types: HashMap::new(),
         globals: HashMap::new(),
@@ -273,7 +295,7 @@ impl Gen {
                 self.load_imm(*n as i32);
             }
             ExprK::StrLit(idx) => {
-                self.line(&format!("lea .Lstr{idx},a0"));
+                self.line(&format!("lea {}_{idx},a0", self.str_prefix));
                 self.line("move.l a0,d0");
             }
             ExprK::Var(_) | ExprK::Unary(UnOp::Deref, _) | ExprK::Member(..) => {
@@ -673,7 +695,7 @@ impl Gen {
         if !prog.strings.is_empty() {
             self.out.push_str("\t.data\n");
             for (i, s) in prog.strings.iter().enumerate() {
-                writeln!(self.out, ".Lstr{i}:").unwrap();
+                writeln!(self.out, "{}_{i}:", self.str_prefix).unwrap();
                 self.out.push_str("\t.dc.b ");
                 let parts: Vec<String> = s.iter().map(|b| format!("${b:02X}")).collect();
                 self.out.push_str(&parts.join(","));
@@ -694,10 +716,7 @@ impl Gen {
                         writeln!(self.out, "\t.globl {}", mangle(&g.name)).unwrap();
                     }
                     writeln!(self.out, "{}:", mangle(&g.name)).unwrap();
-                    self.out.push_str("\t.dc.b ");
-                    let parts: Vec<String> = init.iter().map(|b| format!("${b:02X}")).collect();
-                    self.out.push_str(&parts.join(","));
-                    self.out.push('\n');
+                    emit_init(&mut self.out, init);
                 }
             }
         }
@@ -713,6 +732,36 @@ impl Gen {
             writeln!(self.out, "\t.ds.b {sz}").unwrap();
         }
     }
+}
+
+/// Emit a global's initializer image: coalesce runs of literal bytes into
+/// `.dc.b` directives, and emit each symbol address as `.dc.l _sym+addend`.
+fn emit_init(out: &mut String, init: &[InitByte]) {
+    let mut run: Vec<u8> = Vec::new();
+    let flush = |out: &mut String, run: &mut Vec<u8>| {
+        if !run.is_empty() {
+            out.push_str("\t.dc.b ");
+            let parts: Vec<String> = run.iter().map(|b| format!("${b:02X}")).collect();
+            out.push_str(&parts.join(","));
+            out.push('\n');
+            run.clear();
+        }
+    };
+    for item in init {
+        match item {
+            InitByte::Byte(b) => run.push(*b),
+            InitByte::Addr(sym, addend) => {
+                flush(out, &mut run);
+                out.push_str("\t.even\n");
+                if *addend != 0 {
+                    writeln!(out, "\t.dc.l {}+{}", mangle(sym), addend).unwrap();
+                } else {
+                    writeln!(out, "\t.dc.l {}", mangle(sym)).unwrap();
+                }
+            }
+        }
+    }
+    flush(out, &mut run);
 }
 
 /// Post-process the emitted assembly. Currently: drop `bra L` when the very

@@ -50,8 +50,27 @@ struct CondFrame {
 }
 
 pub fn preprocess(src: &str, path: &Path, include_dirs: &[String]) -> Result<String, String> {
+    preprocess_with(src, path, include_dirs, &[])
+}
+
+/// Like [`preprocess`], with command-line `-D` macros applied first. Each entry
+/// is `NAME` (defined as `1`) or `NAME=BODY`.
+pub fn preprocess_with(
+    src: &str,
+    path: &Path,
+    include_dirs: &[String],
+    defines: &[String],
+) -> Result<String, String> {
+    let mut macros = builtin_macros();
+    for d in defines {
+        let (name, body) = match d.split_once('=') {
+            Some((n, b)) => (n, b),
+            None => (d.as_str(), "1"),
+        };
+        macros.insert(name.trim().to_string(), Macro { params: None, body: lex_pp(body) });
+    }
     let mut pp = Pp {
-        macros: builtin_macros(),
+        macros,
         include_dirs: include_dirs.iter().map(PathBuf::from).collect(),
         active_stack: Vec::new(),
         out: String::new(),
@@ -60,6 +79,37 @@ pub fn preprocess(src: &str, path: &Path, include_dirs: &[String]) -> Result<Str
     };
     pp.run(src, path)?;
     Ok(pp.out)
+}
+
+/// Freestanding standard headers jcc68k supplies itself (LP32 model).
+fn builtin_header(name: &str) -> Option<&'static str> {
+    let base = name.rsplit('/').next().unwrap_or(name);
+    Some(match base {
+        "stdint.h" => {
+            "typedef signed char int8_t; typedef unsigned char uint8_t;\
+             typedef short int16_t; typedef unsigned short uint16_t;\
+             typedef int int32_t; typedef unsigned int uint32_t;\
+             typedef int intptr_t; typedef unsigned int uintptr_t;\
+             typedef int int_fast16_t; typedef unsigned int uint_fast16_t;\
+             typedef signed char int_least8_t; typedef unsigned char uint_least8_t;"
+        }
+        "stddef.h" => {
+            "typedef unsigned int size_t; typedef int ptrdiff_t;\
+             #define NULL ((void*)0)"
+        }
+        "stdbool.h" => "typedef int bool; #define true 1\n#define false 0\n#define __bool_true_false_are_defined 1",
+        "stdarg.h" => {
+            // Args are 32-bit longs on the stack; va_list walks upward. `ap` is
+            // initialized to the address just past the last named argument.
+            "typedef char* va_list;\
+             #define va_start(ap,last) ((ap) = (va_list)&(last) + sizeof(last))\
+             #define va_arg(ap,ty) (*(ty*)(((ap) += 4) - 4))\
+             #define va_end(ap) ((void)0)\
+             #define va_copy(d,s) ((d)=(s))"
+        }
+        "stdlib.h" | "string.h" | "stdio.h" | "math.h" | "assert.h" | "ctype.h" => "",
+        _ => return None,
+    })
 }
 
 fn builtin_macros() -> HashMap<String, Macro> {
@@ -223,6 +273,18 @@ impl Pp {
                 return Ok(());
             }
         };
+        // Built-in freestanding headers (the ports are -nostdlib; supply the
+        // fixed-width types, size_t/NULL, bool, and the varargs macros).
+        if let Some(text) = builtin_header(&fname) {
+            let bp = PathBuf::from(format!("<builtin>/{fname}"));
+            if self.included.insert(bp.clone()) {
+                let text = text.to_string();
+                self.depth += 1;
+                self.run(&text, &bp)?;
+                self.depth -= 1;
+            }
+            return Ok(());
+        }
         let resolved = self.resolve_include(&fname, cur, angle);
         let Some(p) = resolved else {
             // Missing header: skip rather than fail, so system headers we don't
@@ -353,19 +415,82 @@ impl Pp {
 /// Substitute macro parameters in a function-macro body with the actual args
 /// (each arg is itself expanded).
 fn substitute(body: &[Tk], params: &[String], args: &[Vec<Tk>], pp: &Pp, hide: &HashSet<String>) -> Vec<Tk> {
-    let mut out = Vec::new();
-    for t in body {
+    // Raw (unexpanded) argument tokens for a parameter name.
+    let raw_arg = |name: &str| -> Option<Vec<Tk>> {
+        params.iter().position(|p| p == name).and_then(|i| args.get(i).cloned())
+    };
+    // The `##`/`#` operands of a token: a parameter yields its RAW argument (no
+    // expansion), anything else yields itself verbatim.
+    let operand_raw = |t: &Tk| -> Vec<Tk> {
+        if let Tk::Id(name) = t {
+            if let Some(a) = raw_arg(name) {
+                return a;
+            }
+        }
+        vec![t.clone()]
+    };
+
+    let mut out: Vec<Tk> = Vec::new();
+    let mut i = 0;
+    while i < body.len() {
+        let t = &body[i];
+        // Stringize: `# param` → a single string token of the raw argument.
+        if matches!(t, Tk::Hash) {
+            if let Some(Tk::Id(name)) = body.get(i + 1) {
+                if let Some(arg) = raw_arg(name) {
+                    out.push(Tk::Str(format!("\"{}\"", render(&arg))));
+                    i += 2;
+                    continue;
+                }
+            }
+        }
+        // Paste: `A ## B [## C …]`. Operands are taken raw; adjacent tokens are
+        // concatenated and re-lexed. Interior tokens of multi-token args stay put.
+        if matches!(body.get(i + 1), Some(Tk::HashHash)) {
+            let mut acc = operand_raw(t);
+            let mut j = i;
+            while matches!(body.get(j + 1), Some(Tk::HashHash)) {
+                let right = body.get(j + 2).map(operand_raw).unwrap_or_default();
+                acc = paste_tokens(acc, right);
+                j += 2;
+            }
+            out.extend(acc);
+            i = j + 1;
+            continue;
+        }
+        // Ordinary parameter → fully macro-expanded argument.
         if let Tk::Id(name) = t {
             if let Some(idx) = params.iter().position(|p| p == name) {
                 if let Some(arg) = args.get(idx) {
                     let mut h = hide.clone();
                     out.extend(pp.expand(arg.clone(), &mut h));
+                    i += 1;
                     continue;
                 }
             }
         }
         out.push(t.clone());
+        i += 1;
     }
+    out
+}
+
+/// Concatenate two operand token-runs across the `##` boundary: the last token
+/// of `left` is spelled together with the first token of `right` and re-lexed
+/// into whatever token(s) that produces; everything else is preserved.
+fn paste_tokens(mut left: Vec<Tk>, mut right: Vec<Tk>) -> Vec<Tk> {
+    if left.is_empty() {
+        return right;
+    }
+    if right.is_empty() {
+        return left;
+    }
+    let l = left.pop().unwrap();
+    let r = right.remove(0);
+    let glued = format!("{}{}", render(std::slice::from_ref(&l)), render(std::slice::from_ref(&r)));
+    let mut out = left;
+    out.extend(lex_pp(&glued));
+    out.extend(right);
     out
 }
 
@@ -576,10 +701,18 @@ fn lex_pp(s: &str) -> Vec<Tk> {
             }
             continue;
         }
-        // multi-char punctuators
+        // multi-char punctuators (longest first so `<<=` beats `<<`)
+        let three = if i + 2 < b.len() { &s[i..i + 3] } else { "" };
+        const P3: &[&str] = &["<<=", ">>=", "..."];
+        if P3.contains(&three) {
+            out.push(Tk::Punct(three.to_string()));
+            i += 3;
+            continue;
+        }
         let two = if i + 1 < b.len() { &s[i..i + 2] } else { "" };
         const P2: &[&str] = &[
             "<<", ">>", "<=", ">=", "==", "!=", "&&", "||", "->", "++", "--", "+=", "-=",
+            "*=", "/=", "%=", "&=", "|=", "^=",
         ];
         if P2.contains(&two) {
             out.push(Tk::Punct(two.to_string()));

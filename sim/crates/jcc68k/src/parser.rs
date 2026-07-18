@@ -45,7 +45,82 @@ struct VarRef {
 
 type PResult<T> = Result<T, String>;
 
+/// Normalize GNU C extensions the parser doesn't model but must not choke on:
+/// drop `__attribute__((…))`, `__asm__(…)`, `__extension__`, and `__restrict`;
+/// fold `__inline__`/`__const__`/`__volatile__`/`__signed__` to their keywords.
+fn strip_gnu(toks: Vec<Token>) -> Vec<Token> {
+    let mut out = Vec::with_capacity(toks.len());
+    let mut i = 0;
+    let kw = |s: &str, t: &Token| Token { tok: Tok::Keyword(s.into()), line: t.line, col: t.col };
+    while i < toks.len() {
+        if let Tok::Ident(s) = &toks[i].tok {
+            match s.as_str() {
+                "__attribute__" | "__attribute" | "__asm__" | "__asm" | "asm" => {
+                    i += 1;
+                    // `asm`/`__asm__` may carry a qualifier before the `(`:
+                    // `__asm__ volatile ("…")`, `asm goto (…)`.
+                    while matches!(toks.get(i).map(|t| &t.tok),
+                        Some(Tok::Keyword(k)) if k == "volatile" || k == "const" || k == "inline" || k == "goto")
+                        || matches!(toks.get(i).map(|t| &t.tok),
+                        Some(Tok::Ident(id)) if id == "__volatile__")
+                    {
+                        i += 1;
+                    }
+                    if matches!(toks.get(i).map(|t| &t.tok), Some(Tok::Punct(p)) if p == "(") {
+                        let mut depth = 0i32;
+                        while i < toks.len() {
+                            match &toks[i].tok {
+                                Tok::Punct(p) if p == "(" => depth += 1,
+                                Tok::Punct(p) if p == ")" => {
+                                    depth -= 1;
+                                    i += 1;
+                                    if depth == 0 {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                                _ => {}
+                            }
+                            i += 1;
+                        }
+                    }
+                    continue;
+                }
+                "__extension__" | "__restrict__" | "__restrict" | "restrict" => {
+                    i += 1;
+                    continue;
+                }
+                "__inline__" | "__inline" | "__forceinline" => {
+                    out.push(kw("inline", &toks[i]));
+                    i += 1;
+                    continue;
+                }
+                "__const__" | "__const" => {
+                    out.push(kw("const", &toks[i]));
+                    i += 1;
+                    continue;
+                }
+                "__volatile__" | "__volatile" => {
+                    out.push(kw("volatile", &toks[i]));
+                    i += 1;
+                    continue;
+                }
+                "__signed__" => {
+                    out.push(kw("signed", &toks[i]));
+                    i += 1;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        out.push(toks[i].clone());
+        i += 1;
+    }
+    out
+}
+
 pub fn parse(toks: Vec<Token>) -> PResult<Program> {
+    let toks = strip_gnu(toks);
     let mut p = Parser {
         toks,
         pos: 0,
@@ -234,20 +309,138 @@ impl Parser {
         Ok(())
     }
 
-    fn global_initializer(&mut self, ty: &Type) -> PResult<Vec<u8>> {
-        // Only constant scalar / string initializers for now.
-        if let Tok::Str(bytes) = self.peek().clone() {
-            self.pos += 1;
-            return Ok(bytes);
-        }
-        let e = self.assign()?;
-        let v = const_eval(&e)?;
-        let sz = ty.size().max(1);
+    fn global_initializer(&mut self, ty: &Type) -> PResult<Vec<InitByte>> {
         let mut out = Vec::new();
-        for i in (0..sz).rev() {
-            out.push(((v >> (i * 8)) & 0xFF) as u8); // big-endian
-        }
+        self.global_init_into(ty, &mut out)?;
         Ok(out)
+    }
+
+    /// Parse one initializer for `ty`, appending its big-endian image to `out`
+    /// and padding to `ty.size()`. Handles nested braces (arrays/structs),
+    /// string literals into char arrays, scalar constants, and address-of /
+    /// bare-array-name pointer initializers (emitted as relocations).
+    fn global_init_into(&mut self, ty: &Type, out: &mut Vec<InitByte>) -> PResult<()> {
+        // `char buf[] = "…"` / `char buf[N] = "…"`.
+        if let TypeK::Array(el, n) = &**ty {
+            if el.size() == 1 {
+                if let Tok::Str(bytes) = self.peek().clone() {
+                    self.pos += 1;
+                    let cap = if *n == 0 { bytes.len() as u32 } else { *n };
+                    for i in 0..cap {
+                        out.push(InitByte::Byte(*bytes.get(i as usize).unwrap_or(&0)));
+                    }
+                    return Ok(());
+                }
+            }
+        }
+        if self.eat_punct("{") {
+            match &**ty {
+                TypeK::Array(el, n) => {
+                    let esz = el.size().max(1);
+                    let mut count = 0u32;
+                    while !self.at_punct("}") {
+                        self.global_init_into(el, out)?;
+                        count += 1;
+                        if !self.eat_punct(",") {
+                            break;
+                        }
+                    }
+                    self.expect("}")?;
+                    // zero-fill the remaining declared elements
+                    let total = if *n == 0 { count } else { *n };
+                    for _ in count..total {
+                        for _ in 0..esz {
+                            out.push(InitByte::Byte(0));
+                        }
+                    }
+                }
+                TypeK::Struct { members, size, .. } => {
+                    let start = out.len();
+                    let mut mi = 0usize;
+                    while !self.at_punct("}") {
+                        if mi >= members.len() {
+                            return Err(format!("{}: too many struct initializers", self.line()));
+                        }
+                        // pad to this member's offset
+                        let target = start + members[mi].offset as usize;
+                        while out.len() < target {
+                            out.push(InitByte::Byte(0));
+                        }
+                        self.global_init_into(&members[mi].ty, out)?;
+                        mi += 1;
+                        if !self.eat_punct(",") {
+                            break;
+                        }
+                    }
+                    self.expect("}")?;
+                    while out.len() < start + *size as usize {
+                        out.push(InitByte::Byte(0));
+                    }
+                }
+                _ => {
+                    // scalar wrapped in braces: `int x = { 5 };`
+                    self.global_init_into(ty, out)?;
+                    self.eat_punct(",");
+                    self.expect("}")?;
+                }
+            }
+            return Ok(());
+        }
+        // Scalar. Try a symbol address first (pointer initializers), else a
+        // constant expression.
+        let sz = ty.size().max(1);
+        if ty.is_ptr() {
+            if let Some((sym, addend)) = self.try_global_addr()? {
+                out.push(InitByte::Addr(sym, addend));
+                return Ok(());
+            }
+        }
+        let line = self.line();
+        let e = self.assign()?;
+        let v = const_eval(&e).map_err(|m| format!("{line}: {m} in initializer"))?;
+        for i in (0..sz).rev() {
+            out.push(InitByte::Byte(((v >> (i * 8)) & 0xFF) as u8));
+        }
+        Ok(())
+    }
+
+    /// Recognize a pointer initializer that is the address of a global:
+    /// a bare array/global name, `&global`, `&global[k]`, or `name + k`.
+    /// Returns `(mangled-less symbol, byte addend)` or None if it isn't one.
+    fn try_global_addr(&mut self) -> PResult<Option<(String, i64)>> {
+        let save = self.pos;
+        let took_amp = self.eat_punct("&");
+        if let Tok::Ident(name) = self.peek().clone() {
+            if let Some(v) = self.resolve(&name) {
+                if v.is_global {
+                    self.pos += 1;
+                    let mut addend = 0i64;
+                    // &global[k]  → addend = k * elem_size
+                    if self.eat_punct("[") {
+                        let idx = const_eval(&self.assign()?)?;
+                        self.expect("]")?;
+                        let esz = v.ty.base().map(|e| e.size()).unwrap_or(1) as i64;
+                        addend += idx * esz;
+                    }
+                    // name + k / name - k  → addend scaled by pointee size
+                    let scale = v.ty.base().map(|e| e.size().max(1)).unwrap_or(1) as i64;
+                    loop {
+                        if self.eat_punct("+") {
+                            addend += const_eval(&self.assign()?)? * scale;
+                        } else if self.eat_punct("-") {
+                            addend -= const_eval(&self.assign()?)? * scale;
+                        } else {
+                            break;
+                        }
+                    }
+                    return Ok(Some((v.name, addend)));
+                }
+            }
+        }
+        // not a symbol address — restore and let the caller const-eval it
+        self.pos = save;
+        let _ = took_amp;
+        Ok(None)
     }
 
     fn function(&mut self, name: String, ty: Type, sc: Storage) -> PResult<()> {
@@ -580,9 +773,33 @@ impl Parser {
                 break;
             }
             let (name, ty) = self.declarator(base.clone())?;
-            if sc.is_static || sc.is_extern {
-                // A static/extern local lives in static storage, not the frame:
-                // give it a unique global and bind the name to it in this scope.
+            if sc.is_extern {
+                // `extern T x;` inside a function refers to the file-scope /
+                // other-unit symbol `x` — bind to the real name, don't mint a
+                // fresh one. Register it as a known (external) global so codegen
+                // emits `_x`, unless a definition for it already exists here.
+                self.scopes.last_mut().unwrap().insert(
+                    name.clone(),
+                    VarRef { name: name.clone(), ty: ty.clone(), is_global: true },
+                );
+                if !self.globals.iter().any(|g| g.name == name) {
+                    self.globals.push(Global {
+                        name: name.clone(),
+                        ty: ty.clone(),
+                        init: None,
+                        is_static: false,
+                        is_extern: true,
+                    });
+                }
+                // An extern declaration can't have an initializer; move on.
+                if !self.eat_punct(",") {
+                    break;
+                }
+                continue;
+            }
+            if sc.is_static {
+                // A static local lives in static storage, not the frame: give it
+                // a unique global (internal linkage) and bind it in this scope.
                 self.uid += 1;
                 let uniq = format!("{name}__s{}", self.uid);
                 self.scopes.last_mut().unwrap().insert(
@@ -593,15 +810,13 @@ impl Parser {
                 if self.eat_punct("=") {
                     init = Some(self.global_initializer(&ty)?);
                 }
-                if !sc.is_extern {
-                    self.globals.push(Global {
-                        name: uniq,
-                        ty,
-                        init,
-                        is_static: true,
-                        is_extern: false,
-                    });
-                }
+                self.globals.push(Global {
+                    name: uniq,
+                    ty,
+                    init,
+                    is_static: true,
+                    is_extern: false,
+                });
                 if !self.eat_punct(",") {
                     break;
                 }
@@ -904,7 +1119,7 @@ impl Parser {
             Tok::Keyword(k) => matches!(
                 k.as_str(),
                 "void" | "char" | "short" | "int" | "long" | "unsigned" | "signed"
-                    | "struct" | "union" | "enum" | "float" | "double" | "_Bool" | "const"
+                    | "struct" | "union" | "enum" | "float" | "double" | "_Bool" | "const" | "volatile"
             ),
             Tok::Ident(s) => self.find_typedef(s).is_some(),
             _ => false,
@@ -1212,7 +1427,18 @@ pub fn const_eval(e: &Expr) -> Result<i64, String> {
         ExprK::Num(n) => *n,
         ExprK::Unary(UnOp::Neg, a) => -const_eval(a)?,
         ExprK::Unary(UnOp::Not, a) => !const_eval(a)?,
+        ExprK::Unary(UnOp::LogNot, a) => (const_eval(a)? == 0) as i64,
         ExprK::Binary(op, a, b) => {
+            // Short-circuit operators must not eval the dead side.
+            match op {
+                BinOp::LogAnd => {
+                    return Ok((const_eval(a)? != 0 && const_eval(b)? != 0) as i64);
+                }
+                BinOp::LogOr => {
+                    return Ok((const_eval(a)? != 0 || const_eval(b)? != 0) as i64);
+                }
+                _ => {}
+            }
             let (x, y) = (const_eval(a)?, const_eval(b)?);
             match op {
                 BinOp::Add => x + y,
@@ -1225,7 +1451,20 @@ pub fn const_eval(e: &Expr) -> Result<i64, String> {
                 BinOp::And => x & y,
                 BinOp::Or => x | y,
                 BinOp::Xor => x ^ y,
-                _ => return Err("non-constant expression".into()),
+                BinOp::Eq => (x == y) as i64,
+                BinOp::Ne => (x != y) as i64,
+                BinOp::Lt => (x < y) as i64,
+                BinOp::Le => (x <= y) as i64,
+                BinOp::Gt => (x > y) as i64,
+                BinOp::Ge => (x >= y) as i64,
+                BinOp::LogAnd | BinOp::LogOr => unreachable!(),
+            }
+        }
+        ExprK::Cond(c, t, f) => {
+            if const_eval(c)? != 0 {
+                const_eval(t)?
+            } else {
+                const_eval(f)?
             }
         }
         ExprK::Cast(a) => const_eval(a)?,
