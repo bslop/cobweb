@@ -276,3 +276,42 @@ fn struct_array_and_typedef() {
     "#;
     assert_eq!(run(src), (0 + 9 + 18));
 }
+
+#[test]
+fn switch_stmt() {
+    let f = |n: i32| format!("int main(){{ int x={n}; int r=0; switch(x){{ case 1: r=10; break; case 2: r=20; break; case 3: r=30; break; default: r=99; }} return r; }}");
+    assert_eq!(run(&f(1)), 10);
+    assert_eq!(run(&f(2)), 20);
+    assert_eq!(run(&f(3)), 30);
+    assert_eq!(run(&f(7)), 99);
+}
+
+#[test]
+fn switch_fallthrough() {
+    let src = "int main(){ int x=1; int r=0; switch(x){ case 1: r+=1; case 2: r+=2; case 3: r+=4; break; case 4: r+=8; } return r; }";
+    assert_eq!(run(src), 7);
+}
+
+#[test]
+fn array_initializer() {
+    let src = "int main(){ int a[5] = {10,20,30}; return a[0]+a[1]+a[2]+a[3]+a[4]; }";
+    assert_eq!(run(src), 60); // 10+20+30+0+0
+}
+
+#[test]
+fn struct_initializer() {
+    let src = "struct P{int x;int y;int z;}; int main(){ struct P p = {3,4,5}; return p.x*100+p.y*10+p.z; }";
+    assert_eq!(run(src), 345);
+}
+
+#[test]
+fn nested_array_init() {
+    let src = "int main(){ int m[2][3] = {{1,2,3},{4,5,6}}; return m[0][0]+m[0][2]+m[1][1]+m[1][2]; }";
+    assert_eq!(run(src), 1+3+5+6);
+}
+
+#[test]
+fn goto_stmt() {
+    let src = "int main(){ int i=0; int s=0; loop: if(i<5){ s+=i; i++; goto loop; } return s; }";
+    assert_eq!(run(src), 10);
+}

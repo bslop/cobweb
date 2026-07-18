@@ -169,9 +169,27 @@ pub enum Stmt {
     Block(Vec<Stmt>),
     Break,
     Continue,
-    /// A local variable declaration with an optional initializer.
-    Decl(String, Type, Option<Expr>),
+    /// `switch (expr) body`, plus the collected `(case value, label id)` list and
+    /// an optional default label id (assigned by the parser).
+    Switch(Expr, Box<Stmt>, Vec<(i64, u32)>, Option<u32>),
+    /// A `case N:` label — its unique id matches an entry in the enclosing Switch.
+    Case(u32),
+    /// A `default:` label.
+    Default(u32),
+    Goto(String),
+    Label(String, Box<Stmt>),
+    /// A local variable declaration with an optional initializer. The initializer
+    /// list handles scalars, arrays, and structs (see `Init`).
+    Decl(String, Type, Option<Init>),
     Null,
+}
+
+/// A local/global initializer: a scalar expression, or a brace list for
+/// aggregates (arrays/structs), possibly nested.
+#[derive(Debug, Clone)]
+pub enum Init {
+    Scalar(Expr),
+    List(Vec<Init>),
 }
 
 // ── top level ────────────────────────────────────────────────────────────────

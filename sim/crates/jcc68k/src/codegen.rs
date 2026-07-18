@@ -139,9 +139,41 @@ impl Gen {
             }
             Stmt::Decl(name, ty, init) => {
                 if let Some(init) = init {
-                    self.gen_expr(init)?; // value in D0
-                    self.store_to_local(name, ty);
+                    let off = self.frame.get(name).copied().unwrap_or(0);
+                    match init {
+                        Init::Scalar(e) => {
+                            self.gen_expr(e)?;
+                            self.store_to_local(name, ty);
+                        }
+                        Init::List(_) => {
+                            self.clear_frame(off, ty.size());
+                            self.gen_local_init(off, ty, init)?;
+                        }
+                    }
                 }
+            }
+            Stmt::Switch(cond, body, cases, default) => {
+                self.gen_expr(cond)?; // D0 = switch value
+                for (val, id) in cases {
+                    self.line(&format!("cmpi.l #{val},d0"));
+                    self.line(&format!("beq.w .Lsw_{id}"));
+                }
+                let brk = self.l();
+                let after = default
+                    .map(|d| format!(".Lsw_{d}"))
+                    .unwrap_or_else(|| format!(".Lbrk_{brk}"));
+                self.line(&format!("bra.w {after}"));
+                self.break_labels.push(format!(".Lbrk_{brk}"));
+                self.gen_stmt(body)?;
+                self.break_labels.pop();
+                self.lbl(&format!(".Lbrk_{brk}"));
+            }
+            Stmt::Case(id) => self.lbl(&format!(".Lsw_{id}")),
+            Stmt::Default(id) => self.lbl(&format!(".Lsw_{id}")),
+            Stmt::Goto(name) => self.line(&format!("bra.w .LuserL_{name}")),
+            Stmt::Label(name, s) => {
+                self.lbl(&format!(".LuserL_{name}"));
+                self.gen_stmt(s)?;
             }
             Stmt::If(c, then, els) => {
                 let lelse = self.l();
@@ -504,6 +536,60 @@ impl Gen {
             2 => self.line("move.w d0,(a0)"),
             _ => self.line("move.l d0,(a0)"),
         }
+    }
+
+    /// Zero `size` bytes at `off(a6)` (used before an aggregate initializer so
+    /// unlisted elements read as 0, per C).
+    fn clear_frame(&mut self, off: i32, size: u32) {
+        if size == 0 {
+            return;
+        }
+        self.line(&format!("lea {off}(a6),a0"));
+        let longs = size / 4;
+        if longs > 0 {
+            let lbl = self.l();
+            self.load_imm_into("d0", longs as i32 - 1);
+            self.lbl(&format!(".Lclr_{lbl}"));
+            self.line("clr.l (a0)+");
+            self.line(&format!("dbra d0,.Lclr_{lbl}"));
+        }
+        for _ in 0..(size % 4) {
+            self.line("clr.b (a0)+");
+        }
+    }
+
+    /// Emit an aggregate/scalar initializer into the frame slot at `off(a6)`.
+    fn gen_local_init(&mut self, off: i32, ty: &Type, init: &Init) -> Result<(), String> {
+        match (init, &**ty) {
+            (Init::Scalar(e), _) => {
+                self.gen_expr(e)?;
+                match ty.size() {
+                    1 => self.line(&format!("move.b d0,{off}(a6)")),
+                    2 => self.line(&format!("move.w d0,{off}(a6)")),
+                    _ => self.line(&format!("move.l d0,{off}(a6)")),
+                }
+            }
+            (Init::List(items), TypeK::Array(el, n)) => {
+                let esz = el.size() as i32;
+                for (i, it) in items.iter().enumerate() {
+                    if *n != 0 && i as u32 >= *n {
+                        break;
+                    }
+                    self.gen_local_init(off + i as i32 * esz, el, it)?;
+                }
+            }
+            (Init::List(items), TypeK::Struct { members, .. }) => {
+                for (it, m) in items.iter().zip(members.iter()) {
+                    self.gen_local_init(off + m.offset as i32, &m.ty, it)?;
+                }
+            }
+            (Init::List(items), _) => {
+                if let Some(first) = items.first() {
+                    self.gen_local_init(off, ty, first)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn store_to_local(&mut self, name: &str, ty: &Type) {

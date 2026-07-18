@@ -26,6 +26,14 @@ pub struct Parser {
     pending_params: Vec<String>,
     /// enum constant name → value, visible as integer constants.
     enum_consts: HashMap<String, i64>,
+    /// Stack of switch statements being parsed, collecting their case labels.
+    cur_switch: Vec<SwitchBuild>,
+}
+
+#[derive(Default)]
+struct SwitchBuild {
+    cases: Vec<(i64, u32)>,
+    default: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -51,6 +59,7 @@ pub fn parse(toks: Vec<Token>) -> PResult<Program> {
         strings: Vec::new(),
         pending_params: Vec::new(),
         enum_consts: HashMap::new(),
+        cur_switch: Vec::new(),
     };
     p.program()?;
     Ok(Program { functions: p.functions, globals: p.globals, strings: p.strings })
@@ -562,7 +571,7 @@ impl Parser {
             let (name, ty) = self.declarator(base.clone())?;
             let uniq = self.new_local(&name, ty.clone());
             let init = if self.eat_punct("=") {
-                Some(self.assign()?)
+                Some(self.initializer()?)
             } else {
                 None
             };
@@ -575,7 +584,67 @@ impl Parser {
         Ok(())
     }
 
+    fn initializer(&mut self) -> PResult<Init> {
+        if self.eat_punct("{") {
+            let mut items = Vec::new();
+            while !self.at_punct("}") {
+                items.push(self.initializer()?);
+                if !self.eat_punct(",") {
+                    break;
+                }
+            }
+            self.expect("}")?;
+            Ok(Init::List(items))
+        } else {
+            Ok(Init::Scalar(self.assign()?))
+        }
+    }
+
     fn stmt(&mut self) -> PResult<Stmt> {
+        // labeled statement:  IDENT ':' stmt   (goto target)
+        if let Tok::Ident(name) = self.peek().clone() {
+            if matches!(&self.toks[self.pos + 1].tok, Tok::Punct(p) if p == ":") {
+                self.pos += 2;
+                let s = self.stmt()?;
+                return Ok(Stmt::Label(name, Box::new(s)));
+            }
+        }
+        if self.eat_kw("switch") {
+            self.expect("(")?;
+            let cond = self.expr()?;
+            self.expect(")")?;
+            self.cur_switch.push(SwitchBuild::default());
+            let body = self.stmt()?;
+            let sw = self.cur_switch.pop().unwrap();
+            return Ok(Stmt::Switch(cond, Box::new(body), sw.cases, sw.default));
+        }
+        if self.eat_kw("case") {
+            let e = self.conditional()?;
+            let val = const_eval(&e)?;
+            self.expect(":")?;
+            let id = self.uid as u32;
+            self.uid += 1;
+            if let Some(sw) = self.cur_switch.last_mut() {
+                sw.cases.push((val, id));
+            }
+            // The statement after the label is a separate block item; a bare
+            // `case N:` before `}` is allowed (empty).
+            return Ok(Stmt::Case(id));
+        }
+        if self.eat_kw("default") {
+            self.expect(":")?;
+            let id = self.uid as u32;
+            self.uid += 1;
+            if let Some(sw) = self.cur_switch.last_mut() {
+                sw.default = Some(id);
+            }
+            return Ok(Stmt::Default(id));
+        }
+        if self.eat_kw("goto") {
+            let name = self.ident()?;
+            self.expect(";")?;
+            return Ok(Stmt::Goto(name));
+        }
         if self.eat_kw("return") {
             if self.eat_punct(";") {
                 return Ok(Stmt::Return(None));
