@@ -308,7 +308,18 @@ pub(crate) fn encode(mnem: &str, args: &str, here: u32, asm: &Assembler) -> Resu
         }
         let dest = asm.eval_pub(target).map_err(msg)?;
         let disp = dest as i64 - (here as i64 + 2);
-        if (-128..=127).contains(&disp) && disp != 0 {
+        // An explicit size forces the form: `.w` → 16-bit, `.s`/`.b` → short. This
+        // lets a code generator sidestep short/long relaxation entirely by always
+        // requesting `.w`. Without a suffix, auto-select (short when it fits).
+        let force_word = low.ends_with(".w");
+        let force_short = low.ends_with(".s") || low.ends_with(".b");
+        if !force_word && (force_short || ((-128..=127).contains(&disp) && disp != 0)) {
+            if disp == 0 {
+                return Err(msg("short branch to next instruction (disp 0) — use .w"));
+            }
+            if !(-128..=127).contains(&disp) {
+                return Err(msg("short branch displacement out of range"));
+            }
             return Ok(one(opbase | (disp as u8 as u16)));
         }
         // 16-bit form
@@ -385,6 +396,42 @@ pub(crate) fn encode(mnem: &str, args: &str, here: u32, asm: &Assembler) -> Resu
         let dn = dreg(args.trim()).ok_or_else(|| msg("ext needs a data register"))?;
         let w = if sz == Sz::L { 0x48C0 } else { 0x4880 };
         return Ok(one(w | dn));
+    }
+
+    // ── mulu / muls / divu / divs (word form: <ea>,Dn) ────────────────────────
+    if let Some(opbase) = match base.as_str() {
+        "mulu" => Some(0xC0C0u16),
+        "muls" => Some(0xC1C0),
+        "divu" => Some(0x80C0),
+        "divs" => Some(0x81C0),
+        _ => None,
+    } {
+        let (src, dn_s) = split2(args)?;
+        let dn = dreg(&dn_s).ok_or_else(|| msg("mul/div destination must be a data register"))?;
+        let s = parse_ea(&src, Sz::W, asm)?;
+        return Ok(with_src(opbase | (dn << 9) | s.field(), &s));
+    }
+
+    // ── addx / subx (data-register form: Dy,Dx) ──────────────────────────────
+    if let Some(opbase) = match base.as_str() {
+        "addx" => Some(0xD100u16),
+        "subx" => Some(0x9100),
+        _ => None,
+    } {
+        let (dy_s, dx_s) = split2(args)?;
+        let dy = dreg(&dy_s).ok_or_else(|| msg("addx/subx source must be a data register"))?;
+        let dx = dreg(&dx_s).ok_or_else(|| msg("addx/subx dest must be a data register"))?;
+        return Ok(one(opbase | (dx << 9) | (sz.field() << 6) | dy));
+    }
+
+    // ── Scc <ea> (set a byte to $FF/$00 on the condition) ─────────────────────
+    // `s` + a valid condition suffix. `sub`/`suba`/`subq`/`swap` carry invalid
+    // suffixes, so they fall through to their own handlers below.
+    if base.len() >= 2 && base.starts_with('s') {
+        if let Some(cc) = cc_field(&base[1..]) {
+            let s = parse_ea(args.trim(), Sz::B, asm)?;
+            return Ok(with_src(0x50C0 | (cc << 8) | s.field(), &s));
+        }
     }
 
     // ── jmp / jsr ─────────────────────────────────────────────────────────────

@@ -1,0 +1,19 @@
+[package]
+name = "jcc68k"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "jcc68k"
+path = "src/main.rs"
+
+[lib]
+name = "jcc68k"
+path = "src/lib.rs"
+
+[dependencies]
+jas = { path = "../jas" }
+
+[dev-dependencies]
+jag-core = { path = "../jag-core" }

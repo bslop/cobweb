@@ -17,6 +17,7 @@ members = [
     "crates/jtest",
     "crates/jopt",
     "crates/jcc",
+    "crates/jcc68k",
     "crates/jprof",
     "crates/jdbg",
     "crates/jln",

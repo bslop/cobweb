@@ -745,6 +745,22 @@ impl M68k {
             None => return self.illegal(bus, op),
         };
         let to_ea = opmode & 4 != 0;
+        // ADDX/SUBX register form (Dy,Dx): the `Dn,<ea>` encoding with ea mode
+        // 000 is not ADD/SUB but the extended add/subtract that folds in the X
+        // carry. (ADD/SUB never use a data register as the memory destination —
+        // that direction is the `<ea>,Dn` form.) do_add/do_sub already handle the
+        // carry-in when told to.
+        if to_ea && mode == 0 {
+            let s = self.d[(reg & 7) as usize];
+            let d = self.d[dn];
+            let r = if is_add {
+                self.do_add(s, d, size, true)
+            } else {
+                self.do_sub(s, d, size, true)
+            };
+            self.d[dn] = (self.d[dn] & !size.mask()) | (r & size.mask());
+            return 8;
+        }
         let ea = self.decode_ea(bus, mode, reg, size);
         if to_ea {
             let s = self.d[dn];
