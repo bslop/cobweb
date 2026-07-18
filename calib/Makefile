@@ -26,8 +26,9 @@ CFLAGS := -m68000 -ffreestanding -nostdlib -O2 -Wall
 COMMON := $(BUILD)/bootstub.o $(BUILD)/probes.o
 LAST   := $(BUILD)/lastobj.o
 
-.PHONY: all clean sim
+.PHONY: all clean sim hwq
 all: $(BUILD)/calib_skunk.cof $(BUILD)/calib_sim.cof
+hwq: $(BUILD)/hwq_skunk.cof $(BUILD)/hwq_sim.cof
 
 sim: $(BUILD)/calib_sim.cof
 
@@ -54,6 +55,18 @@ $(BUILD)/calib_skunk.cof: $(COMMON) $(BUILD)/main_skunk.o $(BUILD)/skunkglue.o $
 
 $(BUILD)/calib_sim.cof: $(COMMON) $(BUILD)/main_sim.o $(LAST)
 	$(RLN) -e -rq -a 4000 x x -o $@ $(BUILD)/bootstub.o $(BUILD)/main_sim.o $(BUILD)/probes.o $(LAST)
+
+$(BUILD)/hwq_main_skunk.o: hwq_main.c | $(BUILD)
+	$(CC68) $(CFLAGS) -DUSE_SKUNK_CONSOLE -c -o $@ $<
+
+$(BUILD)/hwq_main_sim.o: hwq_main.c | $(BUILD)
+	$(CC68) $(CFLAGS) -c -o $@ $<
+
+$(BUILD)/hwq_skunk.cof: $(BUILD)/bootstub.o $(BUILD)/hwq_probes.o $(BUILD)/hwq_main_skunk.o $(BUILD)/skunkglue.o $(BUILD)/skunk.o $(LAST)
+	$(RLN) -e -rq -a 4000 x x -o $@ $^
+
+$(BUILD)/hwq_sim.cof: $(BUILD)/bootstub.o $(BUILD)/hwq_probes.o $(BUILD)/hwq_main_sim.o $(LAST)
+	$(RLN) -e -rq -a 4000 x x -o $@ $^
 
 clean:
 	rm -rf $(BUILD)
