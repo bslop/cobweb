@@ -1086,11 +1086,16 @@ fn state_json(jag: &Jaguar) -> String {
     let cpu = &jag.cpu;
     let dregs: Vec<String> = cpu.d.iter().map(|v| v.to_string()).collect();
     let aregs: Vec<String> = cpu.a.iter().map(|v| v.to_string()).collect();
+    let hexregs = |bank: &[u32; 32]| -> String {
+        bank.iter().map(|v| format!("\"0x{v:08X}\"")).collect::<Vec<_>>().join(",")
+    };
     format!(
         "{{\"frame\":{},\"pc\":{},\"pc_hex\":{},\"sr\":{},\"instret\":{},\"illegal\":{},\
          \"last_illegal_op\":\"0x{:04X}\",\
-         \"gpu\":{{\"running\":{},\"pc_hex\":{},\"instret\":{},\"cycles\":{},\"granted\":{},\"timing\":{}}},\
-         \"dsp\":{{\"running\":{},\"instret\":{},\"cycles\":{},\"timing\":{}}},\"d\":[{}],\"a\":[{}]}}",
+         \"gpu\":{{\"running\":{},\"pc_hex\":{},\"instret\":{},\"cycles\":{},\"granted\":{},\"timing\":{},\
+         \"flags\":\"0x{:08X}\",\"regs0\":[{}],\"regs1\":[{}]}},\
+         \"dsp\":{{\"running\":{},\"instret\":{},\"cycles\":{},\"timing\":{},\
+         \"flags\":\"0x{:08X}\",\"regs0\":[{}],\"regs1\":[{}]}},\"d\":[{}],\"a\":[{}]}}",
         jag.frame(),
         cpu.pc,
         jstr(&format!("0x{:06X}", cpu.pc)),
@@ -1104,10 +1109,16 @@ fn state_json(jag: &Jaguar) -> String {
         jag.gpu.cycles,
         jag.gpu.granted,
         timing_json(&jag.gpu.pipe.stats),
+        jag.gpu.flags,
+        hexregs(&jag.gpu.regs[0]),
+        hexregs(&jag.gpu.regs[1]),
         jag.dsp.running,
         jag.dsp.instret,
         jag.dsp.cycles,
         timing_json(&jag.dsp.pipe.stats),
+        jag.dsp.flags,
+        hexregs(&jag.dsp.regs[0]),
+        hexregs(&jag.dsp.regs[1]),
         dregs.join(","),
         aregs.join(",")
     )
