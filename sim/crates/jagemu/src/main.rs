@@ -36,6 +36,7 @@ fn main() -> ExitCode {
         "playtest" => cmd_playtest(rest),
         "disasm" => cmd_disasm(rest),
         "peek" => cmd_peek(rest),
+        "dump" => cmd_dump(rest),
         "objects" | "objlist" => cmd_objects(rest),
         "break" => cmd_break(rest),
         "serve" => cmd_serve(rest),
@@ -75,6 +76,7 @@ fn usage() {
          \x20 jagemu audio <rom> [--frames N] [--press a] -o out.wav\n\
          \x20 jagemu disasm <rom> --at 0xADDR [--count N] [--frames N]\n\
          \x20 jagemu peek <rom> --at 0xADDR [--len N] [--frames N] [--press a]\n\
+         \x20 jagemu dump <rom> --at 0xADDR --len N -o file.bin   # full-region export, no cap\n\
          \x20 jagemu break <rom> --at 0xADDR [--frames N] [--press a]\n\
          \x20 jagemu instances [--prune]\n\
          \x20 jagemu version\n\
@@ -536,6 +538,27 @@ fn cmd_peek(args: &[String]) -> Result<(), String> {
 
 /// Boot N frames, then dump the live Object Processor list (decoded) plus a few
 /// key TOM registers. The AI-eyes window into what the OP is being asked to draw.
+/// Dump an arbitrary memory region to a file — no size cap (unlike the
+/// interactive `peek` hex view), for full-framebuffer parity exports etc.
+fn cmd_dump(args: &[String]) -> Result<(), String> {
+    let (_path, data) = load_rom(args)?;
+    let frames = flag_val(args, "--frames").map(parse_u64).transpose()?.unwrap_or(0);
+    let (btn, after) = press_args(args)?;
+    let at = parse_u32(flag_val(args, "--at").ok_or("dump needs --at ADDR")?)?;
+    let len = parse_u32(flag_val(args, "--len").ok_or("dump needs --len N")?)?;
+    let out = flag_val(args, "-o").or_else(|| flag_val(args, "--out")).ok_or("dump needs -o FILE")?;
+    let jag = boot_input(&data, frames, btn, after, fidelity_arg(args)?)?;
+    let mut buf = vec![0u8; len as usize];
+    jag.bus.peek(at, &mut buf);
+    std::fs::write(out, &buf).map_err(|e| e.to_string())?;
+    println!(
+        "{{\"ok\":true,\"at\":{},\"at_hex\":{},\"len\":{},\"out\":{}}}",
+        at, jstr(&format!("0x{at:06X}")), len, jstr(out)
+    );
+    eprintln!("jagemu: dumped {len} bytes at 0x{at:06X} -> {out}");
+    Ok(())
+}
+
 fn cmd_objects(args: &[String]) -> Result<(), String> {
     let (path, data) = load_rom(args)?;
     let frames = flag_val(args, "--frames").map(parse_u64).transpose()?.unwrap_or(0);
