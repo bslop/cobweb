@@ -745,6 +745,12 @@ impl<'a> Assembler<'a> {
             return None;
         }
         let relocatable = |sym: &str| -> bool {
+            // Local labels (`.name`) are always intra-object: they live in the
+            // symbol table under their scope-qualified name and resolve at
+            // assembly time, so they must never be deferred to the linker.
+            if sym.starts_with('.') {
+                return false;
+            }
             !self.symbols.contains_key(sym)
                 && (self.opts.object_mode || self.externs.contains(sym))
                 && ident_ok(sym)
