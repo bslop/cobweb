@@ -61,6 +61,11 @@ disassembly/audio capture — and its screenshots are the **true Object
 Processor scan-out**.
 
 ### 6. Compiler output can finally be benchmarked and regressed.
+**First report published: [`docs/benchmarks.md`](benchmarks.md)** — vbcc `-O3`
+mandelbrot profiled per placement, showing GPU-local is ~2x more efficient
+than GPU-in-main (56.7% of which is the external-fetch tax) and that 25.9% of
+best-case GPU time is lost to unfilled delay slots — the exact costs jcc and
+jopt are built to attack.
 No compiled-vs-hand-asm numbers have ever been published for this platform.
 Cobweb's shootout pipeline compiles with the public toolchains (vbcc today;
 Brainstorm GCC next), runs the output under the calibrated oracle, and
