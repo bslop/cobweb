@@ -487,7 +487,14 @@ fn cmd_disasm(args: &[String]) -> Result<(), String> {
         Some(s) => parse_u32(s)?,
         None => jag.cpu.pc,
     };
-    let insns = jag_debug::disasm_range(&jag.bus, at, count);
+    // --gpu / --dsp select the JRISC disassembler; default is 68000.
+    let insns = if args.iter().any(|a| a == "--gpu") {
+        jag_debug::disasm_jrisc_range(&jag.bus, at, count, false)
+    } else if args.iter().any(|a| a == "--dsp") {
+        jag_debug::disasm_jrisc_range(&jag.bus, at, count, true)
+    } else {
+        jag_debug::disasm_range(&jag.bus, at, count)
+    };
     let items: Vec<String> = insns
         .iter()
         .map(|i| format!("{{\"addr\":{},\"text\":{}}}", i.addr, jstr(&i.text)))
