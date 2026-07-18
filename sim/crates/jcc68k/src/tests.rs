@@ -180,3 +180,99 @@ fn div_small() {
     assert_eq!(run(&wrap("return 6 / 3;")), 2);
     assert_eq!(run(&wrap("return 7 / 1;")), 7);
 }
+
+// ── preprocessor ─────────────────────────────────────────────────────────────
+fn run_pp(src: &str) -> u32 {
+    let dir = std::env::temp_dir().join(format!("jcc_pp_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let main_c = dir.join("main.c");
+    std::fs::write(&main_c, src).unwrap();
+    let inc = vec![dir.to_string_lossy().to_string()];
+    let user = crate::compile_file(src, &main_c, &inc).unwrap_or_else(|e| panic!("compile: {e}"));
+    let asm = format!("{}\n{}\n{}", crate::startup(), user, crate::runtime());
+    let opts = jas::Options { org: 0x4000, start_m68k: true, check_hazards: false, ..Default::default() };
+    let res = jas::assemble(&asm, &opts);
+    if res.errors() > 0 {
+        panic!("asm errors:\n{:#?}\n{asm}", res.diags);
+    }
+    let mut jag = Jaguar::new();
+    for (i, b) in res.bytes.iter().enumerate() {
+        jag.bus.write8(0x4000 + i as u32, *b);
+    }
+    jag.cpu.set_pc(res.symbols.get("_start").copied().unwrap_or(0x4000));
+    let mut prev = u32::MAX;
+    for _ in 0..5_000_000 {
+        let pc = jag.cpu.pc;
+        if pc == prev { break; }
+        prev = pc;
+        jag.step_instruction();
+    }
+    jag.bus.read32(0x100)
+}
+
+#[test]
+fn pp_object_macro() {
+    assert_eq!(run_pp("#define N 5\n#define M 7\nint main(){ return N*M; }"), 35);
+}
+
+#[test]
+fn pp_function_macro() {
+    assert_eq!(run_pp("#define SQ(x) ((x)*(x))\nint main(){ return SQ(6) + SQ(2); }"), 40);
+    assert_eq!(run_pp("#define MAX(a,b) ((a)>(b)?(a):(b))\nint main(){ return MAX(3,9); }"), 9);
+}
+
+#[test]
+fn pp_conditionals() {
+    let src = "#define FEATURE 1\n#if FEATURE\nint main(){ return 111; }\n#else\nint main(){ return 222; }\n#endif";
+    assert_eq!(run_pp(src), 111);
+    let src2 = "#ifdef NOPE\nint main(){ return 1; }\n#else\nint main(){ return 42; }\n#endif";
+    assert_eq!(run_pp(src2), 42);
+}
+
+#[test]
+fn pp_include() {
+    let dir = std::env::temp_dir().join(format!("jcc_pp_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("hdr.h"), "#define ANSWER 42\nint helper(int x){ return x + ANSWER; }\n").unwrap();
+    assert_eq!(run_pp("#include \"hdr.h\"\nint main(){ return helper(8); }"), 50);
+}
+
+#[test]
+fn pp_nested_macro() {
+    let src = "#define A 2\n#define B (A+3)\n#define C (B*B)\nint main(){ return C; }";
+    assert_eq!(run_pp(src), 25);
+}
+
+#[test]
+fn structs_end_to_end() {
+    let src = r#"
+        struct Point { int x; int y; };
+        int dist2(struct Point *a, struct Point *b) {
+            int dx = a->x - b->x;
+            int dy = a->y - b->y;
+            return dx*dx + dy*dy;
+        }
+        int main() {
+            struct Point p; p.x = 10; p.y = 20;
+            struct Point q; q.x = 13; q.y = 24;
+            return dist2(&p, &q);
+        }
+    "#;
+    assert_eq!(run(src), 25);
+}
+
+#[test]
+fn struct_array_and_typedef() {
+    let src = r#"
+        typedef struct { int lo; int hi; } Range;
+        int main() {
+            Range r[3];
+            int i;
+            int sum = 0;
+            for (i = 0; i < 3; i++) { r[i].lo = i; r[i].hi = i * 10; }
+            for (i = 0; i < 3; i++) sum += r[i].hi - r[i].lo;
+            return sum;
+        }
+    "#;
+    assert_eq!(run(src), (0 + 9 + 18));
+}

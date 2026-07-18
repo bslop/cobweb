@@ -10,14 +10,30 @@ mod ast;
 mod codegen;
 mod lexer;
 mod parser;
+mod preprocess;
 
 pub use parser::const_eval;
 
 /// Compile C source to 68000 assembly (user code only — no runtime/startup).
+/// `src` is assumed already preprocessed (see [`compile_file`] for the full
+/// path that runs the preprocessor).
 pub fn compile(src: &str) -> Result<String, String> {
     let toks = lexer::lex(src)?;
     let prog = parser::parse(toks)?;
     codegen::generate(&prog)
+}
+
+/// Preprocess then compile: runs `#include`/`#define`/`#if` against `src`
+/// (whose on-disk location is `path`, for relative includes) with the given
+/// `-I` include directories, then compiles the result.
+pub fn compile_file(src: &str, path: &std::path::Path, include_dirs: &[String]) -> Result<String, String> {
+    let pp = preprocess::preprocess(src, path, include_dirs)?;
+    compile(&pp)
+}
+
+/// Preprocess C source (exposed for tooling / `-E`).
+pub fn preprocess_only(src: &str, path: &std::path::Path, include_dirs: &[String]) -> Result<String, String> {
+    preprocess::preprocess(src, path, include_dirs)
 }
 
 /// A complete, assemblable program: startup (`_start`) → the compiled unit →

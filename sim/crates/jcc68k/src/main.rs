@@ -17,6 +17,8 @@ fn main() {
     let mut output = None;
     let mut to_bin = false;
     let mut whole_program = false;
+    let mut preprocess_only = false;
+    let mut include_dirs: Vec<String> = Vec::new();
     let mut org = 0x4000u32;
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -24,11 +26,16 @@ fn main() {
             "-o" => output = it.next().cloned(),
             "--bin" => to_bin = true,
             "--prog" => whole_program = true,
+            "-E" => preprocess_only = true,
             "--org" => {
                 org = it
                     .next()
                     .and_then(|s| parse_u32(s))
                     .unwrap_or_else(|| fail("--org needs a number"));
+            }
+            _ if a.starts_with("-I") => {
+                let dir = if a.len() > 2 { a[2..].to_string() } else { it.next().cloned().unwrap_or_default() };
+                include_dirs.push(dir);
             }
             _ if a.starts_with('-') => fail(&format!("unknown flag {a}")),
             _ => input = Some(a.clone()),
@@ -36,13 +43,26 @@ fn main() {
     }
     let input = input.unwrap_or_else(|| fail("no input file"));
     let src = std::fs::read_to_string(&input).unwrap_or_else(|e| fail(&format!("{input}: {e}")));
+    let path = std::path::PathBuf::from(&input);
 
-    let asm = if whole_program || to_bin {
-        jcc68k::compile_program(&src)
-    } else {
-        jcc68k::compile(&src)
+    if preprocess_only {
+        let pp = jcc68k::preprocess_only(&src, &path, &include_dirs)
+            .unwrap_or_else(|e| fail(&format!("{input}: {e}")));
+        match output {
+            Some(o) => std::fs::write(&o, pp).unwrap_or_else(|e| fail(&format!("{o}: {e}"))),
+            None => print!("{pp}"),
+        }
+        return;
     }
-    .unwrap_or_else(|e| fail(&format!("{input}: {e}")));
+
+    // Preprocess then compile.
+    let user = jcc68k::compile_file(&src, &path, &include_dirs)
+        .unwrap_or_else(|e| fail(&format!("{input}: {e}")));
+    let asm = if whole_program || to_bin {
+        format!("{}\n{}\n{}", jcc68k::startup(), user, jcc68k::runtime())
+    } else {
+        user
+    };
 
     if to_bin {
         let opts = jas::Options { org, start_m68k: true, ..Default::default() };
