@@ -341,8 +341,9 @@ impl Parser {
                         self.pos += 1;
                     }
                     "struct" | "union" => {
+                        let is_union = k == "union";
                         self.pos += 1;
-                        ty = Some(self.struct_decl()?);
+                        ty = Some(self.struct_decl(is_union)?);
                     }
                     "enum" => {
                         self.pos += 1;
@@ -383,7 +384,7 @@ impl Parser {
         Ok((final_ty, sc))
     }
 
-    fn struct_decl(&mut self) -> PResult<Type> {
+    fn struct_decl(&mut self, is_union: bool) -> PResult<Type> {
         let tag = if let Tok::Ident(s) = self.peek().clone() {
             self.pos += 1;
             Some(s)
@@ -408,9 +409,15 @@ impl Parser {
             loop {
                 let (mname, mty) = self.declarator(base.clone())?;
                 let a = mty.align();
-                offset = align_to(offset, a);
-                members.push(Member { name: mname, ty: mty.clone(), offset });
-                offset += mty.size();
+                if is_union {
+                    // All union members overlap at offset 0; size is the max.
+                    members.push(Member { name: mname, ty: mty.clone(), offset: 0 });
+                    offset = offset.max(mty.size());
+                } else {
+                    offset = align_to(offset, a);
+                    members.push(Member { name: mname, ty: mty.clone(), offset });
+                    offset += mty.size();
+                }
                 align = align.max(a);
                 if !self.eat_punct(",") {
                     break;
@@ -573,6 +580,33 @@ impl Parser {
                 break;
             }
             let (name, ty) = self.declarator(base.clone())?;
+            if sc.is_static || sc.is_extern {
+                // A static/extern local lives in static storage, not the frame:
+                // give it a unique global and bind the name to it in this scope.
+                self.uid += 1;
+                let uniq = format!("{name}__s{}", self.uid);
+                self.scopes.last_mut().unwrap().insert(
+                    name.clone(),
+                    VarRef { name: uniq.clone(), ty: ty.clone(), is_global: true },
+                );
+                let mut init = None;
+                if self.eat_punct("=") {
+                    init = Some(self.global_initializer(&ty)?);
+                }
+                if !sc.is_extern {
+                    self.globals.push(Global {
+                        name: uniq,
+                        ty,
+                        init,
+                        is_static: true,
+                        is_extern: false,
+                    });
+                }
+                if !self.eat_punct(",") {
+                    break;
+                }
+                continue;
+            }
             let uniq = self.new_local(&name, ty.clone());
             let init = if self.eat_punct("=") {
                 Some(self.initializer()?)

@@ -350,3 +350,41 @@ fn fixed_negative() {
     assert_eq!(run("int main(){ float a = -2.5; float b = 4.0; return (int)(a*b); }"), (-10i32) as u32);
     assert_eq!(run("int main(){ float a = -6.0; float b = 2.0; return (int)(a/b); }"), (-3i32) as u32);
 }
+
+#[test]
+fn union_overlap() {
+    let src = r#"
+        union U { int i; char c[4]; };
+        int main() {
+            union U u;
+            u.i = 0x41424344;
+            return u.c[0] + u.c[3];  // big-endian: c[0]=0x41, c[3]=0x44
+        }
+    "#;
+    assert_eq!(run(src), 0x41 + 0x44);
+}
+
+#[test]
+fn function_pointers() {
+    let src = r#"
+        int add(int a, int b) { return a + b; }
+        int mul(int a, int b) { return a * b; }
+        int apply(int (*f)(int,int), int x, int y) { return f(x, y); }
+        int main() {
+            int (*fp)(int,int) = add;
+            int r1 = fp(3, 4);
+            r1 = apply(mul, 5, 6);
+            return fp(3,4) + r1;  // 7 + 30
+        }
+    "#;
+    assert_eq!(run(src), 37);
+}
+
+#[test]
+fn static_local() {
+    let src = r#"
+        int counter() { static int n = 0; n = n + 1; return n; }
+        int main() { counter(); counter(); return counter(); }
+    "#;
+    assert_eq!(run(src), 3);
+}
