@@ -13,6 +13,10 @@ pub enum StopReason {
     ReachedFrame(u64),
     /// Execution PC hit a breakpoint.
     Breakpoint(u32),
+    /// The GPU PC hit a breakpoint (registers frozen at that instruction).
+    GpuBreakpoint(u32),
+    /// The DSP PC hit a breakpoint.
+    DspBreakpoint(u32),
     /// A watched memory address was accessed.
     Watchpoint { addr: u32, write: bool },
     /// A single requested step completed.

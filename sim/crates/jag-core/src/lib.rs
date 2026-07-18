@@ -109,6 +109,14 @@ impl Jaguar {
                 return StopReason::Breakpoint(self.cpu.pc);
             }
             self.step_instruction();
+            // GPU/DSP PC breakpoints: the RISC core stops mid-slice and records
+            // the hit so registers are frozen at that instruction for inspection.
+            if let Some(pc) = self.gpu.bp_hit.take() {
+                return StopReason::GpuBreakpoint(pc);
+            }
+            if let Some(pc) = self.dsp.bp_hit.take() {
+                return StopReason::DspBreakpoint(pc);
+            }
             if let Some(reason) = self.dbg.take_stop() {
                 return reason;
             }

@@ -96,6 +96,13 @@ pub struct Risc {
     /// Total budget ticks ever granted while running (coupling diagnostics:
     /// `cycles` must never exceed this by more than one instruction).
     pub granted: u64,
+    /// PC breakpoints for this core (GPU/DSP debugging). When the PC about to
+    /// execute is in this set, `run` stops *before* executing it and records the
+    /// address in `bp_hit`, so registers can be inspected at that exact point.
+    pub breakpoints: std::collections::HashSet<u32>,
+    /// Set to the breakpoint PC when `run` stopped on one; the run loop above
+    /// (`Jaguar::run_to_frame`) drains it into a stop reason.
+    pub bp_hit: Option<u32>,
 }
 
 impl Risc {
@@ -123,6 +130,8 @@ impl Risc {
             prev_was_jump: false,
             budget_debt: 0,
             granted: 0,
+            breakpoints: std::collections::HashSet::new(),
+            bp_hit: None,
         }
     }
 
@@ -361,6 +370,16 @@ impl Risc {
         self.budget_debt -= spent;
         while spent < budget {
             if !self.running {
+                break;
+            }
+            // PC breakpoint: stop before executing the marked instruction so the
+            // caller can inspect registers at exactly that point. Not taken in a
+            // delay slot (the transfer must complete first).
+            if !self.breakpoints.is_empty()
+                && self.pending_jump.is_none()
+                && self.breakpoints.contains(&self.pc)
+            {
+                self.bp_hit = Some(self.pc);
                 break;
             }
             // Service a pending interrupt between instructions (never in a

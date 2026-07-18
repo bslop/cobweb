@@ -597,28 +597,64 @@ fn cmd_break(args: &[String]) -> Result<(), String> {
     let frames = flag_val(args, "--frames").map(parse_u64).transpose()?.unwrap_or(600);
     let (btn, after) = press_args(args)?;
     let at = parse_u32(flag_val(args, "--at").ok_or("break needs --at ADDR")?)?;
+    // Which core to break on (default 68000).
+    let core = if args.iter().any(|a| a == "--gpu") {
+        "gpu"
+    } else if args.iter().any(|a| a == "--dsp") {
+        "dsp"
+    } else {
+        "68k"
+    };
     let mut jag = Jaguar::new();
     jag.load(&data).map_err(|e| e.to_string())?;
-    jag.dbg.add_breakpoint(at);
-    let target = jag.frame() + frames;
-    // Optionally inject input before running to the breakpoint.
-    if btn != 0 && after == 0 {
+    jag.gpu.fidelity = fidelity_arg(args)?;
+    jag.dsp.fidelity = fidelity_arg(args)?;
+    // Apply input timing: idle to `after`, press, then arm the breakpoint so we
+    // stop at the first hit during real gameplay rather than during boot.
+    if btn != 0 && after > 0 {
+        jag.run_frames(after.min(frames));
+        jag.set_pad(0, btn);
+    } else if btn != 0 {
         jag.set_pad(0, btn);
     }
+    match core {
+        "gpu" => {
+            jag.gpu.breakpoints.insert(at);
+        }
+        "dsp" => {
+            jag.dsp.breakpoints.insert(at);
+        }
+        _ => jag.dbg.add_breakpoint(at),
+    }
+    let target = jag.frame() + frames;
     let reason = jag.run_to_frame(target);
     let (kind, hit) = match reason {
         jag_core::StopReason::Breakpoint(pc) => ("breakpoint", Some(pc)),
+        jag_core::StopReason::GpuBreakpoint(pc) => ("gpu_breakpoint", Some(pc)),
+        jag_core::StopReason::DspBreakpoint(pc) => ("dsp_breakpoint", Some(pc)),
         jag_core::StopReason::ReachedFrame(_) => ("frame_limit", None),
-        other => {
-            let _ = other;
-            ("stopped", None)
-        }
+        _ => ("stopped", None),
     };
+    // Disassemble a few instructions at the hit PC in the right ISA.
+    let disasm = hit.map(|pc| {
+        let insns = match core {
+            "gpu" => jag_debug::disasm_jrisc_range(&jag.bus, pc, 6, false),
+            "dsp" => jag_debug::disasm_jrisc_range(&jag.bus, pc, 6, true),
+            _ => jag_debug::disasm_range(&jag.bus, pc, 6),
+        };
+        let items: Vec<String> = insns
+            .iter()
+            .map(|i| format!("{{\"addr\":{},\"text\":{}}}", i.addr, jstr(&i.text)))
+            .collect();
+        format!("[{}]", items.join(","))
+    });
     println!(
-        "{{\"ok\":true,\"path\":{},\"stop\":{},\"hit_pc\":{},\"state\":{}}}",
+        "{{\"ok\":true,\"path\":{},\"core\":{},\"stop\":{},\"hit_pc\":{},\"disasm\":{},\"state\":{}}}",
         jstr(&path),
+        jstr(core),
         jstr(kind),
         hit.map(|p| format!("\"0x{p:06X}\"")).unwrap_or_else(|| "null".to_string()),
+        disasm.unwrap_or_else(|| "null".to_string()),
         state_json(&jag)
     );
     Ok(())
