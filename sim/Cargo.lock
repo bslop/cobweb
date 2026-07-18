@@ -51,6 +51,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "jcc68k"
+version = "0.1.0"
+dependencies = [
+ "jag-core",
+ "jas",
+]
+
+[[package]]
 name = "jdbg"
 version = "0.1.0"
 dependencies = [
