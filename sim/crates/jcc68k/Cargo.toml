@@ -17,3 +17,4 @@ jas = { path = "../jas" }
 
 [dev-dependencies]
 jag-core = { path = "../jag-core" }
+jln = { path = "../jln" }

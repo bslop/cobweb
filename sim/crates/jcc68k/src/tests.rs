@@ -388,3 +388,92 @@ fn static_local() {
     "#;
     assert_eq!(run(src), 3);
 }
+
+// ── end-to-end linking: C (jcc68k) + GAS asm (jas) → jln → jsim ──────────────
+
+/// Compile a C unit that calls an external function, assemble a GAS-syntax 68k
+/// helper separately, link the two relocatable objects with jln, and run the
+/// linked image in jsim — the full Cobweb pipeline in one shot.
+fn run_linked(main_src: &str, helper_gas: &str) -> u32 {
+    // main unit (startup + user + runtime) as an object at $4000
+    let main_asm = crate::compile_program(main_src).unwrap_or_else(|e| panic!("compile: {e}"));
+    let main_opts = jas::Options {
+        org: 0x4000,
+        start_m68k: true,
+        check_hazards: false,
+        object_mode: true,
+        ..Default::default()
+    };
+    let mr = jas::assemble(&main_asm, &main_opts);
+    assert_eq!(mr.errors(), 0, "main asm errors: {:#?}", mr.diags);
+    let main_obj = mr.object(0x4000);
+
+    // helper unit (GAS dialect) as an object at $8000
+    let help_opts = jas::Options {
+        org: 0x8000,
+        start_m68k: true,
+        check_hazards: false,
+        object_mode: true,
+        gas: Some(true),
+        ..Default::default()
+    };
+    let hr = jas::assemble(helper_gas, &help_opts);
+    assert_eq!(hr.errors(), 0, "helper asm errors: {:#?}", hr.diags);
+    let help_obj = hr.object(0x8000);
+
+    let img = jln::link(&[main_obj, help_obj]).expect("link failed");
+    let mut jag = Jaguar::new();
+    for (i, b) in img.bytes.iter().enumerate() {
+        jag.bus.write8(img.base + i as u32, *b);
+    }
+    let start = img.symbols.get("_start").copied().unwrap_or(img.base);
+    jag.cpu.set_pc(start);
+    let mut prev = u32::MAX;
+    let mut steps = 0u64;
+    loop {
+        let pc = jag.cpu.pc;
+        if pc == prev {
+            break;
+        }
+        prev = pc;
+        jag.step_instruction();
+        steps += 1;
+        if steps > 5_000_000 {
+            break;
+        }
+    }
+    jag.bus.read32(0x100)
+}
+
+#[test]
+fn link_c_calls_gas_helper() {
+    // helper(x) = x * 2, written in GNU-as syntax (`%sp`, `|` comment).
+    let helper = "\
+        \t.text\n\
+        \t.globl _helper\n\
+        _helper:\n\
+        \tmove.l 4(%sp),%d0  | argument\n\
+        \tadd.l %d0,%d0      | x + x\n\
+        \trts\n";
+    let main = "extern int helper(int x); int main() { return helper(21); }";
+    assert_eq!(run_linked(main, helper), 42);
+}
+
+#[test]
+fn link_c_calls_gas_helper_with_numeric_locals() {
+    // sum(n) = n + (n-1) + ... + 1, via a GAS loop using a numeric local label.
+    let helper = "\
+        \t.text\n\
+        \t.globl _sumto\n\
+        _sumto:\n\
+        \tmove.l 4(%sp),%d1  | n\n\
+        \tmoveq #0,%d0\n\
+        1:\ttst.l %d1\n\
+        \tble.s 2f\n\
+        \tadd.l %d1,%d0\n\
+        \tsubq.l #1,%d1\n\
+        \tbra.s 1b\n\
+        2:\trts\n";
+    let main = "extern int sumto(int n); int main() { return sumto(10); }";
+    assert_eq!(run_linked(main, helper), 55);
+}
