@@ -44,6 +44,11 @@ fn main() -> ExitCode {
             }
             "--no-hazard-check" => opts.check_hazards = false,
             "-Werror" => opts.warnings_as_errors = true,
+            "-I" => {
+                if let Some(d) = it.next() {
+                    opts.include_dirs.push(d.clone());
+                }
+            }
             s if s.starts_with('-') => {
                 eprintln!("jas: unknown option `{s}`");
                 return ExitCode::FAILURE;
@@ -56,6 +61,12 @@ fn main() -> ExitCode {
         eprintln!("jas: no input file");
         return ExitCode::FAILURE;
     };
+    // default include search path: the input file's own directory
+    if let Some(parent) = std::path::Path::new(&input).parent() {
+        if !parent.as_os_str().is_empty() {
+            opts.include_dirs.push(parent.to_string_lossy().into_owned());
+        }
+    }
     let src = match std::fs::read_to_string(&input) {
         Ok(s) => s,
         Err(e) => {

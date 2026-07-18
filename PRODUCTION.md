@@ -8,7 +8,7 @@ failures drive the backlog. No guessing.
 
 ## Current state (measured, 2026-07-17)
 
-**jas assembles 31 / 77 real JRISC files** at the encoder level (no linker
+**jas assembles 36 / 77 real JRISC files** at the encoder level (no linker
 yet), up from 0 before register aliases and the directive set landed. Two
 representative files (`gpu_idle`, `gpu_tick`) verified byte-emitting and clean.
 
@@ -18,7 +18,7 @@ these are the production backlog, in priority order:
 | Blocker | ~count | What it needs |
 |---|---|---|
 | Undefined symbols from `.include`d headers + cross-module `.extern` | ~690 | the **preprocessor** (`.include`) and the **linker** (`jln`) |
-| `.if` / `.rept` / `.macro` unknown-directive | ~60 | the **preprocessor** (conditionals, repeats, macros) |
+| ~~`.if`/`.rept`/`.macro`/`.include`~~ | ~~done~~ | **preprocessor SHIPPED** (front pass) ✓ |
 | 68k mnemonics (`move.l`, `movem`, `lsl`, `ori`, …) in mixed 68k/JRISC files | ~200 | a **68k assembler mode** (or section split) |
 | Unknown condition codes | ~120 | audit the corpus's `jump`/`jr` condition spellings vs jas |
 | `jr` displacement out of range | ~76 | mostly real far-branches (need movei+jump); verify a few |

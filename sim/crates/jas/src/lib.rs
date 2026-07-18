@@ -16,8 +16,10 @@
 
 mod encode;
 pub mod hazard;
+pub mod preprocess;
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 /// Which RISC core the code targets — it changes a handful of shared opcodes
 /// (GPU SAT8/PACK vs DSP SAT16S/ADDQMOD) and the hazard rules.
@@ -113,19 +115,37 @@ pub struct Options {
     pub check_hazards: bool,
     /// Promote warnings to errors.
     pub warnings_as_errors: bool,
+    /// Directories searched for `.include` files (plus the file's own dir).
+    pub include_dirs: Vec<String>,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { target: Target::Gpu, org: 0xF03000, check_hazards: true, warnings_as_errors: false }
+        Options {
+            target: Target::Gpu,
+            org: 0xF03000,
+            check_hazards: true,
+            warnings_as_errors: false,
+            include_dirs: Vec::new(),
+        }
     }
 }
 
 /// Assemble `source`. Returns the emitted bytes plus diagnostics; the caller
 /// decides whether to write output when `errors() > 0` (usually: don't).
 pub fn assemble(source: &str, opts: &Options) -> Assembled {
+    // Front pass: expand includes / macros / rept / conditionals.
+    let mut inc = preprocess::FsIncludes {
+        dirs: opts.include_dirs.iter().map(PathBuf::from).collect(),
+    };
+    let expanded = match preprocess::run(source, &mut inc) {
+        Ok(s) => s,
+        Err(diags) => {
+            return Assembled { diags, ..Default::default() };
+        }
+    };
     let mut asm = Assembler::new(opts);
-    asm.run(source);
+    asm.run(&expanded);
     let mut out = asm.finish();
     if opts.check_hazards {
         let mut hz = hazard::check(&out.emitted);
@@ -351,13 +371,10 @@ impl<'a> Assembler<'a> {
                     self.put_byte(0, line);
                 }
             }
-            ".include" | ".macro" | ".endm" | ".rept" | ".endr" => {
-                self.err_fix(
-                    line.n,
-                    format!("`{op}` (macros/includes) not yet supported in jas v1"),
-                    "preprocess with rmac, or inline the macro; macro support is on the roadmap",
-                );
-            }
+            // preprocessor directives are consumed by the front pass; any that
+            // reach here (e.g. stray .endm) are harmless no-ops.
+            ".include" | ".macro" | ".endm" | ".rept" | ".endr" | ".if" | ".ifdef"
+            | ".ifndef" | ".else" | ".endif" => {}
             ".equ" | ".set" => {
                 let parts = split_args(line.args);
                 if parts.len() == 2 {
@@ -662,7 +679,7 @@ fn is_pseudo(op: &str) -> bool {
     )
 }
 
-fn split_args(s: &str) -> Vec<String> {
+pub(crate) fn split_args(s: &str) -> Vec<String> {
     // split on commas not inside parens
     let mut out = Vec::new();
     let mut depth = 0i32;
