@@ -12,9 +12,16 @@
 //! v1 transform: **delay-slot filling**. The JRISC delay slot always executes,
 //! so a `nop` after a jump is wasted. jopt moves the instruction *before* the
 //! jump into the slot when doing so is behavior-preserving, deleting the nop —
-//! the "bytes are features" win (the source project freed 394 SRAM bytes and
-//! re-opened features that "did not fit" this way). Because the certificate is
-//! the safety net, jopt can try aggressively and let jsim reject mistakes.
+//! the "bytes are features" win.
+//!
+//! Two guards, in order — the certificate alone is NOT enough (COBWEB_ISSUES #3:
+//! a certificate passed a behaviour-changing fill because the test input didn't
+//! observably exercise the affected path). So jopt first applies a STRUCTURAL
+//! precondition — a fill is only *attempted* when every path reaching the jump
+//! must have executed the moved instruction (no label on the jump or between it
+//! and the fill, i.e. the jump is not a branch target) — and only then runs the
+//! jsim equivalence certificate as a second line of defence. Treat `accepted`
+//! as "passed both guards", and re-gate real output with a render/shadow diff.
 
 use jag_core::risc::Fidelity;
 use jag_core::RiscKind;
@@ -190,9 +197,19 @@ pub fn optimize(src: &str, target: RiscKind) -> OptResult {
             if !is_jump(jm) || sm != "nop" || !fillable(bm) {
                 continue;
             }
-            // avoid label complications: the fill line and the slot line must
-            // carry no label (the jump line may).
-            if b.has_label || s.has_label {
+            // SOUNDNESS (COBWEB_ISSUES #3): B may move into J's delay slot only
+            // if EVERY execution path that reaches J executed B immediately
+            // first — i.e. B falls straight through to J. A label on J, or on
+            // any line between B and J, is a branch target: control can jump
+            // there and reach J (and now its slot = B) WITHOUT having run B.
+            // The bug: a `neg` on a conditionally-skipped path was moved into a
+            // *labelled* return-jump's slot, so it also ran on the skip path,
+            // wrongly negating positive quotients. The jsim certificate missed
+            // it (the test input didn't observably exercise that path) — so this
+            // structural precondition, not the certificate alone, is the guard.
+            let branch_reachable_jump =
+                (bi + 1..=ji).any(|k| classify_line(&lines[k]).has_label);
+            if b.has_label || s.has_label || branch_reachable_jump {
                 continue;
             }
             // Build candidate: move line `bi` into slot `si`, drop original `bi`.
@@ -286,6 +303,38 @@ mod tests {
         let (bytes, org) = assemble(&res.source, RiscKind::Gpu).unwrap();
         let r = run(&Spec { bytes, target: RiscKind::Gpu, org, budget: 100_000, capture: (0x0010_0000, 4), fidelity: Fidelity::Silicon });
         assert_eq!(u32::from_be_bytes([r.captured[0], r.captured[1], r.captured[2], r.captured[3]]), 15);
+    }
+
+    #[test]
+    fn refuses_fill_across_a_labelled_jump() {
+        // COBWEB_ISSUES #3 reproducer: `neg r0` on the conditionally-skipped
+        // (negative) path, immediately before a LABELLED return jump. Moving it
+        // into that jump's slot would run it on the positive (skip) path too,
+        // negating a positive value. jopt must REFUSE (the jump is a branch
+        // target). Here r2 is positive, so the correct result is +7, never -7.
+        let src = format!(
+            "        .gpu\n\
+             \x20       moveq #7,r0\n\
+             \x20       moveq #1,r2\n\
+             \x20       movei #$00100000,r5\n\
+             \x20       movei #out,r28\n\
+             \x20       cmpq #0,r2\n\
+             \x20       movei #skip,r27\n\
+             \x20       jump pl,(r27)\n\
+             \x20       nop\n\
+             \x20       neg r0\n\
+             skip:   jump t,(r28)\n\
+             \x20       nop\n\
+             out:    store r0,(r5)\n{STOP}"
+        );
+        let res = optimize(&src, RiscKind::Gpu);
+        // the only fill candidate is neg -> skip's (labelled) slot: must be refused
+        assert_eq!(res.accepted(), 0, "jopt filled a branch-reachable jump slot (unsound!)");
+        // and behaviour is preserved: positive value stays +7
+        let (bytes, org) = assemble(&res.source, RiscKind::Gpu).unwrap();
+        let r = run(&Spec { bytes, target: RiscKind::Gpu, org, budget: 50_000, capture: (0x0010_0000, 4), fidelity: Fidelity::Silicon });
+        assert_eq!(u32::from_be_bytes([r.captured[0], r.captured[1], r.captured[2], r.captured[3]]), 7,
+            "positive value was wrongly negated");
     }
 
     #[test]
