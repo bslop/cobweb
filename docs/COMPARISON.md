@@ -8,6 +8,47 @@ Atari's recovered 1995 Brainstorm GCC, BigPEmu / Virtual-Jaguar-Rx
 solves that none of them do — split honestly into **solved today** and
 **designed, in build order**.
 
+## Side-by-side
+
+Cobweb status: **✅ shipped & tested** · **🔶 v1 / partial** · **📐 designed, not built**.
+"Current toolchain" = rmac/rln + vbcc (+ vasm/vlink) + BigPEmu + skunklib.
+
+| Capability | Cobweb | Current toolchain |
+|---|---|---|
+| **Cycle-accurate timing** | ✅ jsim, calibrated to a real console (0.059 cyc/instr err, 32/32 probes, 2 bench sessions) | none trustworthy — BigPEmu's own community treats GPU timing as unusable for measurement; VJ-Rx / MAME not cycle-accurate |
+| **Stall attribution (why code is slow)** | ✅ per-cause: ALU bubble / load / DIV shadow / jump-refill / fetch / bus contention | none |
+| **Hazard-checking assembler** | ✅ jas errors + fix-its on bug-13 WAW, indexed-store erratum, MOVEI/jump-in-slot, out-of-range branch | rmac assembles all silently (a faithful translator) |
+| **Assembler — real-project coverage** | 🔶 jas: rmac-compatible syntax, **70/77** real hand-written files (incl. full 68000 mode); `; jas:allow` waivers | rmac: **100%**, battle-tested, builds shipping games |
+| **Linker** | 🔶 jln: `.jo` relocatable objects, cross-object symbol + relocation resolution, image layout | rln: mature, drives full multi-object builds |
+| **C compiler** | 🔶 jcc: restricted language → *auditable* JRISC (jas re-checks its output); SRAM budget ledger | vbcc: a real optimizing C compiler, mature (more complete today) |
+| **Overlay streaming past the 4 KB/8 KB SRAM ceiling** | 📐 jcc (the compiler Atari promised in 1995, never shipped) | none |
+| **Verification harness** | ✅ jtest: shadow diff, golden vectors, **silicon-vs-BigPEmu divergence detection** | none |
+| **Optimizing scheduler** | ✅ jopt: delay-slot filling, each transform proven byte-identical in jsim | none |
+| **Profiler** | ✅ jprof: cost breakdown + plain-language bottleneck + build-to-build diff | none |
+| **Debugger** | ✅ jdbg: breakpoints/stepping **by source line**, crash reports name the line | BigPEmu / VJ-Rx: address-level only |
+| **Emulator — retail compatibility** | ❌ jsim renders homebrew, not retail yet (measured 0/68 carts draw a scene) | BigPEmu: full retail library incl. CD/VR — the compatibility king |
+| **Determinism** | ✅ same ROM + inputs → identical frames; JSON CLI, no global lock | BigPEmu: threaded approximation, global lock, per-game script files |
+| **Hardware calibration probes** | ✅ `calib/` — reproducible on any Skunkboard; settled the scoreboard-across-jump question | none (folklore) |
+| **Compiler benchmarks** | ✅ first published cycle-level Jaguar compiler measurement | none |
+| **Cohesion** | ✅ one calibrated model; jcc→jas→jln→jsim, profiled by jprof, debugged by jdbg | separate projects, different authors, no shared model |
+| **License** | ✅ fully open (MIT-bound), commercial carts free | vbcc/vasm non-commercial without consent; BigPEmu / Raptor / U-235 closed |
+
+**Where each wins:** Cobweb already leads on measurement, verification,
+hazard-safety, cohesion, and openness — capabilities the platform never had.
+The current toolchain still leads on raw completeness: rmac/rln/vbcc build
+full projects today, and BigPEmu runs the whole retail library. Closing that
+gap (jln into real builds, the last 7 files, jcc's overlay streaming) is the
+active work, tracked by a number that only moves when working code moves it.
+
+**Not theory — dogfooded.** Cobweb is being used to convert a real, shipping-
+grade project (`aerodagger`). That surfaced two genuine jas defects (a WAW
+false-positive across distance, and the 68k `movem`/size-suffix gap) — both
+found by a real kernel, both since fixed, with `gpu_span.gas` now assembling
+under the full hazard pass byte-identical to rmac. It also drove a hardware
+bench that settled a 30-year-open question (the scoreboard holds across a
+taken jump). The suite is judged by whether it builds the real thing, on real
+silicon — the same test the platform's original tools should have passed.
+
 ## Solved today
 
 ### 1. Nobody could tell you how many cycles JRISC code takes. Now something can.
