@@ -16,9 +16,13 @@
 
 mod encode;
 pub mod hazard;
+pub mod object;
 pub mod preprocess;
 
-use std::collections::HashMap;
+use object::{Object, RelKind, Reloc, Symbol};
+
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 /// Which RISC core the code targets — it changes a handful of shared opcodes
@@ -94,10 +98,25 @@ pub struct Assembled {
     pub emitted: Vec<Emitted>,
     pub symbols: HashMap<String, u32>,
     pub globals: Vec<String>,
+    pub externs: Vec<String>,
+    pub relocs: Vec<Reloc>,
     pub diags: Vec<Diag>,
 }
 
 impl Assembled {
+    /// Build a relocatable object from this assembly (for `jln`).
+    pub fn object(&self, org: u32) -> Object {
+        let syms = self
+            .symbols
+            .iter()
+            .map(|(name, &value)| Symbol {
+                name: name.clone(),
+                value,
+                global: self.globals.iter().any(|g| g == name),
+            })
+            .collect();
+        Object { org, bytes: self.bytes.clone(), symbols: syms, relocs: self.relocs.clone() }
+    }
     pub fn errors(&self) -> usize {
         self.diags.iter().filter(|d| d.level == Level::Error).count()
     }
@@ -117,6 +136,9 @@ pub struct Options {
     pub warnings_as_errors: bool,
     /// Directories searched for `.include` files (plus the file's own dir).
     pub include_dirs: Vec<String>,
+    /// Object mode: undefined symbols become relocations for jln instead of
+    /// errors (turned on when emitting a `.jo` object with `-c`).
+    pub object_mode: bool,
 }
 
 impl Default for Options {
@@ -127,6 +149,7 @@ impl Default for Options {
             check_hazards: true,
             warnings_as_errors: false,
             include_dirs: Vec::new(),
+            object_mode: false,
         }
     }
 }
@@ -180,6 +203,12 @@ struct Assembler<'a> {
     regaliases: HashMap<String, u16>,
     /// condition-code aliases from `.ccdef` (name -> 5-bit cc)
     ccaliases: HashMap<String, u16>,
+    /// symbols declared `.extern` (always relocatable)
+    externs: HashSet<String>,
+    /// relocations recorded in pass 2
+    relocs: Vec<Reloc>,
+    /// set by the encoder when a movei immediate is relocatable
+    pending_reloc: RefCell<Option<(u32, RelKind, String, i64)>>,
     globals: Vec<String>,
     emitted: Vec<Emitted>,
     bytes: Vec<u8>,
@@ -200,6 +229,9 @@ impl<'a> Assembler<'a> {
             symbols: HashMap::new(),
             regaliases: HashMap::new(),
             ccaliases: HashMap::new(),
+            externs: HashSet::new(),
+            relocs: Vec::new(),
+            pending_reloc: RefCell::new(None),
             globals: Vec::new(),
             emitted: Vec::new(),
             bytes: Vec::new(),
@@ -219,6 +251,7 @@ impl<'a> Assembler<'a> {
             self.scope.clear();
             self.regaliases.clear();
             self.ccaliases.clear();
+            self.relocs.clear();
             if pass == 2 {
                 self.emitted.clear();
                 self.bytes.clear();
@@ -238,6 +271,8 @@ impl<'a> Assembler<'a> {
             emitted: self.emitted,
             symbols: self.symbols,
             globals: self.globals,
+            externs: self.externs.into_iter().collect(),
+            relocs: self.relocs,
             diags: self.diags,
         }
     }
@@ -358,11 +393,19 @@ impl<'a> Assembler<'a> {
                     }
                 }
             }
-            ".globl" | ".global" | ".extern" => {
+            ".globl" | ".global" => {
                 for name in line.args.split(',') {
                     let name = name.trim();
                     if !name.is_empty() && self.pass == 2 {
                         self.globals.push(name.to_string());
+                    }
+                }
+            }
+            ".extern" | ".xdef" | ".xref" => {
+                for name in line.args.split(',') {
+                    let name = name.trim();
+                    if !name.is_empty() {
+                        self.externs.insert(name.to_string());
                     }
                 }
             }
@@ -480,6 +523,18 @@ impl<'a> Assembler<'a> {
 
     fn emit_data(&mut self, line: &Line, size: u32, swapped: bool) {
         for item in split_args(line.args) {
+            // relocatable longword (a table of external addresses)
+            if size == 4 {
+                if let Some((sym, addend)) = self.reloc_symbol(item.trim()) {
+                    if self.pass == 2 {
+                        let off = self.bytes.len() as u32;
+                        self.relocs.push(Reloc { offset: off, kind: RelKind::Long, symbol: sym, addend });
+                    }
+                    self.put_word((addend >> 16) as u16, line);
+                    self.put_word(addend as u16, line);
+                    continue;
+                }
+            }
             let Some(v) = self.eval_or_err(&item, line.n) else { continue };
             match size {
                 1 => self.put_byte(v as u8, line),
@@ -528,10 +583,20 @@ impl<'a> Assembler<'a> {
     }
 
     /// Emit one encoded instruction (its opcode word plus any MOVEI immediate).
-    fn emit_insn(&mut self, op: u8, words: Vec<u16>, line: usize) {
+    fn emit_insn(
+        &mut self,
+        op: u8,
+        words: Vec<u16>,
+        line: usize,
+        reloc: Option<(u32, RelKind, String, i64)>,
+    ) {
         if self.pass == 2 {
+            let base = self.bytes.len() as u32;
             for w in &words {
                 self.bytes.extend_from_slice(&w.to_be_bytes());
+            }
+            if let Some((woff, kind, symbol, addend)) = reloc {
+                self.relocs.push(Reloc { offset: base + woff * 2, kind, symbol, addend });
             }
             self.emitted.push(Emitted {
                 addr: self.pc,
@@ -545,8 +610,12 @@ impl<'a> Assembler<'a> {
     }
 
     fn instruction(&mut self, mnem: &str, line: &Line) {
+        *self.pending_reloc.borrow_mut() = None;
         match encode::encode(mnem, line.args, self) {
-            Ok((op, words)) => self.emit_insn(op, words, line.n),
+            Ok((op, words)) => {
+                let reloc = self.pending_reloc.borrow_mut().take();
+                self.emit_insn(op, words, line.n, reloc);
+            }
             Err(EncodeErr::Message(m)) => self.err(line.n, m),
             Err(EncodeErr::Fix(m, fix)) => self.err_fix(line.n, m, fix),
             Err(EncodeErr::Unknown) => {
@@ -602,6 +671,53 @@ impl<'a> Assembler<'a> {
             return Some(cc);
         }
         self.eval(s).ok().map(|v| (v & 0x1F) as u16)
+    }
+
+    /// If `expr` is a relocatable symbol reference (`SYM`, `SYM+C`, `SYM-C`,
+    /// `C+SYM`) for a symbol this object does not define, return (symbol, addend).
+    /// Only fires in pass 2, and only for externs (or any undefined symbol in
+    /// object mode).
+    fn reloc_symbol(&self, expr: &str) -> Option<(String, i64)> {
+        if self.pass != 2 {
+            return None;
+        }
+        let relocatable = |sym: &str| -> bool {
+            !self.symbols.contains_key(sym)
+                && (self.opts.object_mode || self.externs.contains(sym))
+                && ident_ok(sym)
+        };
+        let e = expr.trim();
+        if relocatable(e) {
+            return Some((e.to_string(), 0));
+        }
+        for (op, sign) in [('+', 1i64), ('-', -1i64)] {
+            if let Some(pos) = e.rfind(op) {
+                let l = e[..pos].trim();
+                let r = e[pos + 1..].trim();
+                if relocatable(l) {
+                    if let Ok(c) = self.eval(r) {
+                        return Some((l.to_string(), sign * c as i64));
+                    }
+                }
+                if op == '+' && relocatable(r) {
+                    if let Ok(c) = self.eval(l) {
+                        return Some((r.to_string(), c as i64));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Evaluate a MOVEI immediate, recording a relocation if it references an
+    /// external symbol (returns the addend as the placeholder value).
+    pub(crate) fn movei_imm(&self, expr: &str) -> Result<u32, String> {
+        let e = expr.strip_prefix('#').unwrap_or(expr).trim();
+        if let Some((sym, addend)) = self.reloc_symbol(e) {
+            *self.pending_reloc.borrow_mut() = Some((1, RelKind::Movei, sym, addend));
+            return Ok(addend as u32);
+        }
+        self.eval(e)
     }
 
     fn lookup(&self, name: &str) -> Option<u32> {
@@ -761,6 +877,12 @@ fn suffix_size(sfx: &str) -> u32 {
         "l" | "i" => 4,
         _ => 2, // w / empty / phrase-ish default to word
     }
+}
+
+fn ident_ok(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars().next().map(is_ident_start).unwrap_or(false)
+        && s.chars().all(is_ident_char)
 }
 
 fn is_ident_start(c: char) -> bool {

@@ -1,0 +1,22 @@
+[package]
+name = "jln"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "jln — the Cobweb linker: resolves cross-object symbols and relocations into a loadable image"
+
+[[bin]]
+name = "jln"
+path = "src/main.rs"
+
+[lib]
+name = "jln"
+path = "src/lib.rs"
+
+[dependencies]
+jas = { path = "../jas" }
+
+[dev-dependencies]
+jag-core = { path = "../jag-core" }

@@ -42,6 +42,7 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             }
+            "-c" => opts.object_mode = true,   // emit a relocatable object (.jo)
             "--no-hazard-check" => opts.check_hazards = false,
             "-Werror" => opts.warnings_as_errors = true,
             "-I" => {
@@ -89,15 +90,22 @@ fn main() -> ExitCode {
     }
 
     if let Some(out) = output {
-        if let Err(e) = std::fs::write(&out, &result.bytes) {
+        let data = if opts.object_mode {
+            result.object(result.org).serialize()
+        } else {
+            result.bytes.clone()
+        };
+        if let Err(e) = std::fs::write(&out, &data) {
             eprintln!("jas: cannot write {out}: {e}");
             return ExitCode::FAILURE;
         }
         eprintln!(
-            "jas: wrote {} ({} bytes at 0x{:06X}), {warns} warning(s)",
+            "jas: wrote {} ({} {} at 0x{:06X}, {} relocs), {warns} warning(s)",
             out,
-            result.bytes.len(),
-            result.org
+            if opts.object_mode { data.len() } else { result.bytes.len() },
+            if opts.object_mode { "object bytes" } else { "bytes" },
+            result.org,
+            result.relocs.len(),
         );
     } else {
         // no -o: just report (a syntax/hazard check run)

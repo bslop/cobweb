@@ -17,7 +17,7 @@ these are the production backlog, in priority order:
 
 | Blocker | ~count | What it needs |
 |---|---|---|
-| Undefined symbols from `.include`d headers + cross-module `.extern` | ~690 | the **preprocessor** (`.include`) and the **linker** (`jln`) |
+| ~~Undefined symbols / cross-module `.extern`~~ | ~~done~~ | preprocessor + **jln linker SHIPPED** (jas `-c` objects, reloc resolution) ✓ |
 | ~~`.if`/`.rept`/`.macro`/`.include`~~ | ~~done~~ | **preprocessor SHIPPED** (front pass) ✓ |
 | 68k mnemonics (`move.l`, `movem`, `lsl`, `ori`, …) in mixed 68k/JRISC files | ~200 | a **68k assembler mode** (or section split) |
 | Unknown condition codes | ~120 | audit the corpus's `jump`/`jr` condition spellings vs jas |
@@ -30,10 +30,9 @@ these are the production backlog, in priority order:
    existing two-pass assembler already handles. Unblocks the include-header
    undefined-symbols and the conditional/repeat/macro directives — the single
    biggest category.
-2. **jln — the linker** (the missing 8th component): sections, relocations,
-   `.extern`/`.globl` resolution across objects, and the headline feature from
-   the wishlist — **SRAM overlay groups as first-class objects**. Replaces rln.
-   Resolves the cross-module undefined symbols.
+2. ~~**jln — the linker**~~ **SHIPPED**: jas emits `.jo` relocatable objects
+   (`-c`), jln resolves cross-object symbols + movei/long relocations into a
+   loadable image. SRAM overlay groups (first-class) are the next jln step.
 3. **68k assembler mode** in jas (or a sibling `jas68k`): the mixed files
    interleave a 68k host section (`.68000`) with GPU/DSP code. Real projects
    need both assembled and linked together. (jcc already needs a 68k backend

@@ -65,7 +65,9 @@ live in `calib/` (bench logs) and `sim/crates/jag-core/src/risc/timing.rs`
 | **jdbg** | Source-level debugger: breakpoints and stepping by **source line** (not raw address), live register inspection, crash forensics that name the source line | **v1 landed** — `sim/crates/jdbg/`: assembles via jas (keeping the addr→line map), runs in jsim, breaks/steps by source line. 4 tests. (Skunkboard/GameDrive hardware backend behind the same `Session` API, and jcc variable-name inspection: next.) |
 | **jprof** | See where the cycles go: per-cause cost breakdown (issue vs stalls vs bus), IPC, plain-language bottleneck diagnosis, and build-to-build diff | **v1 landed** — `sim/crates/jprof/`: turns jsim's stall attribution into a profile that names the bottleneck (it surfaced vbcc's 26%-in-jump-refill) and proves whether an optimization moved it. 3 tests. (Per-region hotspots, frame timelines: next.) |
 
-Build order (from the wishlist): jsim → jas → jtest → jopt → jcc → jdbg/jprof.
+| **jln** | The linker (successor to rln): resolves cross-object symbols + relocations from jas objects into a loadable image; SRAM overlay groups next | **v1 landed** — `sim/crates/jln/`: `.jo` object format, movei/long relocations, global symbol table, sparse image layout; assemble→object→link→run proven in jsim. 3 tests. |
+
+Build order: jsim → jas → jln → jtest → jopt → jcc → jdbg/jprof.
 **The pilot project** — live kernels, a running shadow harness,
 and a boot gate that tells us within two minutes whether our output lies.
 

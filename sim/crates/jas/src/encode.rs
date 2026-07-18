@@ -189,8 +189,8 @@ pub(crate) fn encode(mnem: &str, args: &str, asm: &Assembler) -> R {
         "movefa" => rr(37),
         "movei" => {
             let (a, b) = args2(args)?;
-            let v = imm(&a, asm)?;
             let r2 = dreg(&b, asm)?;
+            let v = asm.movei_imm(&a).map_err(msg)?;
             let w0 = (38u16 << 10) | (r2 & 0x1F);
             Ok((38, vec![w0, (v & 0xFFFF) as u16, (v >> 16) as u16]))
         }
