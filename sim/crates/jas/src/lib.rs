@@ -101,6 +101,8 @@ pub struct Assembled {
     pub globals: Vec<String>,
     pub externs: Vec<String>,
     pub relocs: Vec<Reloc>,
+    /// source lines carrying a `;jas:allow` pragma (hazards there are waived)
+    pub suppressed: Vec<usize>,
     pub diags: Vec<Diag>,
 }
 
@@ -140,6 +142,9 @@ pub struct Options {
     /// Object mode: undefined symbols become relocations for jln instead of
     /// errors (turned on when emitting a `.jo` object with `-c`).
     pub object_mode: bool,
+    /// Start in 68000 mode (for pure-68k source files with no `.68000`
+    /// directive — rmac's default CPU is the 68k).
+    pub start_m68k: bool,
 }
 
 impl Default for Options {
@@ -151,6 +156,7 @@ impl Default for Options {
             warnings_as_errors: false,
             include_dirs: Vec::new(),
             object_mode: false,
+            start_m68k: false,
         }
     }
 }
@@ -172,7 +178,9 @@ pub fn assemble(source: &str, opts: &Options) -> Assembled {
     asm.run(&expanded);
     let mut out = asm.finish();
     if opts.check_hazards {
+        let suppressed: std::collections::HashSet<usize> = out.suppressed.iter().copied().collect();
         let mut hz = hazard::check(&out.emitted);
+        hz.retain(|d| !suppressed.contains(&d.line));
         if opts.warnings_as_errors {
             for d in &mut hz {
                 d.level = Level::Error;
@@ -220,6 +228,8 @@ struct Assembler<'a> {
     scope: String,
     /// true inside a `.68000` section (route instructions to the 68k encoder)
     m68k_mode: bool,
+    /// source lines with a `;jas:allow` pragma (hazard diagnostics waived)
+    suppressed: std::collections::HashSet<usize>,
     pass: u8,
 }
 
@@ -242,7 +252,8 @@ impl<'a> Assembler<'a> {
             bytes: Vec::new(),
             diags: Vec::new(),
             scope: String::new(),
-            m68k_mode: false,
+            m68k_mode: opts.start_m68k,
+            suppressed: HashSet::new(),
             pass: 0,
         }
     }
@@ -258,12 +269,15 @@ impl<'a> Assembler<'a> {
             self.regaliases.clear();
             self.ccaliases.clear();
             self.relocs.clear();
-            self.m68k_mode = false;
+            self.m68k_mode = self.opts.start_m68k;
             if pass == 2 {
                 self.emitted.clear();
                 self.bytes.clear();
             }
             for (i, raw) in source.lines().enumerate() {
+                if pass == 1 && raw.contains("jas:allow") {
+                    self.suppressed.insert(i + 1);
+                }
                 if let Some(line) = parse_line(raw, i + 1) {
                     self.handle(&line);
                 }
@@ -280,6 +294,7 @@ impl<'a> Assembler<'a> {
             globals: self.globals,
             externs: self.externs.into_iter().collect(),
             relocs: self.relocs,
+            suppressed: self.suppressed.into_iter().collect(),
             diags: self.diags,
         }
     }
@@ -393,11 +408,11 @@ impl<'a> Assembler<'a> {
         match opl.as_str() {
             ".gpu" => {
                 self.target = Target::Gpu;
-                self.m68k_mode = false;
+                self.m68k_mode = self.opts.start_m68k;
             }
             ".dsp" => {
                 self.target = Target::Dsp;
-                self.m68k_mode = false;
+                self.m68k_mode = self.opts.start_m68k;
             }
             ".68000" | ".68k" | ".m68k" => self.m68k_mode = true,
             ".org" | "org" => {

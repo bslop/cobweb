@@ -260,3 +260,40 @@ fn m68k_movem_roundtrip() {
     );
     assert_eq!(bus.read32(0x0010_0000), 22);
 }
+
+// ── COBWEB_ISSUES (aerodagger dogfooding) regressions ────────────────────────
+
+#[test]
+fn waw_window_does_not_flag_distant_write() {
+    // Issue #1: a write far past the load's shadow must NOT be flagged (the
+    // load has long since settled). Load into r2, 30 independent ops, write r2.
+    let mut src = String::from("        .gpu\n        movei #$100000,r3\n        load (r3),r2\n");
+    for _ in 0..30 {
+        src.push_str("        nop\n");
+    }
+    src.push_str("        moveq #3,r2\n");
+    assert_eq!(errors_of(&src).len(), 0, "distant write wrongly flagged (issue #1)");
+}
+
+#[test]
+fn waw_window_still_flags_in_shadow() {
+    // ...but a write a few instructions after the load IS still caught.
+    let src = "        .gpu\n        movei #$100000,r3\n        load (r3),r2\n\
+               \x20       nop\n        nop\n        moveq #3,r2\n";
+    assert!(errors_of(src).iter().any(|e| e.contains("bug 13")), "close WAW must still fire");
+}
+
+#[test]
+fn pragma_waives_hazard_on_its_line() {
+    let src = "        .gpu\n        movei #$100000,r3\n        load (r3),r2\n\
+               \x20       moveq #3,r2   ; jas:allow reviewed\n";
+    assert_eq!(errors_of(src).len(), 0, "; jas:allow should waive the WAW on that line");
+}
+
+#[test]
+fn m68k_start_flag_assembles_pure_68k() {
+    // Issue #2: a pure-68k file with no .68000 directive assembles in 68k mode.
+    let opts = Options { target: Target::Gpu, org: 0x4000, start_m68k: true, check_hazards: false, ..Default::default() };
+    let out = assemble("        movem.l a1-a2,-(sp)\n        move.w #$4001,d0\n        rts\n", &opts);
+    assert_eq!(out.errors(), 0, "pure-68k with --68000 must assemble: {:#?}", out.diags);
+}

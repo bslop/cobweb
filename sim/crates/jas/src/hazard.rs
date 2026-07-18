@@ -197,7 +197,7 @@ fn is_jump(op: u8) -> bool {
 pub fn check(emitted: &[Emitted]) -> Vec<Diag> {
     let mut diags = Vec::new();
     // reg -> line of the pending slow producer (None = settled)
-    let mut pending: HashMap<u8, usize> = HashMap::new();
+    let mut pending: HashMap<u8, Pend> = HashMap::new();
 
     // Only instruction-bearing entries participate; keep their indices so we can
     // look at the delay slot (the next instruction).
@@ -235,17 +235,30 @@ pub fn check(emitted: &[Emitted]) -> Vec<Diag> {
             }
         }
 
+        // Is `reg` still inside its producer's shadow at instruction `i`? The
+        // scoreboard only mis-behaves while the slow result is IN FLIGHT — a
+        // load settles in ~16 cycles, a divide at cycle 18 (jsim's calibrated
+        // latencies). A write/store that many instructions later lands AFTER
+        // the result, so it is safe. Bounding the window here is the fix for
+        // the corpus false positive where a write sat 62 instructions past its
+        // load (COBWEB_ISSUES #1). Instruction distance is a conservative lower
+        // bound on cycle distance (every instruction is ≥1 cycle).
+        let in_shadow = |p: &Pend| i.saturating_sub(p.issue_i) < p.window();
+
         // Indexed store of an unsettled register (erratum) — check BEFORE reads
         // settle anything, and do NOT settle it (the read is unprotected).
         if let Some(data) = acc.indexed_store_data {
-            if let Some(&pline) = pending.get(&data) {
-                diags.push(Diag::error(
-                    e.line,
-                    format!(
-                        "indexed store of r{data}, still pending from a load/divide at line {pline} \
-                         — the DATA register is not scoreboarded (TRM errata), the STALE value is stored"
-                    ),
-                ).with_fix(format!("touch the register first, e.g. `or r{data},r{data}`, so the scoreboard settles it")));
+            if let Some(p) = pending.get(&data) {
+                if in_shadow(p) {
+                    diags.push(Diag::error(
+                        e.line,
+                        format!(
+                            "indexed store of r{data}, still pending from a load/divide at line {} \
+                             — the DATA register is not scoreboarded (TRM errata), the STALE value is stored",
+                            p.line
+                        ),
+                    ).with_fix(format!("touch the register first, e.g. `or r{data},r{data}`, so the scoreboard settles it")));
+                }
             }
         }
 
@@ -254,24 +267,28 @@ pub fn check(emitted: &[Emitted]) -> Vec<Diag> {
             pending.remove(&r);
         }
 
-        // Write-after-write into a shadow (bug 13): writing a register that is
-        // still pending, when this instruction did NOT also read it.
+        // Write-after-write into a shadow (bug 13): writing a register still in
+        // flight from a slow producer, when this instruction did NOT also read
+        // it — but only if the write lands inside the shadow.
         if let Some(w) = acc.write {
             let read_it = acc.reads.contains(&w);
             if !read_it {
-                if let Some(&pline) = pending.get(&w) {
-                    diags.push(Diag::error(
-                        e.line,
-                        format!(
-                            "write to r{w} races a pending load/divide from line {pline} \
-                             (TRM bug 13: writes are not scoreboarded — the slow value lands LAST)"
-                        ),
-                    ).with_fix(format!("read r{w} first (e.g. `or r{w},r{w}`) or reorder so the slow result is consumed before overwrite")));
+                if let Some(p) = pending.get(&w) {
+                    if in_shadow(p) {
+                        diags.push(Diag::error(
+                            e.line,
+                            format!(
+                                "write to r{w} races a pending load/divide from line {} \
+                                 (TRM bug 13: writes are not scoreboarded — the slow value lands LAST)",
+                                p.line
+                            ),
+                        ).with_fix(format!("read r{w} first (e.g. `or r{w},r{w}`) or reorder so the slow result is consumed before overwrite")));
+                    }
                 }
             }
             // Update pending for this write.
             if acc.slow {
-                pending.insert(w, e.line);
+                pending.insert(w, Pend { line: e.line, issue_i: i, is_div: acc.op == 21 });
             } else {
                 pending.remove(&w);
             }
@@ -279,4 +296,24 @@ pub fn check(emitted: &[Emitted]) -> Vec<Diag> {
     }
 
     diags
+}
+
+/// A slow result in flight: where it was produced, and its shadow length.
+struct Pend {
+    line: usize,
+    issue_i: usize,
+    is_div: bool,
+}
+
+impl Pend {
+    /// Worst-case shadow in issued instructions (conservative lower bound on
+    /// cycles): the divide quotient lands at cycle 18; a consumed external load
+    /// lands ~16 cycles out (jsim `DRAM_LAT_HIT` + internal load latency).
+    fn window(&self) -> usize {
+        if self.is_div {
+            18
+        } else {
+            16
+        }
+    }
 }

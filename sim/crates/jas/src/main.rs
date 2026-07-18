@@ -33,6 +33,7 @@ fn main() -> ExitCode {
                 }
             }
             "--gpu" => opts.target = Target::Gpu,
+            "--68000" | "--m68k" => opts.start_m68k = true,
             "--org" => {
                 if let Some(v) = it.next().and_then(|s| parse_num(s)) {
                     opts.org = v;
@@ -138,6 +139,7 @@ fn usage() {
          OPTIONS:\n\
          \x20 -o <file>            write flat binary output\n\
          \x20 --gpu | --dsp       target core (default gpu; sets default org)\n\
+         \x20 --68000            start in 68000 mode (pure-68k files w/o a .68000 directive)\n\
          \x20 --org <0xADDR>      origin address (default GPU $F03000 / DSP $F1B000)\n\
          \x20 --no-hazard-check   emit even known silicon hazards (not recommended)\n\
          \x20 -Werror             treat warnings as errors\n\
