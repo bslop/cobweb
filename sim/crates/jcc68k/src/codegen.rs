@@ -143,6 +143,7 @@ impl Gen {
                     match init {
                         Init::Scalar(e) => {
                             self.gen_expr(e)?;
+                            self.cast(&e.ty, ty); // implicit conversion
                             self.store_to_local(name, ty);
                         }
                         Init::List(_) => {
@@ -306,6 +307,7 @@ impl Gen {
                 self.gen_addr(lhs)?;
                 self.line("move.l a0,-(a7)"); // save dest addr
                 self.gen_expr(rhs)?; // value in D0
+                self.cast(&rhs.ty, &lhs.ty); // implicit conversion (int↔fixed, widen)
                 self.line("move.l (a7)+,a0"); // restore dest
                 self.store(&lhs.ty);
                 // result of assignment is the stored value (already in D0)
@@ -456,9 +458,17 @@ impl Gen {
                     self.line("asr.l d1,d0");
                 }
             }
-            BinOp::Mul => self.line("jsr __mulsi3"),
+            BinOp::Mul => {
+                if lt.is_fixed() || rt.is_fixed() {
+                    self.line("jsr __mulfix");
+                } else {
+                    self.line("jsr __mulsi3");
+                }
+            }
             BinOp::Div => {
-                if unsigned {
+                if lt.is_fixed() || rt.is_fixed() {
+                    self.line("jsr __divfix");
+                } else if unsigned {
                     self.line("jsr __udivsi3");
                 } else {
                     self.line("jsr __divsi3");
@@ -563,6 +573,7 @@ impl Gen {
         match (init, &**ty) {
             (Init::Scalar(e), _) => {
                 self.gen_expr(e)?;
+                self.cast(&e.ty, ty);
                 match ty.size() {
                     1 => self.line(&format!("move.b d0,{off}(a6)")),
                     2 => self.line(&format!("move.w d0,{off}(a6)")),
@@ -603,6 +614,23 @@ impl Gen {
     }
 
     fn cast(&mut self, from: &Type, to: &Type) {
+        // int/fixed conversions (16.16 fixed-point).
+        if to.is_fixed() && from.is_integer() {
+            // int → fixed: value << 16 (swap words, clear the low word).
+            self.line("swap d0");
+            self.line("clr.w d0");
+            return;
+        }
+        if to.is_integer() && from.is_fixed() {
+            // fixed → int: signed value >> 16 (integer part in the high word).
+            self.line("swap d0");
+            self.line("ext.l d0");
+            // narrow to the target int size happens implicitly on store
+            return;
+        }
+        if to.is_fixed() || from.is_fixed() {
+            return; // fixed↔fixed, or fixed↔pointer: bit-identical
+        }
         // Narrowing/widening in D0.
         if to.size() >= 4 {
             // widen to 32 from smaller int

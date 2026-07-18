@@ -79,6 +79,8 @@ const RUNTIME: &str = r#"
 	.globl __umodsi3
 	.globl __divsi3
 	.globl __modsi3
+	.globl __mulfix
+	.globl __divfix
 
 ; D0 = D0 * D1  (32×32→32, low 32 bits)
 __mulsi3:
@@ -170,6 +172,106 @@ __mod_p2:
 	neg.l	d0
 __mod_done:
 	movem.l	(a7)+,d5
+	rts
+
+; ── 16.16 fixed-point helpers ────────────────────────────────────────────────
+; D0 = (D0 * D1) >> 16, signed 16.16. Builds the full 64-bit product from four
+; 16×16 partials, then shifts right 16.
+__mulfix:
+	movem.l	d2-d7,-(a7)
+	moveq	#0,d7			; sign
+	tst.l	d0
+	bpl.w	__mf_a
+	neg.l	d0
+	not.l	d7
+__mf_a:
+	tst.l	d1
+	bpl.w	__mf_b
+	neg.l	d1
+	not.l	d7
+__mf_b:
+	move.w	d0,d3			; a0
+	move.w	d1,d2			; b0
+	mulu.w	d2,d3			; d3 = a0*b0 (pll)
+	move.l	d0,d4
+	swap	d4			; d4.w = a1
+	move.w	d1,d5
+	mulu.w	d4,d5			; d5 = a1*b0 (phl)
+	move.l	d1,d6
+	swap	d6			; d6.w = b1
+	move.w	d0,d2
+	mulu.w	d6,d2			; d2 = a0*b1 (plh)
+	mulu.w	d6,d4			; d4 = a1*b1 (phh)
+	; mid = plh + phl, carry → phh<<16
+	add.l	d5,d2			; d2 = mid, X = carry
+	moveq	#0,d0
+	addx.l	d0,d0			; d0 = carry
+	swap	d0			; carry << 16
+	add.l	d0,d4			; phh += carry<<16
+	; lo = pll + (mid_lo16 << 16)
+	move.l	d2,d0
+	swap	d0
+	clr.w	d0			; (mid & $FFFF) << 16
+	add.l	d0,d3			; lo(d3), X = carry_lo
+	moveq	#0,d1
+	addx.l	d1,d1			; d1 = carry_lo
+	; hi = phh + (mid >> 16) + carry_lo
+	move.l	d2,d0
+	clr.w	d0
+	swap	d0			; mid >> 16
+	add.l	d0,d4			; hi(d4)
+	add.l	d1,d4			; += carry_lo
+	; result = (lo >> 16) | (hi << 16)
+	move.l	d3,d0
+	clr.w	d0
+	swap	d0			; lo >> 16
+	move.l	d4,d1
+	swap	d1
+	clr.w	d1			; hi << 16
+	or.l	d1,d0
+	tst.l	d7
+	beq.w	__mf_done
+	neg.l	d0
+__mf_done:
+	movem.l	(a7)+,d2-d7
+	rts
+
+; D0 = (D0 << 16) / D1, signed 16.16. Shift-subtract with 48 iterations: after
+; the 32 dividend bits are consumed the shift feeds zeros, producing the 16
+; fractional quotient bits.
+__divfix:
+	movem.l	d2-d5,-(a7)
+	moveq	#0,d5			; sign
+	tst.l	d0
+	bpl.w	__df_a
+	neg.l	d0
+	not.l	d5
+__df_a:
+	tst.l	d1
+	bpl.w	__df_b
+	neg.l	d1
+	not.l	d5
+__df_b:
+	move.l	d0,d2			; dividend
+	move.l	d1,d3			; divisor
+	moveq	#0,d0			; quotient
+	moveq	#0,d4			; remainder
+	moveq	#47,d1			; 32 + 16 iterations
+__df_loop:
+	add.l	d2,d2			; dividend <<= 1, MSB → X (0 once exhausted)
+	addx.l	d4,d4			; remainder = (remainder<<1)|X
+	add.l	d0,d0			; quotient <<= 1
+	cmp.l	d3,d4
+	bcs.w	__df_skip
+	sub.l	d3,d4
+	addq.l	#1,d0
+__df_skip:
+	dbra	d1,__df_loop
+	tst.l	d5
+	beq.w	__df_done
+	neg.l	d0
+__df_done:
+	movem.l	(a7)+,d2-d5
 	rts
 "#;
 

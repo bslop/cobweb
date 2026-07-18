@@ -315,3 +315,38 @@ fn goto_stmt() {
     let src = "int main(){ int i=0; int s=0; loop: if(i<5){ s+=i; i++; goto loop; } return s; }";
     assert_eq!(run(src), 10);
 }
+
+// ── fixed-point (16.16) ──────────────────────────────────────────────────────
+#[test]
+fn fixed_basic() {
+    assert_eq!(run("int main(){ float f = 2.5; float g = 4.0; return (int)(f*g); }"), 10);
+    assert_eq!(run("int main(){ float a = 1.5; float b = 2.25; return (int)((a+b)*100); }"), 375);
+    assert_eq!(run("int main(){ float f = 3.0; float g = 2.0; return (int)(f/g*1000); }"), 1500);
+}
+
+#[test]
+fn fixed_int_mix() {
+    // int promoted to fixed
+    assert_eq!(run("int main(){ float f = 3; return (int)(f * 2); }"), 6);
+    assert_eq!(run("int main(){ float half = 1; half = half / 2; return (int)(half * 1000); }"), 500);
+}
+
+#[test]
+fn fixed_raw_repr() {
+    // 0.5 in 16.16 is 0x8000 = 32768
+    assert_eq!(run("int main(){ float f = 0.5; return f; }"), 32768);
+    // 1.0 is 0x10000 = 65536
+    assert_eq!(run("int main(){ float f = 1.0; return f; }"), 65536);
+}
+
+#[test]
+fn fixed_compare() {
+    assert_eq!(run("int main(){ float a = 3.14; float b = 2.71; return a > b; }"), 1);
+    assert_eq!(run("int main(){ float a = 1.5; return a < 1.0; }"), 0);
+}
+
+#[test]
+fn fixed_negative() {
+    assert_eq!(run("int main(){ float a = -2.5; float b = 4.0; return (int)(a*b); }"), (-10i32) as u32);
+    assert_eq!(run("int main(){ float a = -6.0; float b = 2.0; return (int)(a/b); }"), (-3i32) as u32);
+}

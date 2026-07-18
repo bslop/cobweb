@@ -11,6 +11,9 @@ pub enum TypeK {
     Void,
     /// Integer: (size in bytes, signed?).
     Int { size: u32, signed: bool },
+    /// Fixed-point (the Jaguar has no FPU): C `float`/`double` are 16.16 signed
+    /// fixed, held in a 32-bit word. `frac` is the fractional bit count (16).
+    Fixed { frac: u32 },
     Ptr(Type),
     Array(Type, u32),
     Func { ret: Type, params: Vec<Type>, variadic: bool },
@@ -48,12 +51,16 @@ pub fn t_ushort() -> Type {
 pub fn t_ptr(to: Type) -> Type {
     Rc::new(TypeK::Ptr(to))
 }
+pub fn t_fixed() -> Type {
+    Rc::new(TypeK::Fixed { frac: 16 })
+}
 
 impl TypeK {
     pub fn size(&self) -> u32 {
         match self {
             TypeK::Void => 1,
             TypeK::Int { size, .. } => *size,
+            TypeK::Fixed { .. } => 4,
             TypeK::Ptr(_) => 4,
             TypeK::Array(el, n) => el.size() * n,
             TypeK::Func { .. } => 4,
@@ -64,7 +71,7 @@ impl TypeK {
         match self {
             TypeK::Void => 1,
             TypeK::Int { size, .. } => (*size).min(2).max(1), // 68k: 16-bit alignment
-            TypeK::Ptr(_) | TypeK::Func { .. } => 2,
+            TypeK::Fixed { .. } | TypeK::Ptr(_) | TypeK::Func { .. } => 2,
             TypeK::Array(el, _) => el.align(),
             TypeK::Struct { align, .. } => *align,
         }
@@ -72,8 +79,11 @@ impl TypeK {
     pub fn is_integer(&self) -> bool {
         matches!(self, TypeK::Int { .. })
     }
+    pub fn is_fixed(&self) -> bool {
+        matches!(self, TypeK::Fixed { .. })
+    }
     pub fn is_signed(&self) -> bool {
-        matches!(self, TypeK::Int { signed: true, .. })
+        matches!(self, TypeK::Int { signed: true, .. } | TypeK::Fixed { .. })
     }
     pub fn is_ptr(&self) -> bool {
         matches!(self, TypeK::Ptr(_) | TypeK::Array(..))

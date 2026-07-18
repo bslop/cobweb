@@ -318,13 +318,17 @@ impl Parser {
                         signed = Some(false);
                         self.pos += 1;
                     }
-                    "void" | "char" | "int" | "float" | "double" | "_Bool" => {
+                    "float" | "double" => {
+                        // No FPU on the Jaguar: C floating types are 16.16 fixed.
+                        ty = Some(t_fixed());
+                        self.pos += 1;
+                    }
+                    "void" | "char" | "int" | "_Bool" => {
                         base_kw = Some(match k.as_str() {
                             "void" => "void",
                             "char" => "char",
-                            "int" => "int",
                             "_Bool" => "char",
-                            _ => "int", // float/double → int placeholder (no FPU codegen yet)
+                            _ => "int",
                         });
                         self.pos += 1;
                     }
@@ -1025,6 +1029,12 @@ impl Parser {
                 self.pos += 1;
                 Ok(Expr { kind: ExprK::Num(n), ty: t_int(), line })
             }
+            Tok::Float(f) => {
+                self.pos += 1;
+                // 16.16 fixed-point literal (round to nearest).
+                let fixed = (f * 65536.0).round() as i64;
+                Ok(Expr { kind: ExprK::Num(fixed), ty: t_fixed(), line })
+            }
             Tok::Char(n) => {
                 self.pos += 1;
                 Ok(Expr { kind: ExprK::Num(n), ty: t_char(), line })
@@ -1086,6 +1096,25 @@ impl Parser {
                 let szc = Expr { kind: ExprK::Num(esz), ty: t_int(), line };
                 return Ok(Expr { kind: ExprK::Binary(BinOp::Div, Box::new(diff), Box::new(szc)), ty: t_int(), line });
             }
+        }
+        // fixed-point: if either operand is fixed, promote both to fixed. The
+        // result is fixed for arithmetic, int for comparisons.
+        if lt.is_fixed() || rt.is_fixed() {
+            let to_fixed = |e: Expr| -> Expr {
+                if e.ty.is_fixed() {
+                    e
+                } else {
+                    Expr { kind: ExprK::Cast(Box::new(e)), ty: t_fixed(), line }
+                }
+            };
+            let l = to_fixed(lhs);
+            let r = to_fixed(rhs);
+            let ty = match op {
+                BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+                | BinOp::LogAnd | BinOp::LogOr => t_int(),
+                _ => t_fixed(),
+            };
+            return Ok(Expr { kind: ExprK::Binary(op, Box::new(l), Box::new(r)), ty, line });
         }
         // comparisons and logicals yield int
         let ty = match op {

@@ -6,6 +6,8 @@
 pub enum Tok {
     // literals / identifiers
     Num(i64),
+    /// Floating literal (kept as f64; lowered to 16.16 fixed-point by codegen).
+    Float(f64),
     Str(Vec<u8>),
      Char(i64),
     Ident(String),
@@ -87,13 +89,11 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             continue;
         }
         let (sl, sc) = (line, col);
-        // number (int; hex/oct/dec, with optional u/l suffixes)
-        if c.is_ascii_digit() {
-            let start = i;
-            let (val, n) = lex_number(&b[i..])?;
+        // number: integer (hex/oct/dec) or float (has '.' or exponent)
+        if c.is_ascii_digit() || (c == b'.' && b.get(i + 1).is_some_and(|d| d.is_ascii_digit())) {
+            let (tok, n) = scan_number(&b[i..])?;
             bump(&mut i, &mut line, &mut col, n);
-            let _ = start;
-            out.push(Token { tok: Tok::Num(val), line: sl, col: sc });
+            out.push(Token { tok, line: sl, col: sc });
             continue;
         }
         // char literal
@@ -143,6 +143,48 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
     }
     out.push(Token { tok: Tok::Eof, line, col });
     Ok(out)
+}
+
+/// Scan a numeric literal, distinguishing integers from floats (`.`/exponent).
+fn scan_number(b: &[u8]) -> Result<(Tok, usize), String> {
+    // hex / octal are always integers
+    if b.len() >= 2 && b[0] == b'0' && (b[1] == b'x' || b[1] == b'X') {
+        let (v, n) = lex_number(b)?;
+        return Ok((Tok::Num(v), n));
+    }
+    let mut i = 0;
+    let mut is_float = false;
+    while i < b.len() && b[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i < b.len() && b[i] == b'.' {
+        is_float = true;
+        i += 1;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+    }
+    if i < b.len() && (b[i] == b'e' || b[i] == b'E') {
+        is_float = true;
+        i += 1;
+        if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
+            i += 1;
+        }
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+    }
+    if is_float {
+        let s = std::str::from_utf8(&b[..i]).unwrap();
+        let f = s.parse::<f64>().map_err(|e| format!("bad float literal: {e}"))?;
+        while i < b.len() && matches!(b[i], b'f' | b'F' | b'l' | b'L') {
+            i += 1;
+        }
+        Ok((Tok::Float(f), i))
+    } else {
+        let (v, n) = lex_number(b)?;
+        Ok((Tok::Num(v), n))
+    }
 }
 
 fn lex_number(b: &[u8]) -> Result<(i64, usize), String> {
