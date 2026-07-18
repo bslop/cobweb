@@ -97,6 +97,12 @@ pub struct Tom {
     /// captured at scan-out time, not as a torn end-of-frame snapshot). See
     /// `tom::op_render_line`.
     pub fb: crate::tom::Framebuffer,
+    /// The last **fully composited** field, snapshotted from `fb` at each frame
+    /// boundary (see `scheduler`). `fb` is the *live* canvas — mid-field it may be
+    /// freshly cleared with only the top lines drawn — so screen captures read
+    /// `presented` to always get a coherent, complete frame regardless of where a
+    /// run happens to stop.
+    pub presented: crate::tom::Framebuffer,
     /// Per-field Object Processor cursor (geometry + anchor), reset each frame.
     pub op: crate::tom::OpState,
 }
@@ -108,6 +114,7 @@ impl Tom {
             int1_enable: 0,
             int1_pending: 0,
             fb: crate::tom::Framebuffer::solid(320, 240, 0, 0, 0),
+            presented: crate::tom::Framebuffer::solid(320, 240, 0, 0, 0),
             op: crate::tom::OpState::default(),
         }
     }

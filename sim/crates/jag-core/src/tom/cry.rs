@@ -1,9 +1,12 @@
-//! Hardware CRY16 → RGB decode. CRY = Cyan/Red chroma (high byte) + intensity
+//! Hardware CRY16 → RGB decode. CRY = intensity (high byte) + Cyan/Red chroma
 //! (low byte). The three 16×16 modifier ROM tables are the Jaguar's, transcribed
 //! from the Technical Reference (TRM p.28). This is the decode the OP/DAC does —
 //! independent of any game-specific palette — so it matches BigPEmu.
 //!
-//! `cr = px[15:12]` (row), `cy = px[11:8]` (col), `y = px[7:0]` (intensity).
+//! Byte order (verified against retail framebuffers — Cybermorph et al.): the
+//! DAC takes **intensity Y in the high byte** and the CRY chroma pair in the low
+//! byte. So for a big-endian 16-bit pixel `px`:
+//! `y = px[15:8]`, `cr = px[7:4]` (row), `cy = px[3:0]` (col).
 //! `R = CRY_RED[cr][cy] * y / 255`, likewise G/B.
 
 #[rustfmt::skip]
@@ -69,9 +72,9 @@ const CRY_BLUE: [[u8; 16]; 16] = [
 /// Decode a 16-bit CRY pixel to 8-bit RGB.
 #[inline]
 pub fn cry16_to_rgb(px: u16) -> (u8, u8, u8) {
-    let cr = ((px >> 12) & 0xF) as usize;
-    let cy = ((px >> 8) & 0xF) as usize;
-    let y = (px & 0xFF) as u32;
+    let y = ((px >> 8) & 0xFF) as u32;
+    let cr = ((px >> 4) & 0xF) as usize;
+    let cy = (px & 0xF) as usize;
     let scale = |m: u8| ((m as u32 * y) / 255) as u8;
     (scale(CRY_RED[cr][cy]), scale(CRY_GREEN[cr][cy]), scale(CRY_BLUE[cr][cy]))
 }
@@ -82,14 +85,15 @@ mod tests {
 
     #[test]
     fn cry_intensity_zero_is_black() {
-        assert_eq!(cry16_to_rgb(0xFF00), (0, 0, 0)); // any chroma, y=0
+        // Y is the high byte; a zero high byte is black for any chroma.
+        assert_eq!(cry16_to_rgb(0x00FF), (0, 0, 0)); // y=0, any chroma
     }
 
     #[test]
     fn cry_full_intensity_white_corner() {
-        // cr=15,cy=0 → RED=255,GREEN=0,BLUE=0 at full intensity.
-        assert_eq!(cry16_to_rgb(0xF0FF), (255, 0, 0));
-        // cr=0,cy=0 → RED=0,GREEN=0,BLUE=255 (blue corner).
-        assert_eq!(cry16_to_rgb(0x00FF), (0, 0, 255));
+        // y=0xFF (high byte), cr=15,cy=0 (chroma 0xF0) → RED=255,GREEN=0,BLUE=0.
+        assert_eq!(cry16_to_rgb(0xFFF0), (255, 0, 0));
+        // y=0xFF, cr=0,cy=0 (chroma 0x00) → RED=0,GREEN=0,BLUE=255 (blue corner).
+        assert_eq!(cry16_to_rgb(0xFF00), (0, 0, 255));
     }
 }

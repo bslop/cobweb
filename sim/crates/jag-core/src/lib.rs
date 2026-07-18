@@ -140,7 +140,7 @@ impl Jaguar {
     /// `tom::op_render_line`), so this is just the accumulated framebuffer. This
     /// is the screenshot primitive that BigPEmu's headless path gets wrong.
     pub fn capture_frame(&self) -> Framebuffer {
-        self.bus.tom.fb.clone()
+        self.bus.tom.presented.clone()
     }
 
     /// Inject controller state for port `port` (0 or 1). See `jerry` for the

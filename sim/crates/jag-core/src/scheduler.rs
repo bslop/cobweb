@@ -106,8 +106,13 @@ impl Scheduler {
                 self.half_line = 0;
                 self.frame += 1;
                 self.vi_fired_this_frame = false;
+                // The field just completed: snapshot the fully composited canvas
+                // as the presented frame BEFORE the next field clears `fb`. This
+                // is what `capture_frame` returns, so a capture is always a whole
+                // coherent field even if the run stops mid-way into the new one.
+                bus.tom.presented = bus.tom.fb.clone();
                 // New field: the OP re-sizes/clears its canvas at the next
-                // active line. The framebuffer persists for `capture_frame`.
+                // active line.
                 bus.tom.op.started = false;
             }
 
