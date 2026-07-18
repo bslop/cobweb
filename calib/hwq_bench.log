@@ -1,0 +1,15 @@
+jcp v02.04.02 built on Jul  6 2026
+
+COFF File:  Skip 168 bytes, base addr is $4000, length is 2368 bytes
+Sending... 
+|/-Jag accepted start request at $00004000.
+ 
+Finished in 521 millis, 4KB/second.
+ 
+Starting console...
+Cobweb hardware-question probes v1
+HWQ XJUMP  val=600D600D  [GOOD: scoreboard held]
+HWQ CTRL   val=600D600D  [GOOD: scoreboard held]
+HWQ VCFULL max=00000872 (modulus = max+1)
+HWQ DONE
+Console terminating.
