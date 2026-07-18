@@ -156,6 +156,8 @@ struct Assembler<'a> {
     org: u32,
     org_set: bool,
     symbols: HashMap<String, u32>,
+    /// register aliases from `.equr` (name -> register number)
+    regaliases: HashMap<String, u16>,
     globals: Vec<String>,
     emitted: Vec<Emitted>,
     bytes: Vec<u8>,
@@ -174,6 +176,7 @@ impl<'a> Assembler<'a> {
             org: opts.org,
             org_set: false,
             symbols: HashMap::new(),
+            regaliases: HashMap::new(),
             globals: Vec::new(),
             emitted: Vec::new(),
             bytes: Vec::new(),
@@ -191,6 +194,7 @@ impl<'a> Assembler<'a> {
             self.target = self.opts.target;
             self.pc = self.org;
             self.scope.clear();
+            self.regaliases.clear();
             if pass == 2 {
                 self.emitted.clear();
                 self.bytes.clear();
@@ -241,6 +245,16 @@ impl<'a> Assembler<'a> {
             }
             return;
         }
+        if line.op == Some(".equr") {
+            if let Some(name) = line.label {
+                if let Some(r) = self.resolve_reg(line.args) {
+                    self.regaliases.insert(name.to_string(), r);
+                } else {
+                    self.err(line.n, format!("`.equr {name}` needs a register, found `{}`", line.args));
+                }
+            }
+            return;
+        }
         if let Some(label) = line.label {
             self.define_label(label, line.n);
         }
@@ -282,7 +296,24 @@ impl<'a> Assembler<'a> {
     }
 
     fn directive(&mut self, op: &str, line: &Line) {
-        match op {
+        let opl = op.to_ascii_lowercase();
+        // size-suffixed data directives: .dc.X / .dcb.X / .ds.X
+        if let Some(rest) = opl.strip_prefix(".dc.").or_else(|| opl.strip_prefix("dc.")) {
+            let sz = suffix_size(rest);
+            return self.emit_data(line, sz, rest == "i");
+        }
+        if let Some(rest) = opl.strip_prefix(".dcb") {
+            if rest.is_empty() || rest.starts_with('.') {
+                return self.emit_dcb(line, suffix_size(rest.trim_start_matches('.')));
+            }
+        }
+        if let Some(rest) = opl.strip_prefix(".ds") {
+            // guard: don't swallow `.dsp`
+            if rest.is_empty() || rest.starts_with('.') {
+                return self.emit_ds(line, suffix_size(rest.trim_start_matches('.')));
+            }
+        }
+        match opl.as_str() {
             ".gpu" => self.target = Target::Gpu,
             ".dsp" => self.target = Target::Dsp,
             ".68000" | ".68k" => { /* leaving RISC scope — data/host, no encode */ }
@@ -327,7 +358,81 @@ impl<'a> Assembler<'a> {
                     "preprocess with rmac, or inline the macro; macro support is on the roadmap",
                 );
             }
+            ".equ" | ".set" => {
+                let parts = split_args(line.args);
+                if parts.len() == 2 {
+                    if let Some(v) = self.eval_or_err(&parts[1], line.n) {
+                        self.symbols.insert(parts[0].trim().to_string(), v);
+                    }
+                } else {
+                    self.err(line.n, "`.equ` expects `NAME, value`");
+                }
+            }
+            ".equr" => {
+                let parts = split_args(line.args);
+                if parts.len() == 2 {
+                    if let Some(r) = self.resolve_reg(&parts[1]) {
+                        self.regaliases.insert(parts[0].trim().to_string(), r);
+                    } else {
+                        self.err(line.n, "`.equr` expects `NAME, rN`");
+                    }
+                }
+            }
+            ".equrundef" | ".equundef" => {
+                for name in line.args.split(',') {
+                    self.regaliases.remove(name.trim());
+                }
+            }
+            ".dc" => self.emit_data(line, 2, false),
+            ".phrase" => self.align_to(8, line),
+            ".dphrase" => self.align_to(16, line),
+            ".text" | ".data" | ".bss" | ".abs" => { /* section: advisory in single-file mode */ }
+            ".print" => { /* assembler-time message: ignored in batch */ }
+            ".farskip" | ".wait" => {
+                self.err_fix(line.n,
+                    format!("`{op}` looks like a project macro — not defined here"),
+                    "define it with .macro, or jas will expand it once macro support lands");
+            }
             _ => self.err(line.n, format!("unknown directive `{op}`")),
+        }
+    }
+
+    fn align_to(&mut self, a: u32, line: &Line) {
+        while self.pc % a != 0 {
+            self.put_byte(0, line);
+        }
+    }
+
+    /// `.dcb[.size] count, value` — `count` copies of `value`.
+    fn emit_dcb(&mut self, line: &Line, size: u32) {
+        let parts = split_args(line.args);
+        if parts.len() != 2 {
+            self.err(line.n, "`.dcb` expects `count, value`");
+            return;
+        }
+        let (Some(count), Some(val)) =
+            (self.eval_or_err(&parts[0], line.n), self.eval_or_err(&parts[1], line.n))
+        else {
+            return;
+        };
+        for _ in 0..count {
+            match size {
+                1 => self.put_byte(val as u8, line),
+                4 => {
+                    self.put_word((val >> 16) as u16, line);
+                    self.put_word(val as u16, line);
+                }
+                _ => self.put_word(val as u16, line),
+            }
+        }
+    }
+
+    /// `.ds[.size] count` — reserve `count*size` zero bytes.
+    fn emit_ds(&mut self, line: &Line, size: u32) {
+        if let Some(count) = self.eval_or_err(line.args.trim(), line.n) {
+            for _ in 0..(count * size) {
+                self.put_byte(0, line);
+            }
         }
     }
 
@@ -433,6 +538,17 @@ impl<'a> Assembler<'a> {
         Ok(v)
     }
 
+    /// Resolve a register operand: an `.equr` alias, or a plain `rN`/`RN`.
+    pub(crate) fn resolve_reg(&self, s: &str) -> Option<u16> {
+        let s = s.trim();
+        if let Some(&r) = self.regaliases.get(s) {
+            return Some(r);
+        }
+        let rest = s.strip_prefix(['r', 'R'])?;
+        let n: u16 = rest.parse().ok()?;
+        (n < 32).then_some(n)
+    }
+
     fn lookup(&self, name: &str) -> Option<u32> {
         let q = if name.starts_with('.') {
             format!("{}{}", self.scope, name)
@@ -477,9 +593,16 @@ fn parse_line(raw: &str, n: usize) -> Option<Line<'_>> {
             // possibly `name equ expr` / `name = expr`
             let first = rest.split_whitespace().next().unwrap_or("");
             let after = rest[first.len()..].trim_start();
-            if after.starts_with('=') || after.to_ascii_lowercase().starts_with("equ") {
-                // Treat as a symbol definition line: op = "=", args = value.
-                return Some(Line { n, label: Some(first), op: Some("="), args: equ_value(after) });
+            let al = after.to_ascii_lowercase();
+            if after.starts_with('=') || al.starts_with("equ") || al.starts_with(".equ ")
+                || al.starts_with(".equ\t") || al.starts_with(".set")
+            {
+                // symbol definition: op "=", args = value
+                return Some(Line { n, label: Some(first), op: Some("="), args: kw_value(after) });
+            }
+            if al.starts_with(".equr") {
+                // register alias: NAME .equr rN
+                return Some(Line { n, label: Some(first), op: Some(".equr"), args: kw_value(after) });
             }
         }
     } else {
@@ -494,14 +617,14 @@ fn parse_line(raw: &str, n: usize) -> Option<Line<'_>> {
     Some(Line { n, label, op: Some(op), args })
 }
 
-fn equ_value(after: &str) -> &str {
+fn kw_value(after: &str) -> &str {
     let a = after.trim_start();
-    if let Some(r) = a.strip_prefix('=') {
-        r.trim()
-    } else {
-        // "equ ..."
-        a[3..].trim()
+    for kw in ["=", ".equrundef", ".equr", ".equ", ".set", "equ"] {
+        if let Some(r) = a.strip_prefix(kw) {
+            return r.trim_start_matches([',', ' ', '\t']).trim();
+        }
     }
+    a.trim()
 }
 
 /// Find the colon that terminates a leading label, ignoring `::` (global) and
@@ -565,6 +688,15 @@ fn split_args(s: &str) -> Vec<String> {
         out.push(cur.trim().to_string());
     }
     out
+}
+
+/// Map a data-directive size suffix (`b`/`w`/`l`/`i`) to a byte size.
+fn suffix_size(sfx: &str) -> u32 {
+    match sfx.trim_start_matches('.') {
+        "b" => 1,
+        "l" | "i" => 4,
+        _ => 2, // w / empty / phrase-ish default to word
+    }
 }
 
 fn is_ident_start(c: char) -> bool {

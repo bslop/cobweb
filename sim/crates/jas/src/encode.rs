@@ -11,13 +11,6 @@ fn word(op: u8, r1: u16, r2: u16) -> (u8, Vec<u16>) {
     (op, vec![((op as u16) << 10) | ((r1 & 0x1F) << 5) | (r2 & 0x1F)])
 }
 
-fn parse_reg(s: &str) -> Option<u16> {
-    let s = s.trim();
-    let rest = s.strip_prefix(['r', 'R'])?;
-    let n: u16 = rest.parse().ok()?;
-    (n < 32).then_some(n)
-}
-
 fn parse_cc(s: &str) -> Option<u16> {
     Some(match s.trim().to_ascii_lowercase().as_str() {
         "t" | "" | "always" => 0x00,
@@ -48,10 +41,10 @@ fn args2(s: &str) -> Result<(String, String), EncodeErr> {
     Ok((parts[0].clone(), parts[1].clone()))
 }
 
-fn reg2(s: &str) -> Result<(u16, u16), EncodeErr> {
+fn reg2(s: &str, asm: &Assembler) -> Result<(u16, u16), EncodeErr> {
     let (a, b) = args2(s)?;
-    let r1 = parse_reg(&a).ok_or_else(|| msg(format!("expected register, found `{a}`")))?;
-    let r2 = parse_reg(&b).ok_or_else(|| msg(format!("expected register, found `{b}`")))?;
+    let r1 = asm.resolve_reg(&a).ok_or_else(|| msg(format!("expected register, found `{a}`")))?;
+    let r2 = asm.resolve_reg(&b).ok_or_else(|| msg(format!("expected register, found `{b}`")))?;
     Ok((r1, r2))
 }
 
@@ -73,8 +66,8 @@ fn quick_1_32(n: u32) -> Result<u16, EncodeErr> {
     Ok((n & 0x1F) as u16) // 32 -> 0
 }
 
-fn dreg(s: &str) -> Result<u16, EncodeErr> {
-    parse_reg(s).ok_or_else(|| msg(format!("expected register, found `{s}`")))
+fn dreg(s: &str, asm: &Assembler) -> Result<u16, EncodeErr> {
+    asm.resolve_reg(s).ok_or_else(|| msg(format!("expected register, found `{s}`")))
 }
 
 /// Parse a load/store paren operand: `(rN)`, `(r14+n)`, `(r15+n)`, `(r14+rN)`,
@@ -95,19 +88,19 @@ fn parse_addr(s: &str, asm: &Assembler) -> Result<Addr, EncodeErr> {
     if let Some(plus) = inner.find('+') {
         let base = inner[..plus].trim();
         let idx = inner[plus + 1..].trim();
-        let base_r = parse_reg(base)
+        let base_r = asm.resolve_reg(base)
             .ok_or_else(|| msg(format!("indexed base must be r14 or r15, found `{base}`")))?;
         if base_r != 14 && base_r != 15 {
             return Err(msg("indexed addressing only supports r14 or r15 as base"));
         }
-        if let Some(ir) = parse_reg(idx) {
+        if let Some(ir) = asm.resolve_reg(idx) {
             Ok(Addr::IdxReg(base_r, ir))
         } else {
             let v = asm.eval_pub(idx).map_err(msg)?;
             Ok(Addr::IdxImm(base_r, v))
         }
     } else {
-        let r = parse_reg(inner)
+        let r = asm.resolve_reg(inner)
             .ok_or_else(|| msg(format!("expected register in `(...)`, found `{inner}`")))?;
         Ok(Addr::Reg(r))
     }
@@ -120,19 +113,19 @@ pub(crate) fn encode(mnem: &str, args: &str, asm: &Assembler) -> R {
 
     // Two-register ALU ops.
     let rr = |op: u8| -> R {
-        let (r1, r2) = reg2(args)?;
+        let (r1, r2) = reg2(args, asm)?;
         Ok(word(op, r1, r2))
     };
     // quick #n, rD ops with a custom field encoder.
     let q = |op: u8, field: fn(u32) -> Result<u16, EncodeErr>| -> R {
         let (a, b) = args2(args)?;
         let n = imm(&a, asm)?;
-        let r2 = dreg(&b)?;
+        let r2 = dreg(&b, asm)?;
         Ok(word(op, field(n)?, r2))
     };
     // single-register (reg1 = 0).
     let one = |op: u8| -> R {
-        let r2 = dreg(args.trim())?;
+        let r2 = dreg(args.trim(), asm)?;
         Ok(word(op, 0, r2))
     };
 
@@ -197,7 +190,7 @@ pub(crate) fn encode(mnem: &str, args: &str, asm: &Assembler) -> R {
         "movei" => {
             let (a, b) = args2(args)?;
             let v = imm(&a, asm)?;
-            let r2 = dreg(&b)?;
+            let r2 = dreg(&b, asm)?;
             let w0 = (38u16 << 10) | (r2 & 0x1F);
             Ok((38, vec![w0, (v & 0xFFFF) as u16, (v >> 16) as u16]))
         }
@@ -215,8 +208,8 @@ pub(crate) fn encode(mnem: &str, args: &str, asm: &Assembler) -> R {
         "normi" => rr(56),
         "nop" => Ok(word(57, 0, 0)),
         "sat24" if !dsp => one(62),
-        "pack" if !dsp => Ok(word(63, 0, dreg(args.trim())?)),
-        "unpack" if !dsp => Ok(word(63, 1, dreg(args.trim())?)),
+        "pack" if !dsp => Ok(word(63, 0, dreg(args.trim(), asm)?)),
+        "unpack" if !dsp => Ok(word(63, 1, dreg(args.trim(), asm)?)),
         "addqmod" if dsp => q(63, quick_1_32),
         "mmult" => rr(54),
         "jump" => encode_jump(args, asm),
@@ -226,13 +219,13 @@ pub(crate) fn encode(mnem: &str, args: &str, asm: &Assembler) -> R {
 }
 
 /// MOVE has three forms: `move rS,rD` (op34), `move PC,rD` (op51).
-fn encode_move(args: &str, _asm: &Assembler) -> R {
+fn encode_move(args: &str, asm: &Assembler) -> R {
     let (a, b) = args2(args)?;
-    let r2 = dreg(&b)?;
+    let r2 = dreg(&b, asm)?;
     if a.trim().eq_ignore_ascii_case("pc") {
         return Ok(word(51, 0, r2));
     }
-    let r1 = dreg(&a)?;
+    let r1 = dreg(&a, asm)?;
     Ok(word(34, r1, r2))
 }
 
@@ -241,7 +234,7 @@ fn encode_move(args: &str, _asm: &Assembler) -> R {
 /// dedicated opcodes.
 fn encode_load(base_op: u8, args: &str, asm: &Assembler) -> R {
     let (a, b) = args2(args)?;
-    let dst = dreg(&b)?;
+    let dst = dreg(&b, asm)?;
     match parse_addr(&a, asm)? {
         Addr::Reg(r) => Ok(word(base_op, r, dst)),
         Addr::IdxImm(base, v) => {
@@ -267,7 +260,7 @@ fn encode_load(base_op: u8, args: &str, asm: &Assembler) -> R {
 /// STORE forms: `store rData,(rAddr)` / `store rData,(r14+n)` / `(r14+rS)`.
 fn encode_store(base_op: u8, args: &str, asm: &Assembler) -> R {
     let (a, b) = args2(args)?;
-    let data = dreg(&a)?;
+    let data = dreg(&a, asm)?;
     match parse_addr(&b, asm)? {
         Addr::Reg(r) => Ok(word(base_op, r, data)),
         Addr::IdxImm(base, v) => {
