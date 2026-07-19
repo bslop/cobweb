@@ -536,7 +536,8 @@ impl Pp<'_> {
     }
 
     /// Evaluate a preprocess-time integer expression: literals, recorded
-    /// symbols, and `+ - * / & | << >> == != < > <= >= ! ( )`. Best-effort.
+    /// symbols, and `+ - * / & | << >> = == != < > <= >= ! ( )` (a lone `=` is
+    /// equality, as in rmac's `.if NOFILL=0`). Best-effort.
     fn eval(&self, expr: &str) -> Option<i64> {
         let toks = lex(expr)?;
         let mut p = EP { t: &toks, i: 0, syms: &self.syms };
@@ -615,6 +616,13 @@ fn lex(s: &str) -> Option<Vec<T>> {
                 i += 2;
             } else if "+-*/&|^<>!".contains(c) {
                 out.push(T::Op(c.to_string()));
+                i += 1;
+            } else if c == '=' {
+                // rmac uses a single `=` as equality in `.if`/`.rept` conditions
+                // (`.if NOFILL=0`). `==` is already handled above; a lone `=` is
+                // the same comparison. Without this it failed to lex and the
+                // whole conditional block was silently dropped.
+                out.push(T::Op("==".to_string()));
                 i += 1;
             } else {
                 return None;

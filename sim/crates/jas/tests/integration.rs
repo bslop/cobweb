@@ -32,6 +32,35 @@ fn errors_of(src: &str) -> Vec<String> {
 }
 
 #[test]
+fn if_single_equals_is_equality() {
+    // rmac uses a lone `=` (not only `==`) for equality in `.if`, and an
+    // undefined symbol is 0. So `.if NOFILL=0` must take the TRUE branch and
+    // `.if NOFILL=1` the else branch. Before the lexer fix a lone `=` failed to
+    // lex, the condition evaluated false, and the whole conditional block was
+    // silently dropped — which is exactly how the gpu_geotex blit LAUNCH (inside
+    // `.if NOFILL=0`) went missing and the kernel never rendered.
+    let (mut bus, _) = run_gpu(
+        "        .gpu\n\
+         \x20       .if NOFILL=0\n\
+         \x20       moveq #1,r0\n\
+         \x20       .else\n\
+         \x20       moveq #9,r0\n\
+         \x20       .endif\n\
+         \x20       .if NOFILL=1\n\
+         \x20       moveq #8,r2\n\
+         \x20       .else\n\
+         \x20       moveq #3,r2\n\
+         \x20       .endif\n\
+         \x20       movei #$00100000,r1\n\
+         \x20       store r0,(r1)\n\
+         \x20       movei #$00100004,r3\n\
+         \x20       store r2,(r3)\n",
+    );
+    assert_eq!(bus.read32(0x0010_0000), 1, "`.if NOFILL=0` must take the =0 branch");
+    assert_eq!(bus.read32(0x0010_0004), 3, "`.if NOFILL=1` must take the else branch");
+}
+
+#[test]
 fn assembles_and_runs_arithmetic() {
     // moveq/add/shlq/store round-trip: 5+3=8, <<2 = 32, store to DRAM.
     let (mut bus, _) = run_gpu(
