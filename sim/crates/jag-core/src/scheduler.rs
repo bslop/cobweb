@@ -165,12 +165,16 @@ impl Scheduler {
         // 68k occupies the main bus — external RISC accesses pay for it.
         bus.m68k_on_bus = !cpu.stopped;
         let budget = (cpu_cycles * 2).max(1);
-        if bus.tom.win.r32(mem::G_CTRL) & mem::RISCGO != 0 {
-            gpu.run(bus, budget);
-        }
-        if bus.jerry.win.r32(mem::D_CTRL) & mem::RISCGO != 0 {
-            dsp.run(bus, budget);
-        }
+        // Call `run()` unconditionally — it reads its own control register and
+        // early-returns cheaply when RISCGO is clear. Gating the call on RISCGO
+        // here would hide the *falling* edge of GO from the core, so a re-kick
+        // (`G_CTRL=0; G_PC=entry; G_CTRL=1`, the every-frame idiom) would never
+        // reset `running` and the core would resume at its stale halt PC instead
+        // of restarting at G_PC — nothing past the boot self-test would render.
+        // (The scheduler advances once per 68k instruction, so the GO-low slice
+        // is always observed.)
+        gpu.run(bus, budget);
+        dsp.run(bus, budget);
     }
 
     /// Advance the programmable timers by `ticks` RISC-clock ticks.
@@ -287,5 +291,58 @@ mod tests {
         assert!(bus.audio.iter().any(|&s| s == 1234), "left channel not captured");
         assert!(bus.audio.iter().any(|&s| s == 5678), "right channel not captured");
         assert_eq!(bus.audio_rate, 44_097);
+    }
+
+    /// Encode a JRISC instruction word: opcode[15:10] reg1[9:5] reg2[4:0].
+    fn enc(op: u16, r1: u16, r2: u16) -> u16 {
+        (op << 10) | (r1 << 5) | r2
+    }
+
+    /// Regression for the GPU/DSP re-kick bug: a core that halts by *spinning*
+    /// (not by clearing RISCGO) must restart at G_PC when the 68k toggles
+    /// `G_CTRL` 0→1. The scheduler must observe the GO-low slice; gating
+    /// `run()` on RISCGO hid it, so the core stayed parked at its halt PC and
+    /// only the boot kick ever executed. See COBWEB_BUG_gpu_restart.md.
+    #[test]
+    fn gpu_restarts_on_rekick() {
+        const CNT: u32 = 0x0010_0000; // DRAM counter
+        // kernel @ G_RAM: r0=&counter; r1=*r0; r1++; *r0=r1; then spin (jr self).
+        let kernel: [u16; 8] = [
+            enc(38, 0, 0), (CNT & 0xFFFF) as u16, (CNT >> 16) as u16, // movei #CNT,r0
+            enc(41, 0, 1),    // load (r0),r1
+            enc(2, 1, 1),     // addq #1,r1
+            enc(47, 0, 1),    // store r1,(r0)   (addr=r0, data=r1)
+            enc(53, 0x1F, 0), // jr T,-1  → target=(jr+1)+(-1)=jr : infinite spin
+            enc(57, 0, 0),    // delay-slot nop
+        ];
+
+        let mut bus = Bus::new();
+        for (i, &w) in kernel.iter().enumerate() {
+            bus.write16(mem::G_RAM + i as u32 * 2, w);
+        }
+        bus.write32(CNT, 0);
+        let mut sched = Scheduler::ntsc();
+        let mut cpu = M68k::new();
+        let mut gpu = Risc::new(RiscKind::Gpu);
+        let mut dsp = Risc::new(RiscKind::Dsp);
+
+        // Kick #1 (cold): PC then GO. Let it run — increments 0→1, then spins.
+        bus.write32(mem::G_PC, mem::G_RAM);
+        bus.write32(mem::G_CTRL, mem::RISCGO);
+        for _ in 0..8 {
+            sched.advance(100, &mut cpu, &mut gpu, &mut dsp, &mut bus);
+        }
+        assert_eq!(bus.read32(CNT), 1, "cold kick should run the kernel once");
+
+        // Re-kick idiom: clear GO (falling edge must be observed), reload PC, GO.
+        bus.write32(mem::G_CTRL, 0);
+        sched.advance(100, &mut cpu, &mut gpu, &mut dsp, &mut bus); // observe GO-low
+        bus.write32(mem::G_PC, mem::G_RAM);
+        bus.write32(mem::G_CTRL, mem::RISCGO);
+        for _ in 0..8 {
+            sched.advance(100, &mut cpu, &mut gpu, &mut dsp, &mut bus);
+        }
+        // With the bug the core never restarted and this stays 1.
+        assert_eq!(bus.read32(CNT), 2, "GPU did not restart on re-kick");
     }
 }
