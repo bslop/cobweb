@@ -388,13 +388,14 @@ pub(super) fn execute(core: &mut Risc, bus: &mut Bus, iw: u16) {
             }
         }
         49 => {
-            // STORE Rs,(R14+n) — data=reg1, index=reg2
-            let addr = core.reg(b, 14).wrapping_add(quick(r2) * 4);
-            core.dwrite32(bus, addr, s);
+            // STORE Rd,(R14+n) — index quick = reg1, data = reg2 (mirrors the
+            // indexed LOAD and rmac/hardware: offset in reg1, GPR in reg2).
+            let addr = core.reg(b, 14).wrapping_add(quick(r1) * 4);
+            core.dwrite32(bus, addr, d);
         }
         50 => {
-            let addr = core.reg(b, 15).wrapping_add(quick(r2) * 4);
-            core.dwrite32(bus, addr, s);
+            let addr = core.reg(b, 15).wrapping_add(quick(r1) * 4);
+            core.dwrite32(bus, addr, d);
         }
         51 => {
             // MOVE PC,Rd — return this instruction's address (pc already +2)
@@ -443,13 +444,14 @@ pub(super) fn execute(core: &mut Risc, bus: &mut Bus, iw: u16) {
             core.set_reg(b, r2, v);
         }
         60 => {
-            // STORE Rs,(R14+Rd) — data=reg1, offset=reg2
-            let addr = core.reg(b, 14).wrapping_add(d);
-            core.dwrite32(bus, addr, s);
+            // STORE Rd,(R14+Rn) — offset reg = reg1, data = reg2 (mirrors the
+            // register-indexed LOAD 58/59).
+            let addr = core.reg(b, 14).wrapping_add(s);
+            core.dwrite32(bus, addr, d);
         }
         61 => {
-            let addr = core.reg(b, 15).wrapping_add(d);
-            core.dwrite32(bus, addr, s);
+            let addr = core.reg(b, 15).wrapping_add(s);
+            core.dwrite32(bus, addr, d);
         }
         62 => {
             if core.kind.is_dsp() {

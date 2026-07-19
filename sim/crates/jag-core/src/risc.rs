@@ -485,12 +485,13 @@ impl Risc {
             42 | 48 if is_gpu => Some(s_val),
             43 => Some(self.reg(b, 14).wrapping_add(q1 * 4)),
             44 => Some(self.reg(b, 15).wrapping_add(q1 * 4)),
-            49 => Some(self.reg(b, 14).wrapping_add(q2 * 4)),
-            50 => Some(self.reg(b, 15).wrapping_add(q2 * 4)),
+            // Indexed STORE: offset in reg1 (like the LOAD), data in reg2.
+            49 => Some(self.reg(b, 14).wrapping_add(q1 * 4)),
+            50 => Some(self.reg(b, 15).wrapping_add(q1 * 4)),
             58 => Some(self.reg(b, 14).wrapping_add(s_val)),
             59 => Some(self.reg(b, 15).wrapping_add(s_val)),
-            60 => Some(self.reg(b, 14).wrapping_add(self.reg(b, r2))),
-            61 => Some(self.reg(b, 15).wrapping_add(self.reg(b, r2))),
+            60 => Some(self.reg(b, 14).wrapping_add(s_val)),
+            61 => Some(self.reg(b, 15).wrapping_add(s_val)),
             _ => None,
         };
         let mclass = ea.map(|a| {
@@ -522,11 +523,13 @@ impl Risc {
         // Under `Silicon` the store writes the stale (pre-producer) value.
         let mut stale_subst: Option<(usize, u32)> = None;
         if timing::is_indexed_store(op) {
-            let id = (b * 32 + r1) as u8;
+            // The data register is reg2 (offset is reg1); the erratum leaves that
+            // data register un-scoreboarded.
+            let id = (b * 32 + r2) as u8;
             if let Some(stale) = self.pipe.indexed_store_stale_value(id, now + cost as u64) {
                 if self.fidelity == F::Silicon {
-                    stale_subst = Some((r1, self.regs[b][r1]));
-                    self.regs[b][r1] = stale;
+                    stale_subst = Some((r2, self.regs[b][r2]));
+                    self.regs[b][r2] = stale;
                 }
             }
         }
@@ -803,7 +806,7 @@ mod tests {
             enc(35, 20, 2), // moveq #20,r2
             enc(35, 3, 1),  // moveq #3,r1
             enc(21, 1, 2),  // div r1,r2 → 6 (r2 was 20)
-            enc(49, 2, 1),  // store r2,(r14+1) ← DATA unprotected
+            enc(49, 1, 2),  // store r2,(r14+1): offset=reg1=1, data=reg2=r2 ← unprotected
         ]);
         let (mut bus, gpu) = run_fid(&broken, mem::G_RAM, 500, Fidelity::Silicon, &[]);
         assert_eq!(gpu.pipe.stats.indexed_store_stale, 1);
@@ -817,7 +820,7 @@ mod tests {
             enc(35, 3, 1),
             enc(21, 1, 2),
             enc(10, 2, 2), // or r2,r2 — dependent touch, stalls till quotient
-            enc(49, 2, 1),
+            enc(49, 1, 2), // store r2,(r14+1): offset=reg1=1, data=reg2=r2
         ]);
         let (mut bus, gpu) = run_fid(&fixed, mem::G_RAM, 500, Fidelity::Silicon, &[]);
         assert_eq!(gpu.pipe.stats.indexed_store_stale, 0);

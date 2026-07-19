@@ -144,14 +144,15 @@ fn classify(e: &Emitted) -> Option<Acc> {
                 reads.push(r2);
             }
         }
-        // indexed stores: DATA (r1) NOT scoreboarded; base read is protected
+        // indexed stores: offset is reg1 (quick imm here), DATA is reg2 and is
+        // NOT scoreboarded; the base read is protected.
         49 => {
             reads.push(14);
-            indexed_store_data = Some(r1);
+            indexed_store_data = Some(r2);
         }
         50 => {
             reads.push(15);
-            indexed_store_data = Some(r1);
+            indexed_store_data = Some(r2);
         }
         51 => write = Some(r2),             // move pc
         52 => reads.push(r1),               // jump (addr reg)
@@ -174,15 +175,16 @@ fn classify(e: &Emitted) -> Option<Acc> {
             write = Some(r2);
             slow = true;
         }
+        // register-indexed stores: offset reg = reg1 (protected read), data = reg2.
         60 => {
             reads.push(14);
-            reads.push(r2);
-            indexed_store_data = Some(r1);
+            reads.push(r1);
+            indexed_store_data = Some(r2);
         }
         61 => {
             reads.push(15);
-            reads.push(r2);
-            indexed_store_data = Some(r1);
+            reads.push(r1);
+            indexed_store_data = Some(r2);
         }
         _ => {}
     }

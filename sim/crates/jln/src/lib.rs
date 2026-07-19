@@ -291,6 +291,34 @@ mod tests {
     }
 
     #[test]
+    fn indexed_store_uses_reg1_offset() {
+        // A jas-assembled `store r5,(r15+14)` must write the DATA (r5) to
+        // `r15 + 14*4 = +56` — the hardware/rmac convention (offset in reg1, data
+        // in reg2). The old swap wrote the wrong register to `r15 + quick(0)*4`.
+        let obj = asm_obj(
+            "        .gpu\n\
+             \x20       movei #$00100000,r15\n\
+             \x20       movei #$0000CAFE,r5\n\
+             \x20       store r5,(r15+14)\n\
+             \x20       movei #$00F02114,r1\n\
+             \x20       moveq #0,r0\n\
+             \x20       store r0,(r1)\n\
+             \x20       nop\n",
+            0xF03000,
+        );
+        let mut bus = Bus::new();
+        for (i, byte) in obj.bytes.iter().enumerate() {
+            bus.write8(0xF03000 + i as u32, *byte);
+        }
+        bus.write32(mem::G_PC, 0xF03000);
+        bus.write32(mem::G_CTRL, mem::RISCGO);
+        let mut gpu = Risc::new(RiscKind::Gpu);
+        gpu.run(&mut bus, 5000);
+        assert_eq!(bus.read32(0x0010_0000 + 14 * 4), 0xCAFE, "store landed at r15+56");
+        assert_eq!(bus.read32(0x0010_0000 + 32 * 4), 0, "nothing at the buggy r15+128");
+    }
+
+    #[test]
     fn undefined_reference_errors() {
         let b = asm_obj(
             "        .gpu\n        .extern nowhere\n        movei #nowhere,r1\n        nop\n",

@@ -530,8 +530,8 @@ pub fn disasm_jrisc(w0: u16, w1: u16, w2: u16, pc: u32, is_dsp: bool) -> (String
         47 => format!("store r{r2},(r{r1})"),
         48 if is_dsp => one("mirror"),
         48 => format!("storep r{r2},(r{r1})"),
-        49 => format!("store r{r1},(r14+{})", if r2 == 0 { 32 } else { r2 }),
-        50 => format!("store r{r1},(r15+{})", if r2 == 0 { 32 } else { r2 }),
+        49 => format!("store r{r2},(r14+{q})"),
+        50 => format!("store r{r2},(r15+{q})"),
         51 => format!("move PC,r{r2}"),
         52 => {
             let cc = jrisc_cc(r2);
@@ -557,8 +557,8 @@ pub fn disasm_jrisc(w0: u16, w1: u16, w2: u16, pc: u32, is_dsp: bool) -> (String
         57 => "nop".to_string(),
         58 => format!("load (r14+r{r1}),r{r2}"),
         59 => format!("load (r15+r{r1}),r{r2}"),
-        60 => format!("store r{r1},(r14+r{r2})"),
-        61 => format!("store r{r1},(r15+r{r2})"),
+        60 => format!("store r{r2},(r14+r{r1})"),
+        61 => format!("store r{r2},(r15+r{r1})"),
         62 if !is_dsp => one("sat24"),
         63 if is_dsp => quick("addqmod", q as i32),
         63 if r1 == 0 => one("pack"),

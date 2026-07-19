@@ -270,17 +270,18 @@ fn encode_store(base_op: u8, args: &str, asm: &Assembler) -> R {
             if v == 0 || v > 32 {
                 return Err(msg("indexed store offset out of range 1..32 longwords"));
             }
-            // op49/50: data=reg1, index quick=reg2
+            // op49/50: index quick = reg1, data = reg2 (same field layout as the
+            // indexed LOAD, and as rmac/hardware — offset in reg1, GPR in reg2).
             let op = if base == 14 { 49 } else { 50 };
-            Ok((op, vec![((op as u16) << 10) | ((data & 0x1F) << 5) | ((v & 0x1F) as u16)]))
+            Ok(word(op, (v & 0x1F) as u16, data))
         }
         Addr::IdxReg(base, ir) => {
             if base_op != 47 {
                 return Err(msg("register-indexed addressing only valid for `store`"));
             }
-            // op60/61: data=reg1, offset reg=reg2
+            // op60/61: offset reg = reg1, data = reg2.
             let op = if base == 14 { 60 } else { 61 };
-            Ok((op, vec![((op as u16) << 10) | ((data & 0x1F) << 5) | (ir & 0x1F)]))
+            Ok(word(op, ir, data))
         }
     }
 }
