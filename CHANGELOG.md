@@ -35,6 +35,12 @@ that had been silently dropping conditional blocks is fixed.
   step), so textured spans sample the atlas correctly. *(commit 0d0a2fc)*
 - **GPU/DSP restart on re-kick.** A core kicked after its boot self-test was
   being ignored; it now restarts. *(commit c102187)*
+- **68k↔DSP `D_CMD` mailbox verified.** The resident-DSP command handshake
+  (68k writes Jerry SRAM, the DSP poll loop dispatches and clears it) was an
+  unexercised path. Confirmed correct — shared bus, no per-core cache; a
+  stopped 68k still advances time so the scheduler keeps servicing the DSP —
+  and locked in with regression tests covering Jerry SRAM, DRAM, and the
+  sleep-in-STOP case. No fix needed. *(commit 2f425be)*
 
 ### jopt — the scheduler that can't ship a wrong answer
 
