@@ -67,6 +67,39 @@ fn poll_kernel(cmd_addr: u32, mark: u32) -> String {
 }
 
 #[test]
+fn storep_loadp_phrase_byte_order() {
+    // COBWEB_BUG_storep_loadp_byteorder (hardware-confirmed): the Jaguar is
+    // big-endian, so a phrase's HIGH long (G_HIDATA) lands at the LOWER address
+    // and the low long (Rn) at +4. jsim had them swapped — code round-tripped
+    // fine in jsim but rendered transposed on silicon. Verify the actual memory
+    // layout, not just a self-consistent round-trip.
+    let (mut bus, _) = run_gpu(
+        "        .gpu\n\
+         \x20       movei #$AAAAAAAA,r1\n\
+         \x20       movei #$00F02118,r2\n\
+         \x20       store r1,(r2)\n\
+         \x20       movei #$BBBBBBBB,r3\n\
+         \x20       movei #$00100000,r4\n\
+         \x20       storep r3,(r4)\n\
+         \x20       loadp (r4),r6\n\
+         \x20       nop\n\
+         \x20       nop\n\
+         \x20       movei #$00100010,r7\n\
+         \x20       storep r6,(r7)\n\
+         halt:   movei #halt,r0\n\
+         \x20       jump T,(r0)\n\
+         \x20       nop\n\
+         \x20       nop\n",
+    );
+    // STOREP: high long (hidata) at [A], low long (Rn) at [A+4].
+    assert_eq!(bus.read32(0x0010_0000), 0xAAAA_AAAA, "STOREP high long must land at the lower address");
+    assert_eq!(bus.read32(0x0010_0004), 0xBBBB_BBBB, "STOREP low long must land at +4");
+    // LOADP: hidata ← [A], Rd ← [A+4]; the re-STOREP echoes them unchanged.
+    assert_eq!(bus.read32(0x0010_0010), 0xAAAA_AAAA, "LOADP must read the high long from the lower address");
+    assert_eq!(bus.read32(0x0010_0014), 0xBBBB_BBBB, "LOADP must read the low long from +4");
+}
+
+#[test]
 fn dsp_cmd_mailbox_jerry_sram() {
     // COBWEB_ISSUE_dsp_dcmd_unverified: the 68k↔DSP D_CMD mailbox in Jerry SRAM.
     // A resident DSP poll loop must observe a command the 68k writes into Jerry

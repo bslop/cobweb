@@ -347,9 +347,10 @@ pub(super) fn execute(core: &mut Risc, bus: &mut Bus, iw: u16) {
                 core.set_reg(b, r2, res);
                 core.set_zn(res);
             } else {
-                // LOADP — 64-bit: low long → Rd, high long → hidata
-                core.set_reg(b, r2, bus.read32(s));
-                core.hidata = bus.read32(s.wrapping_add(4));
+                // LOADP — 64-bit, big-endian: the HIGH long is at the lower
+                // address. hidata (bits 63..32) ← [A]; Rd (bits 31..0) ← [A+4].
+                core.hidata = bus.read32(s);
+                core.set_reg(b, r2, bus.read32(s.wrapping_add(4)));
             }
         }
         43 => {
@@ -382,9 +383,10 @@ pub(super) fn execute(core: &mut Risc, bus: &mut Bus, iw: u16) {
                 core.set_reg(b, r2, res);
                 core.set_zn(res);
             } else {
-                // STOREP — 64-bit: low from Rd, high from hidata
-                bus.write32(s, d);
-                bus.write32(s.wrapping_add(4), core.hidata);
+                // STOREP — 64-bit, big-endian: the HIGH long lands at the lower
+                // address. hidata (bits 63..32) → [A]; Rd (bits 31..0) → [A+4].
+                bus.write32(s, core.hidata);
+                bus.write32(s.wrapping_add(4), d);
             }
         }
         49 => {
