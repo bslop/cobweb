@@ -16,10 +16,21 @@ fn main() -> ExitCode {
         eprintln!(
             "jopt — JRISC scheduler; every transform is proven equivalent in jsim\n\
              \n\
-             USAGE: jopt <input.s> [-o out.s] [--dsp]\n\
+             USAGE: jopt <input.s> [-o out.s] [--gpu|--dsp] [--allow-input-hazards]\n\
              \n\
-             v1 transform: delay-slot filling (moves the instruction before a\n\
-             jump into its wasted nop slot when jsim proves it behavior-preserving)."
+             transform: delay-slot filling. For each wasted `nop` after a jump, jopt\n\
+             walks the straight-line block backwards for a donor it can legally sink\n\
+             into the slot (dominated by the jump, data-independent of everything it\n\
+             leapfrogs, flag-safe), then proves the result equivalent in jsim.\n\
+             \n\
+             OPTIONS:\n\
+             \x20 -o <file>              write the optimized source\n\
+             \x20 --gpu | --dsp          target core (default gpu)\n\
+             \x20 --allow-input-hazards  optimize past pre-existing (benign) input\n\
+             \x20                        hazards; the jsim certificate still gates output\n\
+             \n\
+             Reasons over the assembled stream, so instructions in inactive `.if`\n\
+             blocks are never touched (reported as `skipped-inactive`)."
         );
         return if args.is_empty() { ExitCode::FAILURE } else { ExitCode::SUCCESS };
     }
@@ -63,6 +74,7 @@ fn main() -> ExitCode {
         let mark = if t.accepted { "✓ accepted" } else { "· rejected" };
         eprintln!("  {mark}  {}:{}  {}", t.kind, t.at_line, t.reason);
     }
+    let skipped = res.transforms.iter().filter(|t| t.kind == "skipped-inactive").count();
     eprintln!(
         "jopt: {} transform(s) accepted, {} bytes -> {} bytes ({} saved)",
         res.accepted(),
@@ -70,6 +82,11 @@ fn main() -> ExitCode {
         res.bytes_after,
         res.bytes_saved()
     );
+    if skipped > 0 {
+        eprintln!(
+            "jopt: {skipped} wasted slot(s) skipped — inside inactive `.if` blocks (not assembled)"
+        );
+    }
 
     if let Some(out) = output {
         if let Err(e) = std::fs::write(&out, &res.source) {
