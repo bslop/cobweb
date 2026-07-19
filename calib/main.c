@@ -65,6 +65,7 @@ extern char p_ldstride_s[], p_ldstride_e[];
 extern char p_stdram_s[], p_stdram_e[];
 extern char p_blitsm_s[], p_blitsm_e[];
 extern char p_blitbg_s[], p_blitbg_e[];
+extern char p_dsphammer_s[], p_dsphammer_e[];
 extern char p_divhot_s[], p_divhot_e[];
 extern char p_divsh_s[], p_divsh_e[];
 extern char p_jr_s[], p_jr_e[];
@@ -78,7 +79,12 @@ struct probe {
     char *bs, *be;    /* optional body staged to DRAM_CODE */
     u32 reps;
     u32 aux;
+    char *ds, *de;    /* optional DSP hammer: run on Jerry concurrently */
 };
+
+#define D_RAM 0xF1B000UL
+#define D_PC 0xF1A110UL
+#define D_CTRL 0xF1A114UL
 
 static const struct probe probes[] = {
     { "vcmod   ", p_vcmod_s, p_vcmod_e, 0, 0, 0x00080000UL, 0 },
@@ -96,6 +102,7 @@ static const struct probe probes[] = {
     { "stdram  ", p_stdram_s, p_stdram_e, 0, 0, 512, DRAM_BUF },
     { "blitsm  ", p_blitsm_s, p_blitsm_e, 0, 0, 128, DRAM_BUF },
     { "blitbg  ", p_blitbg_s, p_blitbg_e, 0, 0, 128, DRAM_BUF },
+    { "lddramj ", p_lddram_s, p_lddram_e, 0, 0, 512, DRAM_BUF, p_dsphammer_s, p_dsphammer_e },
     { "divhot  ", p_divhot_s, p_divhot_e, 0, 0, 512, 0 },
     { "divsh   ", p_divsh_s, p_divsh_e, 0, 0, 512, 0 },
     { "jr      ", p_jr_s, p_jr_e, 0, 0, 256, 0 },
@@ -164,6 +171,13 @@ static int run_probe(int idx, int mode)
     R32(PARAM_REPS) = p->reps;
     R32(PARAM_RESULT) = res;
     R32(PARAM_AUX) = p->aux ? p->aux : SRAM_SCRATCH;
+    /* Optional concurrent DSP hammer: start Jerry looping over DRAM so the Tom
+     * probe times against real cross-master bus contention. */
+    if (p->ds) {
+        copy16(D_RAM, p->ds, p->de);
+        R32(D_PC) = D_RAM;
+        R32(D_CTRL) = 1;
+    }
     R32(G_PC) = G_RAM;
     R32(G_CTRL) = 1;
 
@@ -176,6 +190,8 @@ static int run_probe(int idx, int mode)
         while (R32(res + 12) != MAGIC_DONE && --guard)
             cpu_stop();
     }
+    if (p->ds)
+        R32(D_CTRL) = 0; /* stop the DSP hammer */
     return guard != 0;
 }
 
@@ -228,6 +244,8 @@ void cal_main(void)
     R16(INT1) = 1;
     irq_on();
 
+    R32(0x001B0000UL) = 0; /* clear the DSP-hammer witness before the suite */
+
     for (i = 0; i < NPROBES; i++) {
         ok = run_probe(i, 0);
         report(i, 0, ok);
@@ -241,6 +259,14 @@ void cal_main(void)
             goto wedged;
     }
 
+    {   /* did the DSP hammer actually run? ($D50D50D5 = yes) */
+        char *d = line;
+        d = put(d, "CAL DSPMARK val=");
+        d = puth(d, R32(0x001B0000UL));
+        d = put(d, "\n");
+        *d = 0;
+        say(line);
+    }
     R32(HDR + 12) = MAGIC_DONE;
     say("CAL DONE\n");
 #ifdef USE_SKUNK_CONSOLE

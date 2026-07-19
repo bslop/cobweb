@@ -407,6 +407,76 @@ _p_blitbg_s:
 	.data
 _p_blitbg_e:
 
+; ── p_dsphammer: resident DSP DRAM read-hammer (concurrent bus-noise source) ─
+; main.c starts this on Jerry (DSP) before a Tom probe and stops it after, so
+; the timed Tom stream runs against real Jerry↔Tom DRAM contention on the one
+; shared 64-bit bus — the term the fps model misses during render (68k STOPped,
+; so its contention tax is off, but Jerry/OP still hammer). Uses only relative
+; `jr` (no absolute label), so it runs wherever main.c stages it (D_RAM).
+DHAMMER_BUF	equ	$001C0000
+DHAMMER_END	equ	$001E0000
+	.even
+	.globl	_p_dsphammer_s
+	.globl	_p_dsphammer_e
+; BOUNDED: a free-running hammer starves the shared bus so hard the 68k's
+; mode-A busy-poll never retires and the suite wedges (observed on hardware —
+; the run stopped dead at this probe). It now runs a fixed number of passes,
+; sized to outlast the Tom probe, then clears its OWN GO bit (TRM bug 23: only
+; the local processor may stop itself) so the machine always recovers.
+DHAMMER_PASSES	equ	64
+D_CTRL_R	equ	$F1A114
+; Loop-top address once staged in D_RAM. The setup ahead of dh_loop is
+; 7 movei (3 words each) + store + move = 20 words = 40 bytes, so the body
+; starts at D_RAM+$28. (Same fixed-address trick as the GPU probes' OUTERPC —
+; the unrolled body is far past jr's ±16-word reach.)
+DH_LOOPPC	equ	$F1B028
+DHAMMER_MARK	equ	$001B0000	; "the DSP actually ran" witness
+_p_dsphammer_s:
+	.dsp
+	movei	#DHAMMER_MARK,r8	; prove we started (main.c prints this)
+	movei	#$D50D50D5,r9
+	store	r9,(r8)
+	movei	#DHAMMER_BUF,r1
+	movei	#DHAMMER_END,r3
+	movei	#DHAMMER_PASSES,r5
+	movei	#DH_LOOPPC,r10		; unrolled body outruns jr's ±16 words
+	move	r1,r2
+dh_loop:
+	; DENSE stream: 8 back-to-back loads with rotating destinations (same shape
+	; as p_lddram) so Jerry demands as much DRAM bandwidth as it possibly can —
+	; a sparse hammer would under-state contention and could fake a null result.
+	load	(r2),r0
+	addqt	#4,r2
+	load	(r2),r4
+	addqt	#4,r2
+	load	(r2),r6
+	addqt	#4,r2
+	load	(r2),r7
+	addqt	#4,r2
+	load	(r2),r0
+	addqt	#4,r2
+	load	(r2),r4
+	addqt	#4,r2
+	load	(r2),r6
+	addqt	#4,r2
+	load	(r2),r7
+	addqt	#4,r2
+	cmp	r3,r2			; r2 - r3
+	jump	cs,(r10)		; borrow ⇒ r2 < end ⇒ keep hammering
+	nop
+	move	r1,r2			; wrap to buffer start
+	subq	#1,r5			; one pass done
+	jump	ne,(r10)
+	nop
+	movei	#D_CTRL_R,r6		; passes exhausted — stop self
+	moveq	#0,r7
+	store	r7,(r6)
+	nop
+	nop
+	.68000
+	.data
+_p_dsphammer_e:
+
 ; ── p_lddramc: CONSUMED sequential DRAM loads — full load-to-use latency ────
 ; (Session 2: pins DRAM_LAT_HIT, which session 1 could not measure.)
 
