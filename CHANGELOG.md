@@ -87,8 +87,31 @@ that had been silently dropping conditional blocks is fixed.
   register allocation; ELF symbol + GCC asm-label conventions so real OpenLara
   translation units link. *(commits e1a8e33, 34528eb, e9dc6da, d8499b9)*
 
+### Known gaps (planned — not in this release)
+
+- **Frame-time prediction is optimistic (~+35%) for bus-bound scenes.** jsim
+  renders correctly and its per-core issue/stall model is hardware-calibrated,
+  but three things are unmodeled, so predicted fps runs high (measured ~7.5 vs
+  ~4.9 on hardware for OpenLara Caves 320×240). Diagnosed in
+  COBWEB_GAP_bus_contention_and_blitter_fill_timing; each needs a
+  hardware-calibration pass, so they are staged deliberately rather than guessed:
+  1. **Synchronous/free Blitter.** `blit::run` completes instantly and `B_CMD`
+     always reads idle, so the GPU's `bwait` never spins (fill measured ~12% of
+     the frame). Plan: charge a per-launch cost (phrase count × the calibrated
+     DRAM write occupancy + page/refresh) and read `B_CMD` busy until it elapses.
+  2. **No multi-master DRAM contention.** The one shared 64-bit DRAM bus
+     (68k + Tom + Jerry + Blitter + OP scan-out) is modeled only for the
+     68k↔GPU pair (`CONTENTION_HIT_EXTRA`, gated on `bus.m68k_on_bus`) — and that
+     gate is *off* during render because `gpu_sync` STOPs the 68k. Plan: extend
+     arbitration to Tom↔Jerry↔Blitter↔OP and surface it in the existing
+     `contention`/`mem_external` counters. This is the dominant term.
+  3. **`LOADP`/`G_HIDATA` load-use latency.** The `r2` result is scoreboarded but
+     `G_HIDATA` is written immediately (zero-latency), so reading it too soon
+     succeeds in jsim while silicon returns stale data. Plan: land `hidata` on
+     the load's `ready_at` via the existing slow-value machinery.
+
 ### Notes
 
-- 145 workspace tests pass, including regressions for each fix above.
+- 149 workspace tests pass, including regressions for each fix above.
 - Differential validation continues to hold jcc68k ≡ gcc -O2 on the shared
   corpus.
