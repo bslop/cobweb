@@ -62,9 +62,24 @@ pub struct RunResult {
 /// Run `spec` in jsim and capture the result. The program is uploaded to the
 /// target core's local SRAM (or its org), started, and run for the budget.
 pub fn run(spec: &Spec) -> RunResult {
+    run_with(spec, &[])
+}
+
+/// Like [`run`], but first writes each `(addr, bytes)` preset into the bus — a
+/// *fixture*: the input state a kernel expects (param block, geometry blob,
+/// camera, framebuffer…). Presets are applied after the program is loaded, so
+/// a fixture may target any address (they must not overlap the code region).
+/// This is what lets a real kernel run to a deterministic halt instead of
+/// looping on zeroed memory.
+pub fn run_with(spec: &Spec, pre: &[(u32, Vec<u8>)]) -> RunResult {
     let mut bus = Bus::new();
     for (i, b) in spec.bytes.iter().enumerate() {
         bus.write8(spec.org + i as u32, *b);
+    }
+    for (addr, blob) in pre {
+        for (i, b) in blob.iter().enumerate() {
+            bus.write8(addr + i as u32, *b);
+        }
     }
     let (pc_addr, ctrl_addr) = match spec.target {
         RiscKind::Gpu => (mem::G_PC, mem::G_CTRL),
@@ -200,6 +215,28 @@ mod tests {
         );
         let (_sil, big, _d) = profile_diff(&Spec::gpu(prog));
         assert!(big.timing.bigpemu_divergence > 0, "expected a bigpemu divergence");
+    }
+
+    #[test]
+    fn run_with_applies_memory_presets() {
+        // A fixture preset is the input state a kernel reads. Here the program
+        // loads a long from DRAM $2_0000 (which is zero unless preset) and stores
+        // it to the capture region — so the observable result reflects the preset,
+        // proving presets reach the bus before the run.
+        let prog = asm(
+            "        movei #$00020000,r1\n\
+             \x20       load (r1),r2\n\
+             \x20       nop\n\
+             \x20       nop\n\
+             \x20       movei #$00100000,r3\n\
+             \x20       store r2,(r3)\n",
+        );
+        let spec = Spec { capture: (0x0010_0000, 4), ..Spec::gpu(prog) };
+        // no preset ⇒ reads 0
+        assert_eq!(run(&spec).captured, vec![0, 0, 0, 0]);
+        // preset $DEADBEEF at the source address ⇒ that value is observed
+        let pre = vec![(0x0002_0000u32, 0xDEAD_BEEFu32.to_be_bytes().to_vec())];
+        assert_eq!(run_with(&spec, &pre).captured, vec![0xDE, 0xAD, 0xBE, 0xEF]);
     }
 
     #[test]

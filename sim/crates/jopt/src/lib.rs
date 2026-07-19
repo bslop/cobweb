@@ -53,7 +53,28 @@ use std::collections::{HashMap, HashSet};
 use jag_core::risc::timing::{self, Access};
 use jag_core::risc::Fidelity;
 use jag_core::RiscKind;
-use jtest::{compare, run, Spec};
+use jtest::{compare, run, run_with, Spec};
+
+/// A certificate *fixture*: the input state a kernel expects, so the baseline
+/// and every candidate run to a deterministic end instead of looping on zeroed
+/// memory. Without one, a kernel like gpu_geotex never halts in isolation and
+/// the equivalence check compares a meaningless budget-cutoff snapshot; with a
+/// fixture (param block + geometry + camera + a framebuffer to capture) the run
+/// completes and the captured render output is a real behavioral fingerprint.
+#[derive(Clone, Default)]
+pub struct Fixture {
+    /// `(addr, bytes)` presets written to the bus before each run.
+    pub pre: Vec<(u32, Vec<u8>)>,
+    /// RISC-tick budget (must comfortably outlast the kernel's completion).
+    pub budget: u32,
+    /// Region to capture as the observable result — point this at the kernel's
+    /// output (e.g. the framebuffer), not the default scratch address.
+    pub capture: (u32, u32),
+}
+
+/// Default certificate run parameters when no fixture is supplied.
+const DEFAULT_BUDGET: u32 = 200_000;
+const DEFAULT_CAPTURE: (u32, u32) = (0x0010_0000, 4096);
 
 /// One attempted transform and its verdict.
 #[derive(Debug, Clone)]
@@ -120,18 +141,25 @@ fn assemble(src: &str, target: RiscKind, allow_hazards: bool) -> Option<(Vec<u8>
     assemble_full(src, target, allow_hazards).map(|a| (a.bytes, a.org))
 }
 
-/// A behavioral fingerprint: run in jsim, capture a wide DRAM region + all
-/// registers. Deterministic programs (no external input) fingerprint stably.
-fn fingerprint(bytes: Vec<u8>, org: u32, target: RiscKind) -> Option<jtest::RunResult> {
-    let spec = Spec {
-        bytes,
-        target,
-        org,
-        budget: 200_000,
-        capture: (0x0010_0000, 4096),
-        fidelity: Fidelity::Silicon,
+/// A behavioral fingerprint: run in jsim, capture the observable region + all
+/// registers. Deterministic programs (no external input, or a fixture that
+/// supplies it) fingerprint stably. With a fixture, the fixture's presets are
+/// applied and its budget/capture used; otherwise the scratch-address defaults.
+fn fingerprint(
+    bytes: Vec<u8>,
+    org: u32,
+    target: RiscKind,
+    fx: Option<&Fixture>,
+) -> Option<jtest::RunResult> {
+    let (budget, capture) = match fx {
+        Some(f) => (f.budget, f.capture),
+        None => (DEFAULT_BUDGET, DEFAULT_CAPTURE),
     };
-    Some(run(&spec))
+    let spec = Spec { bytes, target, org, budget, capture, fidelity: Fidelity::Silicon };
+    Some(match fx {
+        Some(f) => run_with(&spec, &f.pre),
+        None => run(&spec),
+    })
 }
 
 /// True if two runs are behaviorally identical (captured region + registers).
@@ -361,6 +389,19 @@ pub fn optimize(src: &str, target: RiscKind) -> OptResult {
 /// (including one that introduces a harmful hazard, which jsim models at Silicon
 /// fidelity) is still rejected.
 pub fn optimize_opts(src: &str, target: RiscKind, allow_input_hazards: bool) -> OptResult {
+    optimize_fixture(src, target, allow_input_hazards, None)
+}
+
+/// Like [`optimize_opts`], certifying every candidate against `fixture` — the
+/// input state that makes the kernel run to a deterministic, observable end.
+/// This is what lets jopt certify a real render kernel (which otherwise never
+/// halts in isolation) against its actual output.
+pub fn optimize_fixture(
+    src: &str,
+    target: RiscKind,
+    allow_input_hazards: bool,
+    fixture: Option<&Fixture>,
+) -> OptResult {
     let base = match assemble_full(src, target, allow_input_hazards) {
         Some(a) => a,
         None => {
@@ -380,7 +421,7 @@ pub fn optimize_opts(src: &str, target: RiscKind, allow_input_hazards: bool) -> 
     };
     let base_bytes = base.bytes.clone();
     let org = base.org;
-    let base_fp = fingerprint(base_bytes.clone(), org, target);
+    let base_fp = fingerprint(base_bytes.clone(), org, target, fixture);
     let bytes_before = base_bytes.len();
 
     let mut lines: Vec<String> = src.lines().map(|s| s.to_string()).collect();
@@ -440,6 +481,7 @@ pub fn optimize_opts(src: &str, target: RiscKind, allow_input_hazards: bool) -> 
                             target,
                             base_fp.as_ref(),
                             allow_input_hazards,
+                            fixture,
                         ) {
                             Ok(()) => {
                                 transforms.push(Transform {
@@ -516,10 +558,11 @@ fn verify(
     target: RiscKind,
     base_fp: Option<&jtest::RunResult>,
     allow_hazards: bool,
+    fx: Option<&Fixture>,
 ) -> Result<(), String> {
     let (bytes, org) = assemble(cand_src, target, allow_hazards)
         .ok_or_else(|| "candidate did not assemble (jas rejected it — hazard or range)".to_string())?;
-    let fp = fingerprint(bytes, org, target).ok_or_else(|| "candidate did not run".to_string())?;
+    let fp = fingerprint(bytes, org, target, fx).ok_or_else(|| "candidate did not run".to_string())?;
     match base_fp {
         Some(base) if equivalent(base, &fp) => Ok(()),
         Some(_) => Err("candidate diverged from the original in jsim (certificate failed)".into()),
@@ -643,6 +686,41 @@ mod tests {
             !res.transforms.iter().any(|t| t.accepted),
             "jopt accepted a dead-code fill"
         );
+    }
+
+    #[test]
+    fn fixture_certifies_against_preset_input() {
+        // The program reads its input from a preset DRAM address ($2_0000), copies
+        // it through a `move` that can sink into an unconditional jump's slot, and
+        // stores the result to the captured region. The fixture supplies the input
+        // and captures the output, so the certificate is non-vacuous — a fill that
+        // corrupted the value would change the captured result and be rejected.
+        let src = format!(
+            "        .gpu\n\
+             \x20       movei #$00020000,r0\n\
+             \x20       load (r0),r1\n\
+             \x20       nop\n\
+             \x20       nop\n\
+             \x20       move r1,r5\n\
+             \x20       movei #$00100000,r3\n\
+             \x20       jr t,done\n\
+             \x20       nop\n\
+             done:   store r5,(r3)\n{STOP}"
+        );
+        let fx = Fixture {
+            pre: vec![(0x0002_0000, 0x1234_5678u32.to_be_bytes().to_vec())],
+            budget: 100_000,
+            capture: (0x0010_0000, 4),
+        };
+        let res = optimize_fixture(&src, RiscKind::Gpu, false, Some(&fx));
+        assert!(res.accepted() >= 1, "fixture certificate rejected a safe fill");
+        // The optimized program still reproduces the preset value under the fixture.
+        let (bytes, org) = assemble(&res.source, RiscKind::Gpu, false).unwrap();
+        let r = run_with(
+            &Spec { bytes, target: RiscKind::Gpu, org, budget: 100_000, capture: (0x0010_0000, 4), fidelity: Fidelity::Silicon },
+            &fx.pre,
+        );
+        assert_eq!(word_at(&r.captured, 0), 0x1234_5678, "fill changed the fixture output");
     }
 
     #[test]
