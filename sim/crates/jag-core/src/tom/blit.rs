@@ -89,6 +89,12 @@ struct AddrGen {
     ymask: u32,
     xstep: i32,
     ystep: i32,
+    // 16.16 DDA state for XADDINC (A1 affine texture/line stepping): the current
+    // pointer fraction and the per-inner-step increment (integer<<16 | fraction).
+    xfrac: u32,
+    yfrac: u32,
+    xinc: i32,
+    yinc: i32,
 }
 
 impl AddrGen {
@@ -105,6 +111,16 @@ impl AddrGen {
         } else {
             (0xFFFF_FFFF, 0xFFFF_FFFF)
         };
+        // The 16.16 DDA increment/fraction is A1-only (the source generator).
+        // Combine the integer word (A1_INC) and the fraction word (A1_FINC) into a
+        // signed 16.16 step; seed the pointer fraction from A1_FPIXEL.
+        let (fpixel, inc, finc) = if is_a2 {
+            (0, 0, 0)
+        } else {
+            (w.r32(mem::A1_FPIXEL), w.r32(mem::A1_INC), w.r32(mem::A1_FINC))
+        };
+        let xinc = (((inc & 0xFFFF) << 16) | (finc & 0xFFFF)) as i32;
+        let yinc = ((((inc >> 16) & 0xFFFF) << 16) | ((finc >> 16) & 0xFFFF)) as i32;
         AddrGen {
             base: w.r32(base_r) & !7, // phrase-aligned
             width_px: decode_width((flags & mem::AF_WIDTH_MASK) >> mem::AF_WIDTH_SHIFT),
@@ -120,6 +136,10 @@ impl AddrGen {
             ymask,
             xstep: sext16(step & 0xFFFF),
             ystep: sext16((step >> 16) & 0xFFFF),
+            xfrac: fpixel & 0xFFFF,
+            yfrac: (fpixel >> 16) & 0xFFFF,
+            xinc,
+            yinc,
         }
     }
 
@@ -176,10 +196,22 @@ impl AddrGen {
     /// Advance one inner-loop step (one pixel in this functional model).
     #[inline]
     fn step_inner(&mut self) {
+        // XADDINC (3): the 16.16 DDA — add the fractional increment to X *and* Y
+        // (XADDINC overrides YADD), carrying the fraction. This is the affine
+        // texture/line sampler; approximating it as +1 scrambles textures.
+        if self.xadd == 3 {
+            let xp = (((self.x as i64) << 16) | self.xfrac as i64) + self.xinc as i64;
+            self.x = (xp >> 16) as i32;
+            self.xfrac = (xp as u32) & 0xFFFF;
+            let yp = (((self.y as i64) << 16) | self.yfrac as i64) + self.yinc as i64;
+            self.y = (yp >> 16) as i32;
+            self.yfrac = (yp as u32) & 0xFFFF;
+            return;
+        }
         match self.xadd {
             1 => self.x += if self.xsignsub { -1 } else { 1 }, // XADDPIX
             2 => {}                                             // XADD0: hold
-            _ => self.x += 1, // XADDPHR (per-pixel walk; phrase gaps via addr()), XADDINC≈+1
+            _ => self.x += 1, // XADDPHR (per-pixel walk; phrase gaps via addr())
         }
         if self.yadd1 {
             self.y += if self.ysignsub { -1 } else { 1 };
@@ -469,6 +501,39 @@ mod tests {
         }
         // The word past the copy is untouched.
         assert_eq!(bus.read16(dst + 16 * 2), 0x0000);
+    }
+
+    /// XADDINC (A1 affine DDA): the source pointer advances by the 16.16
+    /// increment (`A1_INC`/`A1_FINC`), sampling the texture at fractional steps.
+    /// With `Xinc=2.5`, dest pixel i reads source texel floor(i·2.5) — not i
+    /// (which the old `≈+1` approximation produced).
+    #[test]
+    fn xaddinc_affine_dda_sampling() {
+        let mut bus = Bus::new();
+        let (src, dst) = (0x10_0000u32, 0x12_0000u32);
+        // Source texture: texel i holds value i (8bpp).
+        for i in 0..64u32 {
+            bus.write8(src + i, i as u8);
+        }
+        // A1 = source, XADDINC, 8bpp; increment 2.5 texels/pixel (int 2 + 0x8000).
+        let sflags = 0x0003_0000 | 0x0000_4200 | (3 << mem::AF_PIXEL_SHIFT);
+        bus.tom.win.w32(mem::A1_BASE, src);
+        bus.tom.win.w32(mem::A1_FLAGS, sflags);
+        bus.tom.win.w32(mem::A1_PIXEL, 0);
+        bus.tom.win.w32(mem::A1_FPIXEL, 0);
+        bus.tom.win.w32(mem::A1_INC, 0x0000_0002); // Xinc=2, Yinc=0
+        bus.tom.win.w32(mem::A1_FINC, 0x0000_8000); // Xfinc=0.5
+        // A2 = dest, linear (XADDPIX), 8bpp.
+        let dflags = mem::AF_XADDPIX | 0x0000_4200 | (3 << mem::AF_PIXEL_SHIFT);
+        bus.tom.win.w32(mem::A2_BASE, dst);
+        bus.tom.win.w32(mem::A2_FLAGS, dflags);
+        bus.tom.win.w32(mem::A2_PIXEL, 0);
+        bus.tom.win.w32(mem::B_COUNT, (1 << 16) | 6); // 1 row, 6 pixels
+        bus.write32(mem::B_CMD, mem::BC_DSTA2 | mem::BC_SRCEN | mem::LFU_REPLACE);
+        // floor(i*2.5): 0, 2, 5, 7, 10, 12
+        for (i, &exp) in [0u8, 2, 5, 7, 10, 12].iter().enumerate() {
+            assert_eq!(bus.read8(dst + i as u32), exp, "dda pixel {i}");
+        }
     }
 
     /// Transparent copy: DCOMPEN inhibits writes whose source equals B_PATD.
