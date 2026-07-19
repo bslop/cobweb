@@ -439,12 +439,20 @@ impl Gen {
                 self.lbl(&format!(".Lend_{lend}"));
             }
             ExprK::Binary(op, a, b) => {
-                // rhs first, held on the register eval stack; lhs into D0; rhs → D1
-                self.gen_expr(b)?;
-                let slot = self.push_dtemp();
-                self.gen_expr(a)?;
-                self.pop_dtemp_to(&slot, "d1"); // D0=lhs, D1=rhs
-                self.gen_binop(*op, &a.ty, &b.ty);
+                // Fast path: a cheap rhs (a constant or a 4-byte scalar variable)
+                // folds straight into the instruction, sparing the temp register
+                // and the operand's load — `x + 5` → `add.l #5,d0`, not a push/pop.
+                if let Some((src, is_imm)) = self.foldable_rhs(*op, b) {
+                    self.gen_expr(a)?;
+                    self.fold_binop(*op, &a.ty, &b.ty, &src, is_imm);
+                } else {
+                    // General path: rhs held on the register eval stack.
+                    self.gen_expr(b)?;
+                    let slot = self.push_dtemp();
+                    self.gen_expr(a)?;
+                    self.pop_dtemp_to(&slot, "d1"); // D0=lhs, D1=rhs
+                    self.gen_binop(*op, &a.ty, &b.ty);
+                }
             }
             ExprK::Call(callee, args) => {
                 self.gen_call(callee, args)?;
@@ -568,6 +576,85 @@ impl Gen {
                 };
                 self.line(&format!("{cc} d0"));
                 self.line("and.l #1,d0");
+            }
+            BinOp::LogAnd | BinOp::LogOr => unreachable!("handled in gen_expr"),
+        }
+    }
+
+    /// A "cheap" operand that can be an instruction source without evaluation
+    /// into a register: an integer constant (immediate) or a 4-byte scalar
+    /// variable (a longword in memory). Returns `(source, is_immediate)`.
+    fn cheap_operand(&self, e: &Expr) -> Option<(String, bool)> {
+        match &e.kind {
+            ExprK::Num(n) => Some((format!("#{}", *n as i32), true)),
+            ExprK::Var(name) if is_scalar4(&e.ty) => {
+                let src = match self.frame.get(name).copied() {
+                    Some(off) => format!("{off}(a6)"),
+                    None => mangle(name),
+                };
+                Some((src, false))
+            }
+            _ => None,
+        }
+    }
+
+    /// If the right operand of `op` can be folded directly into the instruction,
+    /// return its source. Some ops accept only a subset (eor needs an immediate;
+    /// shifts need a 1–8 immediate count).
+    fn foldable_rhs(&self, op: BinOp, b: &Expr) -> Option<(String, bool)> {
+        let (src, is_imm) = self.cheap_operand(b)?;
+        let ok = match op {
+            // <ea>/immediate source works directly
+            BinOp::Add | BinOp::Sub | BinOp::And | BinOp::Or
+            | BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+            | BinOp::Mul | BinOp::Div | BinOp::Mod => true,
+            // eor has no `<ea>,Dn` form — immediate only (eori)
+            BinOp::Xor => is_imm,
+            // immediate shift count, 1..8 only
+            BinOp::Shl | BinOp::Shr => {
+                matches!(&b.kind, ExprK::Num(n) if (1..=8).contains(n))
+            }
+            BinOp::LogAnd | BinOp::LogOr => false,
+        };
+        ok.then_some((src, is_imm))
+    }
+
+    /// Emit `op` with the right operand as a folded source (D0 already holds the
+    /// left operand). Mirrors [`gen_binop`] but takes the rhs from `src`.
+    fn fold_binop(&mut self, op: BinOp, lt: &Type, rt: &Type, src: &str, _is_imm: bool) {
+        let unsigned = !(lt.is_signed() && rt.is_signed());
+        match op {
+            BinOp::Add => self.line(&format!("add.l {src},d0")),
+            BinOp::Sub => self.line(&format!("sub.l {src},d0")),
+            BinOp::And => self.line(&format!("and.l {src},d0")),
+            BinOp::Or => self.line(&format!("or.l {src},d0")),
+            BinOp::Xor => self.line(&format!("eori.l {src},d0")),
+            BinOp::Shl => self.line(&format!("asl.l {src},d0")),
+            BinOp::Shr => {
+                self.line(&format!("{} {src},d0", if unsigned { "lsr.l" } else { "asr.l" }));
+            }
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                self.line(&format!("cmp.l {src},d0"));
+                let cc = match (op, unsigned) {
+                    (BinOp::Eq, _) => "seq",
+                    (BinOp::Ne, _) => "sne",
+                    (BinOp::Lt, false) => "slt",
+                    (BinOp::Le, false) => "sle",
+                    (BinOp::Gt, false) => "sgt",
+                    (BinOp::Ge, false) => "sge",
+                    (BinOp::Lt, true) => "scs",
+                    (BinOp::Le, true) => "sls",
+                    (BinOp::Gt, true) => "shi",
+                    (BinOp::Ge, true) => "scc",
+                    _ => unreachable!(),
+                };
+                self.line(&format!("{cc} d0"));
+                self.line("and.l #1,d0");
+            }
+            // multiply/divide/modulo need the rhs in D1 for the runtime helper
+            BinOp::Mul | BinOp::Div | BinOp::Mod => {
+                self.line(&format!("move.l {src},d1"));
+                self.gen_binop(op, lt, rt);
             }
             BinOp::LogAnd | BinOp::LogOr => unreachable!("handled in gen_expr"),
         }
@@ -857,6 +944,13 @@ fn peephole(asm: &str) -> String {
         i += 1;
     }
     out
+}
+
+/// A scalar type that occupies a full 4-byte longword (int, long, pointer,
+/// fixed) — safe to read/write as a `.l` memory operand. Excludes sub-int types
+/// (whose memory image is 1–2 bytes) and aggregates.
+fn is_scalar4(ty: &Type) -> bool {
+    ty.size() == 4 && !matches!(&**ty, TypeK::Array(..) | TypeK::Struct { .. } | TypeK::Func { .. })
 }
 
 fn mangle(name: &str) -> String {
