@@ -321,6 +321,92 @@ _p_stdram_s:
 	.data
 _p_stdram_e:
 
+; ── p_blitsm / p_blitbg: Blitter textured-copy cost (launch + bwait) ─────────
+; OpenLara's span fill: SRCEN|LFU_REPLACE|DSTA2, 8bpp, reading a source and
+; writing the framebuffer. Each rep programs a copy of N pixels, launches it,
+; and spins in bwait until B_CMD reads idle — exactly the GPU's real pattern.
+; jsim currently models the blit as free (B_CMD reads idle instantly), so
+; hardware-minus-sim on the two sizes (8 vs 256 px) pins base + per-pixel cost.
+BLITSRC		equ	$00140000	; seeded DRAM buffer (source)
+BLITDST		equ	$00180000	; scratch DRAM (dest)
+BB_A1BASE	equ	$F02200
+BB_A1FLAGS	equ	$F02204
+BB_A1PIX	equ	$F0220C
+BB_A2BASE	equ	$F02224
+BB_A2FLAGS	equ	$F02228
+BB_A2PIX	equ	$F02230
+BB_BCOUNT	equ	$F0223C
+BB_BCMD		equ	$F02238
+BB_FLAGS8	equ	$00014218	; PITCH1|PIXEL8|WID320|XADDPIX (OpenLara A2)
+BB_CMDTEX	equ	$01800801	; SRCEN|LFU_REPLACE|DSTA2 (OpenLara span)
+
+	.macro	BLITSETUP
+	movei	#BB_A1BASE,r0
+	movei	#BLITSRC,r1
+	store	r1,(r0)
+	movei	#BB_A1FLAGS,r0
+	movei	#BB_FLAGS8,r1
+	store	r1,(r0)
+	movei	#BB_A1PIX,r0
+	moveq	#0,r1
+	store	r1,(r0)
+	movei	#BB_A2BASE,r0
+	movei	#BLITDST,r1
+	store	r1,(r0)
+	movei	#BB_A2FLAGS,r0
+	movei	#BB_FLAGS8,r1
+	store	r1,(r0)
+	movei	#BB_A2PIX,r0
+	moveq	#0,r1
+	store	r1,(r0)
+	.endm
+
+	.even
+	.globl	_p_blitsm_s
+	.globl	_p_blitsm_e
+_p_blitsm_s:
+	.gpu
+	PROBE_PRO
+	BLITSETUP
+	movei	#BB_BCOUNT,r0
+	movei	#$00010008,r1		; 1 row x 8 pixels
+	store	r1,(r0)
+	movei	#BB_BCMD,r2
+	movei	#BB_CMDTEX,r1
+	store	r1,(r2)			; launch
+.bwsm:
+	load	(r2),r1
+	btst	#0,r1
+	jr	eq,.bwsm		; spin until idle bit set
+	nop
+	PROBE_EPI
+	.68000
+	.data
+_p_blitsm_e:
+
+	.even
+	.globl	_p_blitbg_s
+	.globl	_p_blitbg_e
+_p_blitbg_s:
+	.gpu
+	PROBE_PRO
+	BLITSETUP
+	movei	#BB_BCOUNT,r0
+	movei	#$00010100,r1		; 1 row x 256 pixels
+	store	r1,(r0)
+	movei	#BB_BCMD,r2
+	movei	#BB_CMDTEX,r1
+	store	r1,(r2)			; launch
+.bwbg:
+	load	(r2),r1
+	btst	#0,r1
+	jr	eq,.bwbg
+	nop
+	PROBE_EPI
+	.68000
+	.data
+_p_blitbg_e:
+
 ; ── p_lddramc: CONSUMED sequential DRAM loads — full load-to-use latency ────
 ; (Session 2: pins DRAM_LAT_HIT, which session 1 could not measure.)
 

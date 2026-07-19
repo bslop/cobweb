@@ -26,6 +26,18 @@ static WATCH_ADDR: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new()
 /// `B_CMD` read value indicating the blitter is idle (bit 0).
 pub const BLIT_IDLE: u32 = 0x0000_0001;
 
+/// Blitter timing — HARDWARE-CALIBRATED (Skunkboard 2026-07-19, probes
+/// `p_blitsm`/`p_blitbg`: an SRCEN 8bpp *pixel-mode* copy of N pixels measured
+/// `16 + 11.2*N` RISC ticks, i.e. ~5.6 ticks per DRAM phrase access — one for
+/// the source read, one for the dest write — plus a ~16-tick launch. jsim
+/// otherwise runs the whole blit at `B_CMD`-write time for free, so the GPU's
+/// bwait-spin costs nothing; this is the ~12% "fill" term the fps model missed.
+/// Accesses are counted in phrases: pixel-mode (XADDPIX/XADDINC) touches one
+/// phrase per pixel; phrase-mode (XADDPHR) packs 64/bpp pixels per phrase.
+const BLIT_LAUNCH_TICKS: u64 = 16;
+/// Ticks per DRAM phrase access ×10 (5.6), kept integer for exactness.
+const BLIT_ACCESS_TICKS_X10: u64 = 56;
+
 /// Decode the 6-bit floating WIDTH field (4-bit exp, 2-bit mantissa + implied 1)
 /// into a pixel count: `((4 + mant) << exp) >> 2` (spec §2.2).
 fn decode_width(field: u32) -> u32 {
@@ -419,6 +431,19 @@ pub fn run(bus: &mut Bus, cmd: u32) {
             gens[1].step_outer();
         }
     }
+
+    // Charge the blit its DRAM bus time (see BLIT_* constants). Counted in
+    // phrase accesses: every line writes ceil(inner/ppp_dst) dest phrases, and
+    // with SRCEN reads ceil(inner/ppp_src) source phrases. The launching
+    // `B_CMD` store picks this up in the timed RISC step.
+    let ppp = |g: &AddrGen| -> u64 {
+        if g.xadd == 0 { (64 / g.bpp.max(1)).max(1) as u64 } else { 1 }
+    };
+    let per_line = |g: &AddrGen| -> u64 { (inner as u64).div_ceil(ppp(g)) };
+    let dst_phrases = outer as u64 * per_line(&gens[dst]);
+    let src_phrases = if srcen { outer as u64 * per_line(&gens[src]) } else { 0 };
+    bus.tom.last_blit_ticks =
+        BLIT_LAUNCH_TICKS + (dst_phrases + src_phrases) * BLIT_ACCESS_TICKS_X10 / 10;
 }
 
 #[cfg(test)]
@@ -442,6 +467,31 @@ mod tests {
     fn blitter_reads_idle() {
         let mut bus = Bus::new();
         assert_eq!(bus.read32(mem::B_CMD) & BLIT_IDLE, BLIT_IDLE);
+    }
+
+    #[test]
+    fn blit_cost_matches_hardware_probe() {
+        // Mirrors the Skunkboard p_blitsm/p_blitbg probes (bench 2026-07-19):
+        // SRCEN|LFU_REPLACE|DSTA2, 8bpp pixel-mode copy. Each pixel is one source
+        // read phrase + one dest write phrase, so cost = 16 + 2*N*5.6 ticks.
+        let mut bus = Bus::new();
+        let setup = |bus: &mut Bus, n: u32| {
+            bus.tom.win.w32(mem::A1_BASE, 0x14_0000);
+            bus.tom.win.w32(mem::A1_FLAGS, 0x0001_4218); // PITCH1|PIXEL8|WID320|XADDPIX
+            bus.tom.win.w32(mem::A1_PIXEL, 0);
+            bus.tom.win.w32(mem::A2_BASE, 0x18_0000);
+            bus.tom.win.w32(mem::A2_FLAGS, 0x0001_4218);
+            bus.tom.win.w32(mem::A2_PIXEL, 0);
+            bus.tom.win.w32(mem::B_COUNT, (1 << 16) | n);
+        };
+        // 256-px copy → 16 + (256+256)*56/10 = 2883 ticks (measured ~2890).
+        setup(&mut bus, 256);
+        bus.write32(mem::B_CMD, 0x0180_0801);
+        assert_eq!(bus.tom.last_blit_ticks, 16 + (256 + 256) * 56 / 10);
+        // 8-px copy → far cheaper, matching p_blitsm.
+        setup(&mut bus, 8);
+        bus.write32(mem::B_CMD, 0x0180_0801);
+        assert_eq!(bus.tom.last_blit_ticks, 16 + (8 + 8) * 56 / 10);
     }
 
     #[test]

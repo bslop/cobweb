@@ -63,6 +63,8 @@ extern char p_lddram_s[], p_lddram_e[];
 extern char p_lddramc_s[], p_lddramc_e[];
 extern char p_ldstride_s[], p_ldstride_e[];
 extern char p_stdram_s[], p_stdram_e[];
+extern char p_blitsm_s[], p_blitsm_e[];
+extern char p_blitbg_s[], p_blitbg_e[];
 extern char p_divhot_s[], p_divhot_e[];
 extern char p_divsh_s[], p_divsh_e[];
 extern char p_jr_s[], p_jr_e[];
@@ -92,6 +94,8 @@ static const struct probe probes[] = {
     { "lddramc ", p_lddramc_s, p_lddramc_e, 0, 0, 256, DRAM_BUF },
     { "ldstride", p_ldstride_s, p_ldstride_e, 0, 0, 256, DRAM_BUF },
     { "stdram  ", p_stdram_s, p_stdram_e, 0, 0, 512, DRAM_BUF },
+    { "blitsm  ", p_blitsm_s, p_blitsm_e, 0, 0, 128, DRAM_BUF },
+    { "blitbg  ", p_blitbg_s, p_blitbg_e, 0, 0, 128, DRAM_BUF },
     { "divhot  ", p_divhot_s, p_divhot_e, 0, 0, 512, 0 },
     { "divsh   ", p_divsh_s, p_divsh_e, 0, 0, 512, 0 },
     { "jr      ", p_jr_s, p_jr_e, 0, 0, 256, 0 },

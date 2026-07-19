@@ -584,6 +584,16 @@ impl Risc {
         if access.sets_flags {
             self.pipe.set_flags_ready(end - 1 + timing::Lat::ALU);
         }
+
+        // A blit launched by this instruction (a store to B_CMD) costs the GPU
+        // real DRAM-bus time — on hardware the GPU spins in bwait until the
+        // Blitter finishes. blit::run stashed the tick cost; charge it here so
+        // the frame time reflects the fill (see tom::blit BLIT_* constants).
+        let blit_ticks = std::mem::take(&mut bus.tom.last_blit_ticks);
+        if blit_ticks > 0 {
+            self.pipe.stats.blit += blit_ticks;
+            cost = cost.saturating_add(blit_ticks.min(u32::MAX as u64) as u32);
+        }
         cost
     }
 

@@ -105,6 +105,10 @@ pub struct Tom {
     pub presented: crate::tom::Framebuffer,
     /// Per-field Object Processor cursor (geometry + anchor), reset each frame.
     pub op: crate::tom::OpState,
+    /// RISC-tick cost of the most recent blit (`blit::run` sets it; the timed
+    /// RISC step charges it to the launching `B_CMD` store, so the GPU's
+    /// bwait-spin costs real time — HARDWARE-CALIBRATED, see `blit::cost`).
+    pub last_blit_ticks: u64,
 }
 
 impl Tom {
@@ -116,6 +120,7 @@ impl Tom {
             fb: crate::tom::Framebuffer::solid(320, 240, 0, 0, 0),
             presented: crate::tom::Framebuffer::solid(320, 240, 0, 0, 0),
             op: crate::tom::OpState::default(),
+            last_blit_ticks: 0,
         }
     }
 }

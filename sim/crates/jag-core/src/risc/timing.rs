@@ -184,6 +184,10 @@ pub struct TimingStats {
     pub bigpemu_divergence: u64,
     /// Ticks of 68k bus-contention (row-thrash) tax paid by external accesses.
     pub contention: u64,
+    /// Ticks the GPU spent waiting on the Blitter (charged to the launching
+    /// B_CMD store; the GPU's bwait-spin is real DRAM-bus time). HARDWARE-
+    /// CALIBRATED — see `tom::blit` BLIT_* constants.
+    pub blit: u64,
 }
 
 impl TimingStats {

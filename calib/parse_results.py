@@ -38,6 +38,8 @@ PROBES = [
     ("lddramc", 384, "CONSUMED sequential DRAM loads (3 instr/unit)"),
     ("ldstride", 256, "2KB-strided DRAM loads (page misses)"),
     ("stdram", 512, "sequential DRAM store stream"),
+    ("blitsm", 0, "Blitter SRCEN|DSTA2 copy, 8 px + launch + bwait"),
+    ("blitbg", 0, "Blitter SRCEN|DSTA2 copy, 256 px + launch + bwait"),
     ("divhot", 192, "DIV + immediate consume units (3 instr/unit)"),
     ("divsh",  640, "DIV + 17-instr shadow units (20 instr/unit)"),
     ("jr",    1537, "tight taken-JR loop (movei + 512x3)"),
@@ -101,6 +103,7 @@ def reps_of(name):
         "vcmod": 0x80000, "null": 8192, "nop": 1024, "move": 1024,
         "moveq": 1024, "adddep": 1024, "addind": 1024, "ldsram": 512,
         "ldidx": 512, "lddram": 512, "lddramc": 256, "ldstride": 256, "stdram": 512,
+        "blitsm": 128, "blitbg": 128,
         "divhot": 512, "divsh": 512, "jr": 256, "mainmov": 128,
         "mainnop": 128,
     }[name]
