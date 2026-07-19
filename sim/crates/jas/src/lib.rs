@@ -153,6 +153,12 @@ pub struct Options {
     /// Command-line `-D` preprocessor defines (`NAME` or `NAME=VALUE`), seeding
     /// the `#if`/`#ifdef` symbol table for cpp-style `.S` sources.
     pub defines: Vec<String>,
+    /// Relocatable output: emit a relocation for *every* absolute reference to a
+    /// defined symbol (not just externs), so jln can place the object at any
+    /// address. PC-relative branches to same-object labels stay resolved (they
+    /// are position-independent). Implies `object_mode`. Off by default (an
+    /// object then pins to its assembled `.org`).
+    pub relocatable: bool,
 }
 
 impl Default for Options {
@@ -167,6 +173,7 @@ impl Default for Options {
             start_m68k: false,
             gas: None,
             defines: Vec::new(),
+            relocatable: false,
         }
     }
 }
@@ -667,7 +674,7 @@ impl<'a> Assembler<'a> {
             }
             // relocatable longword (a table of external addresses)
             if size == 4 {
-                if let Some((sym, addend)) = self.reloc_symbol(item.trim()) {
+                if let Some((sym, addend)) = self.reloc_symbol_abs(item.trim()) {
                     if self.pass == 2 {
                         let off = self.bytes.len() as u32;
                         self.relocs.push(Reloc { offset: off, kind: RelKind::Long, symbol: sym, addend });
@@ -852,19 +859,36 @@ impl<'a> Assembler<'a> {
     /// Only fires in pass 2, and only for externs (or any undefined symbol in
     /// object mode).
     fn reloc_symbol(&self, expr: &str) -> Option<(String, i64)> {
-        if self.pass != 2 {
-            return None;
-        }
+        self.reloc_symbol_impl(expr, false)
+    }
+
+    /// Like [`reloc_symbol`], for an *absolute* context (abs.l/abs.w, immediate
+    /// address, `dc.l`/`movei`). In `relocatable` mode this also relocates
+    /// references to symbols defined in this object, so the linker can rebase
+    /// them — PC-relative branches keep using the non-abs form and stay resolved.
+    fn reloc_symbol_abs(&self, expr: &str) -> Option<(String, i64)> {
+        self.reloc_symbol_impl(expr, true)
+    }
+
+    fn reloc_symbol_impl(&self, expr: &str, abs: bool) -> Option<(String, i64)> {
+        // Runs in BOTH passes: a reloc target is a full 32-bit address, so it must
+        // be *sized* as abs.l/word-branch in pass 1 too (else the layout shifts
+        // between passes and branch displacements come out wrong). The reloc is
+        // only *recorded* in pass 2 (gated at the emit sites).
         let relocatable = |sym: &str| -> bool {
             // Local labels (`.name`) are always intra-object: they live in the
             // symbol table under their scope-qualified name and resolve at
             // assembly time, so they must never be deferred to the linker.
-            if sym.starts_with('.') {
+            if sym.starts_with('.') || !ident_ok(sym) {
                 return false;
             }
-            !self.symbols.contains_key(sym)
-                && (self.opts.object_mode || self.externs.contains(sym))
-                && ident_ok(sym)
+            // Absolute references in relocatable mode relocate every symbol so
+            // the object can be placed anywhere; otherwise only externs (or any
+            // undefined symbol in object mode) relocate.
+            if abs && self.opts.relocatable && self.opts.object_mode {
+                return true;
+            }
+            !self.symbols.contains_key(sym) && (self.opts.object_mode || self.externs.contains(sym))
         };
         let e = expr.trim();
         if relocatable(e) {
@@ -889,15 +913,20 @@ impl<'a> Assembler<'a> {
         None
     }
 
-    /// Evaluate a MOVEI immediate, recording a relocation if it references an
-    /// external symbol (returns the addend as the placeholder value).
+    /// Relocation predicate for PC-relative contexts (branches): externs only.
     pub(crate) fn reloc_symbol_pub(&self, expr: &str) -> Option<(String, i64)> {
         self.reloc_symbol(expr)
     }
 
+    /// Relocation predicate for absolute contexts (abs EA, immediate address).
+    pub(crate) fn reloc_symbol_abs_pub(&self, expr: &str) -> Option<(String, i64)> {
+        self.reloc_symbol_abs(expr)
+    }
+
     pub(crate) fn movei_imm(&self, expr: &str) -> Result<u32, String> {
+        // A MOVEI loads a full 32-bit address immediate — an absolute context.
         let e = expr.strip_prefix('#').unwrap_or(expr).trim();
-        if let Some((sym, addend)) = self.reloc_symbol(e) {
+        if let Some((sym, addend)) = self.reloc_symbol_abs(e) {
             *self.pending_reloc.borrow_mut() = Some((1, RelKind::Movei, sym, addend));
             return Ok(addend as u32);
         }
@@ -1341,6 +1370,16 @@ fn apply(op: &ETok, a: u32, b: u32) -> Result<u32, String> {
 impl<'a> Assembler<'a> {
     pub(crate) fn eval_pub(&self, expr: &str) -> Result<u32, String> {
         self.eval(expr)
+    }
+    /// Does `expr` reference a symbol (as opposed to being a pure numeric
+    /// constant)? A symbolic operand has an address unknown until link, so an
+    /// absolute reference to it must be sized `abs.l` regardless of any value it
+    /// currently resolves to — keeping pass-1 and pass-2 sizes identical.
+    pub(crate) fn is_symbolic(&self, expr: &str) -> bool {
+        match expr_lex(expr) {
+            Ok(toks) => toks.iter().any(|t| matches!(t, ETok::Sym(_))),
+            Err(_) => true,
+        }
     }
     pub(crate) fn cur_target(&self) -> Target {
         self.target

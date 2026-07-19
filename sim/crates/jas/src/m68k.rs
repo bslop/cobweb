@@ -160,7 +160,7 @@ fn parse_ea(op: &str, sz: Sz, asm: &Assembler) -> Result<Ea, EncodeErr> {
         // A long immediate that is the address of an external symbol relocates
         // (e.g. `move.l #_vi_isr,vec` installing a handler address).
         if sz == Sz::L {
-            if let Some((sym, addend)) = asm.reloc_symbol_pub(imm) {
+            if let Some((sym, addend)) = asm.reloc_symbol_abs_pub(imm) {
                 return Ok(Ea {
                     mode: 7,
                     reg: 4,
@@ -279,7 +279,7 @@ fn parse_ea(op: &str, sz: Sz, asm: &Assembler) -> Result<Ea, EncodeErr> {
     };
     // Symbol may be extern (reloc) or defined. Prefer abs.l so externs relocate
     // cleanly (unless `.w` was requested explicitly).
-    if let Some((sym, addend)) = asm.reloc_symbol_pub(s) {
+    if let Some((sym, addend)) = asm.reloc_symbol_abs_pub(s) {
         if forced == Some(false) {
             return Ok(Ea { mode: 7, reg: 0, ext: vec![addend as u16], reloc: Some((sym, addend)), reloc_ext_off: 0 });
         }
@@ -292,8 +292,12 @@ fn parse_ea(op: &str, sz: Sz, asm: &Assembler) -> Result<Ea, EncodeErr> {
         });
     }
     let v = asm.eval_pub(s).map_err(msg)?;
+    // A symbolic operand's address isn't fixed until link, so it must be abs.l
+    // (unless `.w` was requested) — this keeps its size identical across passes
+    // even when the value currently resolves small. Pure numbers size by value.
     let use_word = match forced {
         Some(w) => !w, // forced .w → true, .l → false
+        None if asm.is_symbolic(s) => false,
         None => v <= 0x7FFF || v >= 0xFFFF_8000,
     };
     if use_word {
@@ -373,18 +377,23 @@ pub(crate) fn encode(mnem: &str, args: &str, here: u32, asm: &Assembler) -> Resu
         } else {
             0x6000 | (cc_field(&bbase[1..]).unwrap() << 8)
         };
-        if let Some((sym, addend)) = asm.reloc_symbol_pub(target) {
-            // PC-relative reloc to an external — emit 16-bit form, jln fixes it.
-            return Ok(M68kEnc {
-                words: vec![opbase, addend as u16],
-                reloc: Some((1, RelKind::Word, sym, addend)),
-            });
-        }
         // The form (and thus the size) is fixed by the suffix, independent of the
         // displacement: `.s`/`.b` → short (1 word), `.w` or no suffix → 16-bit
         // (2 words). Not auto-relaxing keeps sizing identical across passes, so a
         // forward reference — unbound (0) in pass 1 — never changes byte count.
         let force_short = low.ends_with(".s") || low.ends_with(".b");
+        // A short branch can only reach a same-object label (±127 bytes), so it
+        // is never a cross-object relocation — always resolve it PC-relative.
+        // Word-form branches to an *external* symbol relocate (jln patches the
+        // displacement); same-object word branches resolve PC-relative too.
+        if !force_short {
+            if let Some((sym, addend)) = asm.reloc_symbol_pub(target) {
+                return Ok(M68kEnc {
+                    words: vec![opbase, addend as u16],
+                    reloc: Some((1, RelKind::Word, sym, addend)),
+                });
+            }
+        }
         let dest = asm.eval_pub(target).map_err(msg)?;
         let disp = dest as i64 - (here as i64 + 2);
         // Pass 1 only sizes: emit right-sized placeholders, never range-check a
@@ -441,8 +450,38 @@ pub(crate) fn encode(mnem: &str, args: &str, here: u32, asm: &Assembler) -> Resu
     let (base, sz) = parse_size(&low, Sz::W);
     if base == "move" || base == "movea" {
         let (src, dst) = split2(args)?;
-        let s = parse_ea(&src, sz, asm)?;
-        let d = parse_ea(&dst, sz, asm)?;
+        let (srt, dtt) = (src.trim(), dst.trim());
+        // special-register moves (SR/CCR/USP) — the operand order is source,dest
+        let is_sr = |x: &str| x.eq_ignore_ascii_case("sr");
+        let is_ccr = |x: &str| x.eq_ignore_ascii_case("ccr");
+        let is_usp = |x: &str| x.eq_ignore_ascii_case("usp");
+        if is_sr(dtt) {
+            // MOVE <ea>,SR  (0x46C0 | ea) — word
+            let s = parse_ea(srt, Sz::W, asm)?;
+            return Ok(with_src(0x46C0 | s.field(), &s));
+        }
+        if is_sr(srt) {
+            // MOVE SR,<ea>  (0x40C0 | ea)
+            let d = parse_ea(dtt, Sz::W, asm)?;
+            return Ok(with_src(0x40C0 | d.field(), &d));
+        }
+        if is_ccr(dtt) {
+            // MOVE <ea>,CCR (0x44C0 | ea)
+            let s = parse_ea(srt, Sz::W, asm)?;
+            return Ok(with_src(0x44C0 | s.field(), &s));
+        }
+        if is_usp(dtt) {
+            // MOVE An,USP (0x4E60 | An)
+            let a = areg(srt).ok_or_else(|| msg("move to USP needs an address register"))?;
+            return Ok(one(0x4E60 | a));
+        }
+        if is_usp(srt) {
+            // MOVE USP,An (0x4E68 | An)
+            let a = areg(dtt).ok_or_else(|| msg("move from USP needs an address register"))?;
+            return Ok(one(0x4E68 | a));
+        }
+        let s = parse_ea(srt, sz, asm)?;
+        let d = parse_ea(dtt, sz, asm)?;
         let op = (sz.move_field() << 12) | (d.reg << 9) | (d.mode << 6) | s.field();
         return Ok(assemble_words(op, &s, &d));
     }

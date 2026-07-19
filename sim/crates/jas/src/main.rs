@@ -48,6 +48,10 @@ fn main() -> ExitCode {
             "-Werror" => opts.warnings_as_errors = true,
             "--gas" => opts.gas = Some(true),   // force the GNU-as frontend
             "--no-gas" => opts.gas = Some(false),
+            "-r" | "--relocatable" => {
+                opts.relocatable = true;
+                opts.object_mode = true;
+            }
             "--emit-gas" => {
                 // debug: print the GAS→native normalization and exit
                 let inp = it.clone().find(|a| !a.starts_with('-')).cloned();
