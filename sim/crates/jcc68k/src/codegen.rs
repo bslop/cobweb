@@ -33,6 +33,12 @@ pub struct Gen {
     dtemp: usize,
     /// Same, for address temporaries — callee-saved a2–a5, spilling past depth 4.
     atemp: usize,
+    /// Scalar locals promoted to a callee-saved data register for this function
+    /// (name → register). Read/written directly; never spilled to a frame slot.
+    reg_of: HashMap<String, String>,
+    /// Data registers available to the eval stack this function (the callee-saved
+    /// set minus any [`reg_of`] has claimed for a local).
+    dpool: Vec<&'static str>,
 }
 
 /// Callee-saved data registers used as the expression eval stack (they survive
@@ -71,6 +77,8 @@ pub fn generate(prog: &Program) -> Result<String, String> {
         cont_labels: Vec::new(),
         dtemp: 0,
         atemp: 0,
+        reg_of: HashMap::new(),
+        dpool: Vec::new(),
     };
     for gl in &prog.globals {
         g.globals.insert(gl.name.clone(), gl.ty.clone());
@@ -104,7 +112,7 @@ impl Gen {
     /// returning the slot spelling. Uses a callee-saved data register while any
     /// remain, else the machine stack. Pair with [`pop_dtemp_to`].
     fn push_dtemp(&mut self) -> String {
-        let slot = DTEMP_REGS.get(self.dtemp).map(|r| r.to_string()).unwrap_or_else(|| "-(a7)".into());
+        let slot = self.dpool.get(self.dtemp).map(|r| r.to_string()).unwrap_or_else(|| "-(a7)".into());
         self.line(&format!("move.l d0,{slot}"));
         self.dtemp += 1;
         slot
@@ -146,10 +154,40 @@ impl Gen {
         // other locals get negative offsets below A6.
         self.frame.clear();
         self.types.clear();
+        self.reg_of.clear();
+
+        // Promote the hottest scalar-4, address-never-taken locals/params to
+        // callee-saved data registers d7..d4 (the eval stack then uses whatever
+        // remains). This keeps loop counters/accumulators out of memory.
+        let mut refs = HashMap::new();
+        let mut addr = std::collections::HashSet::new();
+        for s in &f.body {
+            analyze_stmt(s, &mut refs, &mut addr);
+        }
+        let mut cand: Vec<(&str, &Type)> = f
+            .params
+            .iter()
+            .map(|(n, t)| (n.as_str(), t))
+            .chain(f.locals.iter().map(|l| (l.name.as_str(), &l.ty)))
+            .filter(|(n, t)| is_scalar4(t) && !addr.contains(*n) && refs.contains_key(*n))
+            .collect();
+        // hottest first; then drop duplicates (a param appears in both lists).
+        cand.sort_by(|a, b| refs[b.0].cmp(&refs[a.0]).then(a.0.cmp(b.0)));
+        cand.dedup_by(|a, b| a.0 == b.0);
+        const LOCAL_REGS: &[&str] = &["d7", "d6", "d5", "d4"];
+        let mut claimed: Vec<&str> = Vec::new();
+        for ((n, _), &r) in cand.iter().zip(LOCAL_REGS) {
+            self.reg_of.insert(n.to_string(), r.to_string());
+            claimed.push(r);
+        }
+        self.dpool = DTEMP_REGS.iter().copied().filter(|r| !claimed.contains(r)).collect();
+
         let param_names: std::collections::HashSet<&str> =
             f.params.iter().map(|(n, _)| n.as_str()).collect();
         let mut poff = 8i32;
         for (pn, pt) in &f.params {
+            // A register param still receives its arg in the stack slot; we copy
+            // it to the register in the prologue below.
             self.frame.insert(pn.clone(), poff);
             self.types.insert(pn.clone(), pt.clone());
             poff += 4; // args are pushed as longs
@@ -157,8 +195,8 @@ impl Gen {
         let mut noff = 0i32;
         for loc in &f.locals {
             self.types.insert(loc.name.clone(), loc.ty.clone());
-            if param_names.contains(loc.name.as_str()) {
-                continue;
+            if param_names.contains(loc.name.as_str()) || self.reg_of.contains_key(&loc.name) {
+                continue; // register locals need no frame slot
             }
             let sz = loc.ty.size().max(1) as i32;
             let al = loc.ty.align().max(1) as i32;
@@ -176,6 +214,13 @@ impl Gen {
         self.lbl(&name);
         self.line(&format!("link a6,#-{frame_size}"));
         self.line("movem.l d2-d7/a2-a5,-(a7)");
+        // Copy register-allocated parameters out of their incoming stack slots.
+        for (pn, _) in &f.params {
+            if let Some(reg) = self.reg_of.get(pn).cloned() {
+                let off = self.frame[pn];
+                self.line(&format!("move.l {off}(a6),{reg}"));
+            }
+        }
         for s in &f.body {
             self.gen_stmt(s)?;
         }
@@ -215,7 +260,11 @@ impl Gen {
                         Init::Scalar(e) => {
                             self.gen_expr(e)?;
                             self.cast(&e.ty, ty); // implicit conversion
-                            self.store_to_local(name, ty);
+                            if let Some(r) = self.reg_of.get(name).cloned() {
+                                self.line(&format!("move.l d0,{r}"));
+                            } else {
+                                self.store_to_local(name, ty);
+                            }
                         }
                         Init::List(_) => {
                             self.clear_frame(off, ty.size());
@@ -347,6 +396,11 @@ impl Gen {
                 self.line(&format!("lea {}_{idx},a0", self.str_prefix));
                 self.line("move.l a0,d0");
             }
+            ExprK::Var(name) if self.reg_of.contains_key(name) => {
+                // register-allocated local → read the register directly
+                let r = self.reg_of[name].clone();
+                self.line(&format!("move.l {r},d0"));
+            }
             ExprK::Var(_) | ExprK::Unary(UnOp::Deref, _) | ExprK::Member(..) => {
                 // lvalue → load its value
                 self.gen_addr(e)?;
@@ -375,6 +429,15 @@ impl Gen {
                 self.cast(&a.ty, &e.ty);
             }
             ExprK::Assign(lhs, rhs) => {
+                if let ExprK::Var(name) = &lhs.kind {
+                    if let Some(r) = self.reg_of.get(name).cloned() {
+                        // register-allocated local → assign the register directly
+                        self.gen_expr(rhs)?;
+                        self.cast(&rhs.ty, &lhs.ty);
+                        self.line(&format!("move.l d0,{r}"));
+                        return Ok(());
+                    }
+                }
                 self.gen_addr(lhs)?;
                 let slot = self.push_atemp(); // hold dest addr in a callee-saved areg
                 self.gen_expr(rhs)?; // value in D0
@@ -384,6 +447,15 @@ impl Gen {
                 // result of assignment is the stored value (already in D0)
             }
             ExprK::PostIncDec(lhs, delta) => {
+                if let ExprK::Var(name) = &lhs.kind {
+                    if let Some(r) = self.reg_of.get(name).cloned() {
+                        // register local: result is the old value, then adjust
+                        self.line(&format!("move.l {r},d0"));
+                        self.load_imm_into("d1", *delta as i32);
+                        self.line(&format!("add.l d1,{r}"));
+                        return Ok(());
+                    }
+                }
                 self.gen_addr(lhs)?;
                 let aslot = self.push_atemp(); // hold dest addr
                 self.load(&lhs.ty); // old value in D0
@@ -465,6 +537,12 @@ impl Gen {
     fn gen_addr(&mut self, e: &Expr) -> Result<(), String> {
         match &e.kind {
             ExprK::Var(name) => {
+                if self.reg_of.contains_key(name) {
+                    // A register-allocated local has no address; reads/writes are
+                    // intercepted before gen_addr, and `&x` locals are excluded
+                    // from allocation, so reaching here is a compiler bug.
+                    return Err(format!("{}: address of register-allocated `{name}`", e.line));
+                }
                 if let Some(off) = self.frame.get(name).copied() {
                     self.line(&format!("lea {off}(a6),a0"));
                 } else if self.globals.contains_key(name) {
@@ -499,9 +577,10 @@ impl Gen {
             self.gen_expr(a)?;
             self.line("move.l d0,-(a7)");
         }
-        // Direct call to a named function, else indirect through D0.
+        // Direct call to a named function, else indirect through D0. A register
+        // (or frame) local named here holds a function *pointer* — call indirect.
         if let ExprK::Var(name) = &callee.kind {
-            if !self.frame.contains_key(name) {
+            if !self.frame.contains_key(name) && !self.reg_of.contains_key(name) {
                 self.line(&format!("jsr {}", mangle(name)));
                 if nbytes > 0 {
                     self.line(&format!("adda.l #{nbytes},a7"));
@@ -587,6 +666,10 @@ impl Gen {
     fn cheap_operand(&self, e: &Expr) -> Option<(String, bool)> {
         match &e.kind {
             ExprK::Num(n) => Some((format!("#{}", *n as i32), true)),
+            ExprK::Var(name) if self.reg_of.contains_key(name) => {
+                // a register-allocated local is itself a valid instruction source
+                Some((self.reg_of[name].clone(), false))
+            }
             ExprK::Var(name) if is_scalar4(&e.ty) => {
                 let src = match self.frame.get(name).copied() {
                     Some(off) => format!("{off}(a6)"),
@@ -951,6 +1034,89 @@ fn peephole(asm: &str) -> String {
 /// (whose memory image is 1–2 bytes) and aggregates.
 fn is_scalar4(ty: &Type) -> bool {
     ty.size() == 4 && !matches!(&**ty, TypeK::Array(..) | TypeK::Struct { .. } | TypeK::Func { .. })
+}
+
+/// Walk an expression, counting variable references and recording which
+/// variables have their address taken (`&x`) — the latter can't live in a
+/// register.
+fn analyze_expr(e: &Expr, refs: &mut HashMap<String, usize>, addr: &mut std::collections::HashSet<String>) {
+    match &e.kind {
+        ExprK::Var(n) => *refs.entry(n.clone()).or_default() += 1,
+        ExprK::Num(_) | ExprK::StrLit(_) => {}
+        ExprK::Unary(UnOp::Addr, inner) => {
+            if let ExprK::Var(n) = &inner.kind {
+                addr.insert(n.clone());
+            }
+            analyze_expr(inner, refs, addr);
+        }
+        ExprK::Unary(_, a) | ExprK::Cast(a) | ExprK::Member(a, _) | ExprK::PostIncDec(a, _) => {
+            analyze_expr(a, refs, addr)
+        }
+        ExprK::Binary(_, a, b) | ExprK::Assign(a, b) | ExprK::Comma(a, b) => {
+            analyze_expr(a, refs, addr);
+            analyze_expr(b, refs, addr);
+        }
+        ExprK::Cond(c, t, f) => {
+            analyze_expr(c, refs, addr);
+            analyze_expr(t, refs, addr);
+            analyze_expr(f, refs, addr);
+        }
+        ExprK::Call(callee, args) => {
+            analyze_expr(callee, refs, addr);
+            for a in args {
+                analyze_expr(a, refs, addr);
+            }
+        }
+    }
+}
+
+/// Walk a statement (and any nested statements/initializers) for the analysis.
+fn analyze_stmt(s: &Stmt, refs: &mut HashMap<String, usize>, addr: &mut std::collections::HashSet<String>) {
+    let mut init = |i: &Init, refs: &mut _, addr: &mut _| {
+        fn walk(i: &Init, refs: &mut HashMap<String, usize>, addr: &mut std::collections::HashSet<String>) {
+            match i {
+                Init::Scalar(e) => analyze_expr(e, refs, addr),
+                Init::List(items) => items.iter().for_each(|it| walk(it, refs, addr)),
+            }
+        }
+        walk(i, refs, addr);
+    };
+    match s {
+        Stmt::Expr(e) | Stmt::Return(Some(e)) => analyze_expr(e, refs, addr),
+        Stmt::Return(None) | Stmt::Break | Stmt::Continue | Stmt::Goto(_)
+        | Stmt::Case(_) | Stmt::Default(_) | Stmt::Null => {}
+        Stmt::If(c, t, e) => {
+            analyze_expr(c, refs, addr);
+            analyze_stmt(t, refs, addr);
+            if let Some(e) = e {
+                analyze_stmt(e, refs, addr);
+            }
+        }
+        Stmt::While(c, b) | Stmt::DoWhile(b, c) => {
+            analyze_expr(c, refs, addr);
+            analyze_stmt(b, refs, addr);
+        }
+        Stmt::For(i, c, st, b) => {
+            if let Some(i) = i {
+                analyze_stmt(i, refs, addr);
+            }
+            if let Some(c) = c {
+                analyze_expr(c, refs, addr);
+            }
+            if let Some(st) = st {
+                analyze_expr(st, refs, addr);
+            }
+            analyze_stmt(b, refs, addr);
+        }
+        Stmt::Block(ss) => ss.iter().for_each(|s| analyze_stmt(s, refs, addr)),
+        Stmt::Switch(e, b, _, _) => {
+            analyze_expr(e, refs, addr);
+            analyze_stmt(b, refs, addr);
+        }
+        Stmt::Label(_, b) => analyze_stmt(b, refs, addr),
+        Stmt::Decl(_, _, Some(i)) => init(i, refs, addr),
+        Stmt::Decl(_, _, None) => {}
+    }
 }
 
 fn mangle(name: &str) -> String {

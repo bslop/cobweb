@@ -566,3 +566,36 @@ fn nested_assign_and_incdec_in_expr() {
     // x = 23; p = 20 (old y), y = 21  →  23000 + 210 + 20 = 23230
     assert_eq!(run(src), 23 * 1000 + 21 * 10 + 20);
 }
+
+// ── local variable register allocation ──────────────────────────────────────
+
+#[test]
+fn many_register_locals() {
+    // 8 hot scalar locals — more than the register pool; the overflow must fall
+    // back to the frame and still compute correctly.
+    let src = "int main(){ int a=1,b=2,c=3,d=4,e=5,f=6,g=7,h=8;\
+               int i; for(i=0;i<3;i++){ a+=b; b+=c; c+=d; d+=e; e+=f; f+=g; g+=h; h+=a; }\
+               return a+b+c+d+e+f+g+h; }";
+    // mirror the loop in Rust
+    let (mut a,mut b,mut c,mut d,mut e,mut f,mut g,mut h)=(1i32,2,3,4,5,6,7,8);
+    for _ in 0..3 { a+=b; b+=c; c+=d; d+=e; e+=f; f+=g; g+=h; h+=a; }
+    assert_eq!(run(src), (a+b+c+d+e+f+g+h) as u32);
+}
+
+#[test]
+fn register_local_survives_call() {
+    // A register-allocated accumulator must survive calls inside the loop.
+    let src = "int inc(int x){ return x+1; }\
+               int main(){ int s=0; int i; for(i=0;i<5;i++) s = s + inc(i); return s; }";
+    // s = sum(inc(0..4)) = (1+2+3+4+5) = 15
+    assert_eq!(run(src), 15);
+}
+
+#[test]
+fn address_taken_local_stays_in_memory() {
+    // `&x` forces x into a frame slot; writing through the pointer must be seen
+    // by a later read of x (would fail if x were wrongly kept in a register).
+    let src = "int main(){ int x=5; int i; int *p=&x;\
+               for(i=0;i<10;i++) *p = *p + 1; return x; }";
+    assert_eq!(run(src), 15);
+}
