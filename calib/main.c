@@ -80,11 +80,52 @@ struct probe {
     u32 reps;
     u32 aux;
     char *ds, *de;    /* optional DSP hammer: run on Jerry concurrently */
+    int op;           /* 1 = run with the OP scanning a full-screen bitmap */
+    int bonly;        /* 1 = mode B only (mode A's busy-poll would be starved) */
 };
 
 #define D_RAM 0xF1B000UL
 #define D_PC 0xF1A110UL
 #define D_CTRL 0xF1A114UL
+
+/* ── Object Processor load (scan-out contention probe) ────────────────────────
+ * The OP is the one master that reads DRAM *continuously* — every displayed
+ * line, all frame — and it outranks the GPU. This ROM normally sets no
+ * VMODE/OLP at all, so the OP is idle; enabling a full-screen BITMAP gives a
+ * clean on/off contrast to time Tom's DRAM stream against.
+ * 320x240 @ 16bpp = 80 phrases/line = the heaviest steady OP demand available,
+ * so a null result here is conclusive for 8bpp too. */
+#define OP_FB 0x00180000UL   /* bitmap pixels (just past DRAM_BUF's 256 KB) */
+#define OP_LIST 0x001AE000UL /* BITMAP -> STOP object list */
+#define OLP_R 0xF00020UL
+
+/* NEVER touch VMODE. An earlier version wrote VMODE=0 to stop the OP and wedged
+ * the console (red boot screen, physical power-cycle to recover): this ROM sets
+ * no VMODE of its own — it inherits the boot value — and its mode-B probes sleep
+ * in cpu_stop() until the VERTICAL INTERRUPT. Killing video timing kills the VI,
+ * the 68k never wakes, and the suite hangs mid-run.
+ *
+ * So vary only the OP's *appetite*, by swapping which object list OLP points at:
+ * a full-screen 320x240 16bpp BITMAP (80 phrases/line, every displayed line) vs
+ * a bare STOP (the OP fetches one object and quits). Video timing, the VI, and
+ * the display mode are all untouched. Worst case the screen shows garbage. */
+static void op_display(int on)
+{
+    u32 ol = OP_LIST, pw = (320u * 2) / 8; /* phrases per line, 16bpp */
+    u32 link = (ol + 16) >> 3;
+    if (on) {
+        R32(ol) = (OP_FB << 8) | (link >> 8);
+        R32(ol + 4) = (link << 24) | (240u << 14); /* height=240, ypos=0 */
+        R32(ol + 8) = pw >> 4;
+        R32(ol + 12) = (pw << 28) | (pw << 18) | (1u << 15) | (4u << 12);
+        R32(ol + 16) = 0; /* STOP */
+        R32(ol + 20) = 4;
+    } else {
+        R32(ol) = 0; /* STOP immediately — OP fetches one object, no pixels */
+        R32(ol + 4) = 4;
+    }
+    R32(OLP_R) = (ol >> 16) | (ol << 16); /* word-swapped, as hardware */
+}
 
 static const struct probe probes[] = {
     { "vcmod   ", p_vcmod_s, p_vcmod_e, 0, 0, 0x00080000UL, 0 },
@@ -102,6 +143,10 @@ static const struct probe probes[] = {
     { "stdram  ", p_stdram_s, p_stdram_e, 0, 0, 512, DRAM_BUF },
     { "blitsm  ", p_blitsm_s, p_blitsm_e, 0, 0, 128, DRAM_BUF },
     { "blitbg  ", p_blitbg_s, p_blitbg_e, 0, 0, 128, DRAM_BUF },
+    /* mode B ONLY: a saturating OP starves the 68k's mode-A DRAM busy-poll
+     * and the suite hangs (observed on hardware). Mode B sleeps on the VI, so
+     * it cannot be starved — and it is the cleaner measurement regardless. */
+    { "lddramop", p_lddram_s, p_lddram_e, 0, 0, 512, DRAM_BUF, 0, 0, 1, 1 },
     /* lddramj (Tom stream + concurrent DSP hammer) is RETIRED from the default
      * run: it answered its question (Jerry does not measurably contend with Tom
      * — 656 vs 656 ticks mode B, twice, with DSPMARK proving the DSP ran), and
@@ -184,6 +229,8 @@ static int run_probe(int idx, int mode)
         R32(D_PC) = D_RAM;
         R32(D_CTRL) = 1;
     }
+    if (p->op)
+        op_display(1); /* OP scans DRAM every displayed line */
     R32(G_PC) = G_RAM;
     R32(G_CTRL) = 1;
 
@@ -198,6 +245,8 @@ static int run_probe(int idx, int mode)
     }
     if (p->ds)
         R32(D_CTRL) = 0; /* stop the DSP hammer */
+    if (p->op)
+        op_display(0);
     return guard != 0;
 }
 
@@ -251,8 +300,14 @@ void cal_main(void)
     irq_on();
 
     R32(0x001B0000UL) = 0; /* clear the DSP-hammer witness before the suite */
+    /* Park the OP on a bare STOP so every baseline probe runs against a known,
+     * minimal scan-out load; only lddramop swaps in the full-screen bitmap.
+     * (OLP only — VMODE and the VI are left exactly as booted.) */
+    op_display(0);
 
     for (i = 0; i < NPROBES; i++) {
+        if (probes[i].bonly)
+            continue; /* would starve the 68k's busy-poll — mode B only */
         ok = run_probe(i, 0);
         report(i, 0, ok);
         if (!ok)
