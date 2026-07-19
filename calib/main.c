@@ -102,7 +102,13 @@ static const struct probe probes[] = {
     { "stdram  ", p_stdram_s, p_stdram_e, 0, 0, 512, DRAM_BUF },
     { "blitsm  ", p_blitsm_s, p_blitsm_e, 0, 0, 128, DRAM_BUF },
     { "blitbg  ", p_blitbg_s, p_blitbg_e, 0, 0, 128, DRAM_BUF },
-    { "lddramj ", p_lddram_s, p_lddram_e, 0, 0, 512, DRAM_BUF, p_dsphammer_s, p_dsphammer_e },
+    /* lddramj (Tom stream + concurrent DSP hammer) is RETIRED from the default
+     * run: it answered its question (Jerry does not measurably contend with Tom
+     * — 656 vs 656 ticks mode B, twice, with DSPMARK proving the DSP ran), and
+     * saturating the shared bus from Jerry wedged the console hard enough to
+     * need a power-cycle (red boot screen). Re-enable deliberately, never as
+     * part of a routine bench.
+     * { "lddramj ", p_lddram_s, p_lddram_e, 0, 0, 512, DRAM_BUF, p_dsphammer_s, p_dsphammer_e }, */
     { "divhot  ", p_divhot_s, p_divhot_e, 0, 0, 512, 0 },
     { "divsh   ", p_divsh_s, p_divsh_e, 0, 0, 512, 0 },
     { "jr      ", p_jr_s, p_jr_e, 0, 0, 256, 0 },
