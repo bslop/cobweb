@@ -111,6 +111,27 @@ fn accepts_waw_guarded_by_read() {
 }
 
 #[test]
+fn hazard_line_survives_conditional_removal() {
+    // A `.if 0` block (removed by the preprocessor) before a hazard must NOT
+    // shift the reported line: the diagnostic must name the real source line
+    // (the write at line 8), not the post-collapse position (line 4).
+    let src = "\t.gpu\n\
+        \t.org $F03000\n\
+        \t.if 0\n\
+        \tnop\n\
+        \tnop\n\
+        \tnop\n\
+        \t.endif\n\
+        \tload (r0),r5\n\
+        \tmoveq #1,r5\n\
+        \tnop\n";
+    let out = assemble(src, &Options::default());
+    let bug13 = out.diags.iter().find(|d| d.msg.contains("bug 13")).expect("bug-13 diag");
+    assert_eq!(bug13.line, 9, "write reported at wrong source line: {}", bug13.line);
+    assert!(bug13.msg.contains("from line 8"), "producer line wrong: {}", bug13.msg);
+}
+
+#[test]
 fn rejects_indexed_store_of_unsettled_reg() {
     // div into r2, then store r2 via (r14+n) without touching it = erratum.
     let errs = errors_of(

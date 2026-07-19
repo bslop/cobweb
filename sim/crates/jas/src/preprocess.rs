@@ -58,6 +58,10 @@ struct Pp<'a> {
     macros: HashMap<String, Macro>,
     syms: HashMap<String, i64>,
     out: Vec<String>,
+    /// Original source line for each emitted line in `out` (parallel array), so
+    /// diagnostics point at the real file line even after conditionals/macros
+    /// add or remove lines. Best-effort for macro/include bodies.
+    src: Vec<usize>,
     diags: Vec<Diag>,
     uniq: usize,
     depth: usize,
@@ -68,6 +72,16 @@ const MAX_DEPTH: usize = 64;
 /// Preprocess `src`. `line0` is the 1-based line the source starts at (for
 /// nested includes it's 1; kept simple — diagnostics use best-effort lines).
 pub fn run(src: &str, inc: &mut dyn Includes, defines: &[String]) -> Result<String, Vec<Diag>> {
+    run_mapped(src, inc, defines).map(|(s, _)| s)
+}
+
+/// Like [`run`], also returning the per-output-line source-line map (parallel to
+/// the output lines) so the assembler can report original file line numbers.
+pub fn run_mapped(
+    src: &str,
+    inc: &mut dyn Includes,
+    defines: &[String],
+) -> Result<(String, Vec<usize>), Vec<Diag>> {
     let mut syms = HashMap::new();
     for d in defines {
         match d.split_once('=') {
@@ -85,6 +99,7 @@ pub fn run(src: &str, inc: &mut dyn Includes, defines: &[String]) -> Result<Stri
         macros: HashMap::new(),
         syms,
         out: Vec::new(),
+        src: Vec::new(),
         diags: Vec::new(),
         uniq: 0,
         depth: 0,
@@ -94,7 +109,7 @@ pub fn run(src: &str, inc: &mut dyn Includes, defines: &[String]) -> Result<Stri
     if pp.diags.iter().any(|d| d.level == Level::Error) {
         Err(pp.diags)
     } else {
-        Ok(pp.out.join("\n"))
+        Ok((pp.out.join("\n"), pp.src))
     }
 }
 
@@ -164,6 +179,13 @@ impl Pp<'_> {
 
     /// Process a slice of lines, appending expanded output. `base` is the
     /// 1-based source line of `lines[0]` for diagnostics.
+    /// Emit one output line, recording the source line it came from (for
+    /// accurate diagnostics after the preprocessor adds/removes lines).
+    fn emit(&mut self, line: String, src_line: usize) {
+        self.out.push(line);
+        self.src.push(src_line);
+    }
+
     fn process(&mut self, lines: &[String], base: usize) {
         if self.depth > MAX_DEPTH {
             self.err(base, "preprocessor recursion too deep (include/macro cycle?)");
@@ -224,14 +246,14 @@ impl Pp<'_> {
             let mac_name = after_label.split_whitespace().next().unwrap_or("");
             if self.macros.contains_key(mac_name) && !after_label.starts_with('.') {
                 if let Some(lbl) = label {
-                    self.out.push(lbl.to_string());
+                    self.emit(lbl.to_string(), base + i);
                 }
                 self.expand_macro(mac_name, after_label, base + i);
                 i += 1;
                 continue;
             }
 
-            self.out.push(raw.clone());
+            self.emit(raw.clone(), base + i);
             i += 1;
         }
     }

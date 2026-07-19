@@ -197,15 +197,16 @@ pub fn assemble(source: &str, opts: &Options) -> Assembled {
     let mut inc = preprocess::FsIncludes {
         dirs: opts.include_dirs.iter().map(PathBuf::from).collect(),
     };
-    let expanded = match preprocess::run(source, &mut inc, &opts.defines) {
-        Ok(s) => s,
+    let (expanded, line_map) = match preprocess::run_mapped(source, &mut inc, &opts.defines) {
+        Ok(pair) => pair,
         Err(diags) => {
             return Assembled { diags, ..Default::default() };
         }
     };
+    // gas::resolve_numeric is line-preserving, so `line_map` still aligns 1:1.
     let expanded = if use_gas { gas::resolve_numeric(&expanded) } else { expanded };
     let mut asm = Assembler::new(opts);
-    asm.run(&expanded);
+    asm.run(&expanded, &line_map);
     let mut out = asm.finish();
     if opts.check_hazards {
         let suppressed: std::collections::HashSet<usize> = out.suppressed.iter().copied().collect();
@@ -290,7 +291,10 @@ impl<'a> Assembler<'a> {
 
     /// Two passes: pass 1 binds every label to an address (forward references
     /// resolve), pass 2 emits with all symbols known.
-    fn run(&mut self, source: &str) {
+    fn run(&mut self, source: &str, line_map: &[usize]) {
+        // Report the *original* source line for each expanded line (the map is
+        // parallel to `source.lines()`); fall back to the expanded position.
+        let src_line = |i: usize| line_map.get(i).copied().unwrap_or(i + 1);
         for pass in 1..=2 {
             self.pass = pass;
             self.target = self.opts.target;
@@ -305,10 +309,11 @@ impl<'a> Assembler<'a> {
                 self.bytes.clear();
             }
             for (i, raw) in source.lines().enumerate() {
+                let n = src_line(i);
                 if pass == 1 && raw.contains("jas:allow") {
-                    self.suppressed.insert(i + 1);
+                    self.suppressed.insert(n);
                 }
-                if let Some(line) = parse_line(raw, i + 1) {
+                if let Some(line) = parse_line(raw, n) {
                     self.handle(&line);
                 }
             }
