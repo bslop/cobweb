@@ -37,6 +37,10 @@ that had been silently dropping conditional blocks is fixed.
   silicon (hardware-confirmed on Skunkboard: gpu_geotex vertices came out with
   x/y swapped). Unblocks verifying `storep`/`loadp` bus-traffic optimizations in
   jsim. *(commit f5197f3)*
+- **Blitter now charges its DRAM-bus time** (was free/synchronous). Calibrated on
+  the Skunkboard (new probes p_blitsm/p_blitbg): 16 launch ticks + 5.6 ticks per
+  phrase access; jsim now predicts the measured 30 / 450 ticks for an 8 / 256-px
+  SRCEN span. Closes the ~12% "fill" term of the fps gap. *(commit 674767d)*
 - **Blitter XADDINC is a real 16.16 affine DDA** (was approximated as a flat +1
   step), so textured spans sample the atlas correctly. *(commit 0d0a2fc)*
 - **GPU/DSP restart on re-kick.** A core kicked after its boot self-test was
@@ -95,10 +99,8 @@ that had been silently dropping conditional blocks is fixed.
   ~4.9 on hardware for OpenLara Caves 320×240). Diagnosed in
   COBWEB_GAP_bus_contention_and_blitter_fill_timing; each needs a
   hardware-calibration pass, so they are staged deliberately rather than guessed:
-  1. **Synchronous/free Blitter.** `blit::run` completes instantly and `B_CMD`
-     always reads idle, so the GPU's `bwait` never spins (fill measured ~12% of
-     the frame). Plan: charge a per-launch cost (phrase count × the calibrated
-     DRAM write occupancy + page/refresh) and read `B_CMD` busy until it elapses.
+  1. ~~**Synchronous/free Blitter.**~~ **DONE** (commit 674767d) — Blitter now
+     charges its calibrated DRAM-bus time.
   2. **No multi-master DRAM contention.** The one shared 64-bit DRAM bus
      (68k + Tom + Jerry + Blitter + OP scan-out) is modeled only for the
      68k↔GPU pair (`CONTENTION_HIT_EXTRA`, gated on `bus.m68k_on_bus`) — and that
