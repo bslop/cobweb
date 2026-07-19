@@ -49,12 +49,35 @@ type PResult<T> = Result<T, String>;
 /// drop `__attribute__((…))`, `__asm__(…)`, `__extension__`, and `__restrict`;
 /// fold `__inline__`/`__const__`/`__volatile__`/`__signed__` to their keywords.
 fn strip_gnu(toks: Vec<Token>) -> Vec<Token> {
-    let mut out = Vec::with_capacity(toks.len());
+    use std::collections::HashMap;
+    let mut out: Vec<Token> = Vec::with_capacity(toks.len());
     let mut i = 0;
     let kw = |s: &str, t: &Token| Token { tok: Tok::Keyword(s.into()), line: t.line, col: t.col };
+    // GCC asm labels: `TYPE name __asm__("linkname")` renames `name`'s linkage
+    // symbol to `linkname`. Collected here, applied to every use in a second pass.
+    let mut renames: HashMap<String, String> = HashMap::new();
     while i < toks.len() {
         if let Tok::Ident(s) = &toks[i].tok {
             match s.as_str() {
+                // An `asm`/`__asm__("linkname")` following a declarator (`name`,
+                // `name(params)`, or `name[]`) is an asm label — a symbol rename,
+                // not an inline-asm statement. Record the rename and drop it.
+                "__asm__" | "__asm" | "asm"
+                    if matches!(toks.get(i + 1).map(|t| &t.tok), Some(Tok::Punct(p)) if p == "(")
+                        && matches!(toks.get(i + 2).map(|t| &t.tok), Some(Tok::Str(_)))
+                        && matches!(toks.get(i + 3).map(|t| &t.tok), Some(Tok::Punct(p)) if p == ")")
+                        && declarator_name(&out).is_some() =>
+                {
+                    if let (Some(cname), Some(Tok::Str(bytes))) =
+                        (declarator_name(&out), toks.get(i + 2).map(|t| t.tok.clone()))
+                    {
+                        let link: String =
+                            bytes.iter().take_while(|&&b| b != 0).map(|&b| b as char).collect();
+                        renames.insert(cname, link);
+                    }
+                    i += 4; // skip `asm ( "str" )`
+                    continue;
+                }
                 "__attribute__" | "__attribute" | "__asm__" | "__asm" | "asm" => {
                     i += 1;
                     // `asm`/`__asm__` may carry a qualifier before the `(`:
@@ -116,7 +139,48 @@ fn strip_gnu(toks: Vec<Token>) -> Vec<Token> {
         out.push(toks[i].clone());
         i += 1;
     }
+    // Apply asm-label renames to every identifier use (the C name links under
+    // the asm name, so a call/reference must emit the asm symbol).
+    if !renames.is_empty() {
+        for t in &mut out {
+            if let Tok::Ident(name) = &t.tok {
+                if let Some(link) = renames.get(name) {
+                    t.tok = Tok::Ident(link.clone());
+                }
+            }
+        }
+    }
     out
+}
+
+/// The declarator name preceding a trailing asm label: skip any balanced
+/// `(params)` / `[dims]` declarator suffixes, then return the identifier.
+fn declarator_name(out: &[Token]) -> Option<String> {
+    let mut j = out.len();
+    loop {
+        let last = out.get(j.checked_sub(1)?)?;
+        match &last.tok {
+            Tok::Punct(p) if p == ")" || p == "]" => {
+                let (close, open) = if p == ")" { (")", "(") } else { ("]", "[") };
+                let mut depth = 0i32;
+                loop {
+                    j = j.checked_sub(1)?;
+                    match &out.get(j)?.tok {
+                        Tok::Punct(x) if x == close => depth += 1,
+                        Tok::Punct(x) if x == open => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Tok::Ident(name) => return Some(name.clone()),
+            _ => return None,
+        }
+    }
 }
 
 pub fn parse(toks: Vec<Token>) -> PResult<Program> {

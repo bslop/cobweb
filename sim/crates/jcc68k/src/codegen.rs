@@ -812,7 +812,9 @@ fn peephole(asm: &str) -> String {
 }
 
 fn mangle(name: &str) -> String {
-    // C linkage: prefix with `_` (classic 68k a.out convention). Keep it simple
-    // and consistent so the runtime and user code agree.
-    format!("_{name}")
+    // C linkage: no prefix, matching the m68k-elf (GCC/ELF) convention the real
+    // Jaguar ports and their hand-written asm use — so a C `gpu_kernel` reference
+    // resolves to the asm's `gpu_kernel` label at link time. (The a.out `_`
+    // prefix would leave every cross-language symbol unresolved.)
+    name.to_string()
 }

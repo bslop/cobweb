@@ -44,7 +44,7 @@ fn run(src: &str) -> u32 {
         eprintln!(
             "DBG steps={steps} final_pc={:06X} d0={:08X} illegal={} sym_start={start:06X} sym_main={:?} $100={:08X}",
             jag.cpu.pc, jag.cpu.d[0], jag.cpu.illegal_count,
-            res.symbols.get("_main"), jag.bus.read32(0x100)
+            res.symbols.get("main"), jag.bus.read32(0x100)
         );
     }
     jag.bus.read32(0x100)
@@ -230,7 +230,7 @@ fn pp_conditionals() {
 }
 
 #[test]
-fn pp_include() {
+fn ppinclude() {
     let dir = std::env::temp_dir().join(format!("jcc_pp_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("hdr.h"), "#define ANSWER 42\nint helper(int x){ return x + ANSWER; }\n").unwrap();
@@ -446,12 +446,12 @@ fn run_linked(main_src: &str, helper_gas: &str) -> u32 {
 }
 
 #[test]
-fn link_c_calls_gas_helper() {
+fn link_c_calls_gashelper() {
     // helper(x) = x * 2, written in GNU-as syntax (`%sp`, `|` comment).
     let helper = "\
         \t.text\n\
-        \t.globl _helper\n\
-        _helper:\n\
+        \t.globl helper\n\
+        helper:\n\
         \tmove.l 4(%sp),%d0  | argument\n\
         \tadd.l %d0,%d0      | x + x\n\
         \trts\n";
@@ -460,12 +460,12 @@ fn link_c_calls_gas_helper() {
 }
 
 #[test]
-fn link_c_calls_gas_helper_with_numeric_locals() {
+fn link_c_calls_gashelper_with_numeric_locals() {
     // sum(n) = n + (n-1) + ... + 1, via a GAS loop using a numeric local label.
     let helper = "\
         \t.text\n\
-        \t.globl _sumto\n\
-        _sumto:\n\
+        \t.globl sumto\n\
+        sumto:\n\
         \tmove.l 4(%sp),%d1  | n\n\
         \tmoveq #0,%d0\n\
         1:\ttst.l %d1\n\
@@ -476,4 +476,62 @@ fn link_c_calls_gas_helper_with_numeric_locals() {
         2:\trts\n";
     let main = "extern int sumto(int n); int main() { return sumto(10); }";
     assert_eq!(run_linked(main, helper), 55);
+}
+
+/// Relocating link: assemble every object as position-independent (`relocatable`
+/// at a nominal org 0) and let jln ASSIGN addresses (`Layout::base`), rebasing
+/// each object's symbols and absolute relocations. No manual orgs.
+fn run_autoplaced(main_src: &str, helpers: &[&str]) -> u32 {
+    let asm_reloc = |src: &str, gas: bool| {
+        let opts = jas::Options {
+            org: 0,
+            start_m68k: true,
+            check_hazards: false,
+            object_mode: true,
+            relocatable: true,
+            gas: gas.then_some(true),
+            ..Default::default()
+        };
+        let r = jas::assemble(src, &opts);
+        assert_eq!(r.errors(), 0, "asm errors: {:#?}", r.diags);
+        r.object(0)
+    };
+    let main_asm = crate::compile_program(main_src).unwrap_or_else(|e| panic!("compile: {e}"));
+    let mut objs = vec![asm_reloc(&main_asm, false)];
+    for h in helpers {
+        objs.push(asm_reloc(h, true));
+    }
+    let layout = jln::Layout { base: Some(0x4000), align: 4, entry: Some("_start".into()), ..Default::default() };
+    let img = jln::link_with(&objs, &layout).expect("relocating link failed");
+    let mut jag = Jaguar::new();
+    for (i, b) in img.bytes.iter().enumerate() {
+        jag.bus.write8(img.base + i as u32, *b);
+    }
+    jag.cpu.set_pc(img.entry);
+    let mut prev = u32::MAX;
+    let mut steps = 0u64;
+    loop {
+        let pc = jag.cpu.pc;
+        if pc == prev {
+            break;
+        }
+        prev = pc;
+        jag.step_instruction();
+        steps += 1;
+        if steps > 5_000_000 {
+            break;
+        }
+    }
+    jag.bus.read32(0x100)
+}
+
+#[test]
+fn relocating_link_assigns_addresses() {
+    // main calls two separately-assembled GAS helpers; the linker places all
+    // three objects and rebases every cross- and intra-object absolute reference.
+    let dbl = "\t.text\n\t.globl dbl\ndbl:\n\tmove.l 4(%sp),%d0\n\tadd.l %d0,%d0\n\trts\n";
+    let inc = "\t.text\n\t.globl inc\ninc:\n\tmove.l 4(%sp),%d0\n\taddq.l #1,%d0\n\trts\n";
+    let main = "extern int dbl(int); extern int inc(int); \
+                int main() { return dbl(20) + inc(1); }";
+    assert_eq!(run_autoplaced(main, &[dbl, inc]), 42);
 }

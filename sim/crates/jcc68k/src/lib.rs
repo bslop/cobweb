@@ -84,7 +84,7 @@ const STARTUP: &str = r#"
 	.globl _start
 _start:
 	movea.l	#$001F0000,a7
-	jsr	_main
+	jsr	main
 	move.l	d0,$100
 _start_halt:
 	bra	_start_halt

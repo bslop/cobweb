@@ -18,6 +18,7 @@ fn main() {
     let mut to_bin = false;
     let mut whole_program = false;
     let mut preprocess_only = false;
+    let mut emit_runtime = false;
     let mut include_dirs: Vec<String> = Vec::new();
     let mut defines: Vec<String> = Vec::new();
     let mut org = 0x4000u32;
@@ -28,6 +29,7 @@ fn main() {
             "--bin" => to_bin = true,
             "--prog" => whole_program = true,
             "-E" => preprocess_only = true,
+            "--runtime" => emit_runtime = true,
             "--org" => {
                 org = it
                     .next()
@@ -48,6 +50,15 @@ fn main() {
             _ if a.starts_with('-') => fail(&format!("unknown flag {a}")),
             _ => input = Some(a.clone()),
         }
+    }
+    if emit_runtime {
+        // emit just the C runtime helpers (__mulsi3 etc.) as a standalone unit
+        let out = jcc68k::runtime();
+        match output {
+            Some(o) => std::fs::write(&o, out).unwrap_or_else(|e| fail(&format!("{o}: {e}"))),
+            None => print!("{out}"),
+        }
+        return;
     }
     let input = input.unwrap_or_else(|| fail("no input file"));
     let src = std::fs::read_to_string(&input).unwrap_or_else(|e| fail(&format!("{input}: {e}")));
