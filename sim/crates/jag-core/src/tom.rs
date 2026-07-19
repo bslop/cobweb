@@ -111,6 +111,13 @@ pub struct OpState {
     /// outside the bitmap canvas). Bitmap-only lists — every game that renders
     /// today — keep the canvas-gated walk, byte-for-byte unchanged.
     pub has_gpu_object: bool,
+    /// Phrases the OP fetches from DRAM per displayed line (sum of the active
+    /// bitmaps' IWIDTH). This is real bus traffic every visible line and it
+    /// outranks the GPU — HARDWARE (Skunkboard 2026-07-19, probe `lddramop`):
+    /// a full-screen 320x240 16bpp object (80 phrases/line) slows Tom's DRAM
+    /// stream by 11.1%, i.e. +0.46 cycles per external access. See
+    /// `timing::OP_TAX_MILLI_PER_PHRASE`.
+    pub phrases_per_line: u32,
 }
 
 impl Default for OpState {
@@ -122,6 +129,7 @@ impl Default for OpState {
             anchor_x: 0,
             anchor_y: 0,
             has_gpu_object: false,
+            phrases_per_line: 0,
         }
     }
 }
@@ -189,6 +197,17 @@ const GPU_OBJ_ISR_BUDGET: u32 = 2_000_000;
 /// correctly here, whereas a single end-of-frame snapshot would catch a torn or
 /// empty list. `vc` is the vertical count in half-lines.
 pub fn op_render_line(vc: u16, cpu: &mut M68k, gpu: &mut Risc, bus: &mut Bus) {
+    // Keep the bus-contention appetite current at LINE granularity. Sampling it
+    // only at field start badly under-counts a load that changes mid-field (and
+    // the calib probe is barely one field long). Ignore an implausible IWIDTH:
+    // the 68k may be mid-write, and a torn list decodes as garbage.
+    {
+        let olp = ((bus.tom.win.r16(mem::OLPH) as u32) << 16) | bus.tom.win.r16(mem::OLP) as u32;
+        let p: u32 = collect_bitmaps(bus, olp).iter().map(|b| b.iwidth_phrases).sum();
+        if p <= (LINE_W as u32) {
+            bus.tom.op.phrases_per_line = p;
+        }
+    }
     let vmode = bus.tom.win.r16(mem::VMODE);
     let fmt = PixFmt::from_vmode(vmode);
 
@@ -287,6 +306,10 @@ fn op_begin_field(bus: &mut Bus, fmt: PixFmt) {
     bus.tom.op.anchor_x = anchor_x;
     bus.tom.op.anchor_y = anchor_y;
     bus.tom.op.has_gpu_object = list_has_gpu_object(bus, olp);
+    // Per-line DRAM appetite of the display list: every bitmap re-reads IWIDTH
+    // phrases on each line it covers. Drives the OP bus-contention tax.
+    bus.tom.op.phrases_per_line =
+        bitmaps.iter().map(|b| b.iwidth_phrases).sum::<u32>().min(4096);
 }
 
 /// Structural scan of the object graph for a GPU (TYPE 2) object (both BRANCH

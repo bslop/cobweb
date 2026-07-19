@@ -546,6 +546,13 @@ impl Risc {
                     ext_load_lat += 4;
                 }
             }
+            // Object Processor scan-out steals DRAM cycles from both RISCs every
+            // visible line (HARDWARE-CALIBRATED; see OP_TAX_MILLI_*). Unlike the
+            // 68k tax this applies to stores too — the OP occupies the bus, it
+            // does not thrash a row.
+            if c == MemClass::Dram {
+                cost += self.pipe.charge_op_tax(bus.tom.op.phrases_per_line);
+            }
         }
 
         // TRM errata §2: indexed stores don't scoreboard their DATA register.
