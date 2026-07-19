@@ -40,7 +40,22 @@ that had been silently dropping conditional blocks is fixed.
 - **Blitter now charges its DRAM-bus time** (was free/synchronous). Calibrated on
   the Skunkboard (new probes p_blitsm/p_blitbg): 16 launch ticks + 5.6 ticks per
   phrase access; jsim now predicts the measured 30 / 450 ticks for an 8 / 256-px
-  SRCEN span. Closes the ~12% "fill" term of the fps gap. *(commit 674767d)*
+  SRCEN span. *(commit 674767d)*
+
+  **End-to-end effect (OpenLara Caves 320×240, HWH_clean, 2600 frames):**
+
+  | | fps | vs hardware |
+  |---|---|---|
+  | jsim before (blit cost zeroed) | 7.50 | +53% |
+  | jsim after (calibrated) | **5.43** | **+11%** |
+  | real Jaguar | 4.9 | — |
+
+  Zeroing the constants reproduces the reported 7.50 exactly, so the movement is
+  attributable to this fix alone. The free Blitter — not bus contention — was the
+  dominant missing term: it accounted for ~2.1 of the 2.6 fps gap.
+- **LOADP's G_HIDATA lands late and unscoreboarded**, so an early read sees the
+  stale value as silicon does (it previously landed instantly, making a kernel
+  that renders garbage on hardware look correct in jsim). *(commit 6f1fd08)*
 - **Blitter XADDINC is a real 16.16 affine DDA** (was approximated as a flat +1
   step), so textured spans sample the atlas correctly. *(commit 0d0a2fc)*
 - **GPU/DSP restart on re-kick.** A core kicked after its boot self-test was
@@ -99,9 +114,17 @@ that had been silently dropping conditional blocks is fixed.
   ~4.9 on hardware for OpenLara Caves 320×240). Diagnosed in
   COBWEB_GAP_bus_contention_and_blitter_fill_timing; each needs a
   hardware-calibration pass, so they are staged deliberately rather than guessed:
-  1. ~~**Synchronous/free Blitter.**~~ **DONE** (commit 674767d) — Blitter now
-     charges its calibrated DRAM-bus time.
-  2. **No multi-master DRAM contention.** The one shared 64-bit DRAM bus
+  **Status: mostly closed — fps over-prediction is down from +53% to +11%.**
+  1. ~~**Synchronous/free Blitter.**~~ **DONE** (674767d) — this was the dominant
+     term, not contention.
+  3. ~~**LOADP/G_HIDATA zero-latency.**~~ **DONE** (6f1fd08).
+  2. **Multi-master DRAM contention — partly answered by measurement.** Jerry is
+     NOT a contributor: a resident DSP hammering DRAM did not measurably slow
+     Tom (656 vs 656 ticks, twice, DSP provably running), so the GPU appears to
+     outrank the DSP in bus arbitration. The remaining ~11% residual is the only
+     budget left for an OP-scan-out term, so a full arbitration model is likely
+     over-engineering; measure the OP first and size it against that residual.
+     The original text follows for reference. The one shared 64-bit DRAM bus
      (68k + Tom + Jerry + Blitter + OP scan-out) is modeled only for the
      68k↔GPU pair (`CONTENTION_HIT_EXTRA`, gated on `bus.m68k_on_bus`) — and that
      gate is *off* during render because `gpu_sync` STOPs the 68k. Plan: extend
