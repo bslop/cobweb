@@ -41,13 +41,46 @@ impl std::error::Error for LinkError {}
 
 /// A linked image.
 pub struct Image {
-    /// Address the image loads at (the lowest object org).
+    /// Address the image loads at (the lowest placed address).
     pub base: u32,
     pub bytes: Vec<u8>,
     /// Every global symbol and its final address.
     pub symbols: HashMap<String, u32>,
-    /// Entry point: the lowest object's org (best-effort; overrideable).
+    /// Entry point: the `entry` symbol's address, or the lowest placed address.
     pub entry: u32,
+}
+
+/// How the linker assigns addresses to objects.
+#[derive(Debug, Clone)]
+pub struct Layout {
+    /// `Some(addr)` places objects sequentially from `addr` (a relocating link —
+    /// each object's symbols and absolute relocations are rebased). `None` keeps
+    /// every object at its own assembled `.org` (the fixed-address model, for
+    /// GPU/DSP local-RAM code).
+    pub base: Option<u32>,
+    /// Alignment (bytes) applied before each sequentially-placed object.
+    pub align: u32,
+    /// Entry-point symbol; falls back to the lowest placed address.
+    pub entry: Option<String>,
+    /// Link-script symbol definitions (`--defsym NAME=ADDR`), e.g. the section
+    /// boundary markers (`__bss_start`) that startup code references. The literal
+    /// value `"@end"` resolves to the end of the placed image.
+    pub defsyms: Vec<(String, DefVal)>,
+}
+
+/// Value of a `--defsym`: a fixed address or a symbolic image position.
+#[derive(Debug, Clone)]
+pub enum DefVal {
+    Addr(u32),
+    /// The address just past the last placed byte (for `__bss_*`/`__end`).
+    ImageEnd,
+}
+
+impl Default for Layout {
+    fn default() -> Self {
+        // Back-compat: honor each object's assembled org.
+        Layout { base: None, align: 2, entry: None, defsyms: Vec::new() }
+    }
 }
 
 /// Parse `.jo` bytes into objects.
@@ -59,49 +92,109 @@ pub fn parse_objects(blobs: &[Vec<u8>]) -> Result<Vec<Object>, LinkError> {
         .collect()
 }
 
-/// Link objects into an image. Global symbols must be unique; every reloc must
-/// resolve to a defined global (or a symbol local to some object).
+/// Link objects into an image at each object's assembled org (back-compat).
 pub fn link(objects: &[Object]) -> Result<Image, LinkError> {
-    // 1. global symbol table (globals are exported; also index all defined
-    //    symbols so intra-project references that happen to be non-global still
-    //    resolve — pragmatic for hand-written Jaguar code).
+    link_with(objects, &Layout::default())
+}
+
+/// Link objects into an image using `layout`. When `layout.base` is set the link
+/// is *relocating*: objects are placed sequentially and their symbols/relocations
+/// are rebased by the delta between the placed address and the assembled org.
+pub fn link_with(objects: &[Object], layout: &Layout) -> Result<Image, LinkError> {
+    // 1. assign a placement base to each object.
+    let align = layout.align.max(1);
+    let mut placed: Vec<u32> = Vec::with_capacity(objects.len());
+    if let Some(start) = layout.base {
+        let mut cursor = start;
+        for obj in objects {
+            cursor = (cursor + align - 1) / align * align;
+            placed.push(cursor);
+            cursor += obj.bytes.len() as u32;
+        }
+    } else {
+        placed.extend(objects.iter().map(|o| o.org));
+    }
+    // per-object rebase delta (placed address − assembled org).
+    let delta = |i: usize| placed[i] as i64 - objects[i].org as i64;
+
+    // image extent (needed to resolve `@end` defsyms below).
+    let img_base = placed.iter().copied().min().unwrap_or(0);
+    let img_end = placed
+        .iter()
+        .zip(objects)
+        .map(|(&p, o)| p + o.bytes.len() as u32)
+        .max()
+        .unwrap_or(img_base);
+
+    // 2. global symbol table, rebased. Globals must be unique.
     let mut globals: HashMap<String, u32> = HashMap::new();
-    for obj in objects {
+    for (i, obj) in objects.iter().enumerate() {
         for s in &obj.symbols {
             if s.global {
-                if globals.insert(s.name.clone(), s.value).is_some() {
+                let addr = (s.value as i64 + delta(i)) as u32;
+                if globals.insert(s.name.clone(), addr).is_some() {
                     return Err(LinkError::DuplicateSymbol(s.name.clone()));
                 }
             }
         }
     }
-    // second-chance table: all defined symbols (non-global included), for
-    // resolving references the author didn't bother to .globl.
-    let mut anydef: HashMap<String, u32> = HashMap::new();
-    for obj in objects {
-        for s in &obj.symbols {
-            anydef.entry(s.name.clone()).or_insert(s.value);
+    // link-script symbol definitions (section markers etc.), lowest precedence.
+    for (name, val) in &layout.defsyms {
+        let addr = match val {
+            DefVal::Addr(a) => *a,
+            DefVal::ImageEnd => img_end,
+        };
+        globals.entry(name.clone()).or_insert(addr);
+    }
+    // per-object local symbol tables (rebased), used to resolve a reference to a
+    // non-exported symbol within its own object before falling back to globals.
+    let locals: Vec<HashMap<String, u32>> = objects
+        .iter()
+        .enumerate()
+        .map(|(i, obj)| {
+            obj.symbols
+                .iter()
+                .map(|s| (s.name.clone(), (s.value as i64 + delta(i)) as u32))
+                .collect()
+        })
+        .collect();
+
+    // 3. patch relocations against the rebased addresses. Collect every
+    //    unresolved symbol first so the user sees the full list, not just one.
+    let mut patched: Vec<Object> = objects.to_vec();
+    let mut missing: Vec<(String, usize)> = Vec::new();
+    for (oi, obj) in objects.iter().enumerate() {
+        for r in &obj.relocs {
+            if locals[oi].get(&r.symbol).or_else(|| globals.get(&r.symbol)).is_none()
+                && !missing.iter().any(|(n, _)| n == &r.symbol)
+            {
+                missing.push((r.symbol.clone(), oi));
+            }
         }
     }
-
-    // 2. patch relocations (work on owned copies of the bytes)
-    let mut patched: Vec<Object> = objects.to_vec();
+    if let Some((symbol, in_obj)) = missing.first() {
+        if missing.len() > 1 {
+            eprintln!("jln: {} undefined symbols:", missing.len());
+            for (n, o) in &missing {
+                eprintln!("  `{n}` (from object #{o})");
+            }
+        }
+        return Err(LinkError::Undefined { symbol: symbol.clone(), in_obj: *in_obj });
+    }
     for (oi, obj) in patched.iter_mut().enumerate() {
         for r in &obj.relocs {
-            let target = globals
+            // prefer this object's own definition, then the global table.
+            let target = locals[oi]
                 .get(&r.symbol)
-                .or_else(|| anydef.get(&r.symbol))
+                .or_else(|| globals.get(&r.symbol))
                 .copied()
                 .ok_or_else(|| LinkError::Undefined { symbol: r.symbol.clone(), in_obj: oi })?;
             let val = (target as i64 + r.addend) as u32;
             let off = r.offset as usize;
             match r.kind {
                 RelKind::Movei => {
-                    // low half-word then high half-word, each big-endian
-                    let lo = (val & 0xFFFF) as u16;
-                    let hi = (val >> 16) as u16;
-                    put_be16(&mut obj.bytes, off, lo)?;
-                    put_be16(&mut obj.bytes, off + 2, hi)?;
+                    put_be16(&mut obj.bytes, off, (val & 0xFFFF) as u16)?;
+                    put_be16(&mut obj.bytes, off + 2, (val >> 16) as u16)?;
                 }
                 RelKind::Long => {
                     put_be16(&mut obj.bytes, off, (val >> 16) as u16)?;
@@ -112,16 +205,26 @@ pub fn link(objects: &[Object]) -> Result<Image, LinkError> {
         }
     }
 
-    // 3. lay out at each object's org into one sparse image
-    let base = patched.iter().map(|o| o.org).min().unwrap_or(0);
-    let end = patched.iter().map(|o| o.org + o.bytes.len() as u32).max().unwrap_or(base);
+    // 4. lay out at the placed addresses into one sparse image.
+    let base = placed.iter().copied().min().unwrap_or(0);
+    let end = placed
+        .iter()
+        .zip(&patched)
+        .map(|(&p, o)| p + o.bytes.len() as u32)
+        .max()
+        .unwrap_or(base);
     let mut bytes = vec![0u8; (end - base) as usize];
-    for obj in &patched {
-        let at = (obj.org - base) as usize;
+    for (i, obj) in patched.iter().enumerate() {
+        let at = (placed[i] - base) as usize;
         bytes[at..at + obj.bytes.len()].copy_from_slice(&obj.bytes);
     }
 
-    Ok(Image { base, bytes, symbols: globals, entry: base })
+    let entry = layout
+        .entry
+        .as_ref()
+        .and_then(|e| globals.get(e).copied())
+        .unwrap_or(base);
+    Ok(Image { base, bytes, symbols: globals, entry })
 }
 
 fn put_be16(b: &mut [u8], off: usize, v: u16) -> Result<(), LinkError> {

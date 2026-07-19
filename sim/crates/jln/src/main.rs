@@ -7,7 +7,16 @@
 
 use std::process::ExitCode;
 
-use jln::{link, parse_objects};
+use jln::parse_objects;
+
+fn parse_num(s: &str) -> Option<u32> {
+    let s = s.trim();
+    if let Some(h) = s.strip_prefix("0x").or_else(|| s.strip_prefix('$')) {
+        u32::from_str_radix(h, 16).ok()
+    } else {
+        s.parse().ok()
+    }
+}
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -27,10 +36,40 @@ fn main() -> ExitCode {
     let mut output = None;
     let mut map = false;
     let mut it = args.iter();
+    let mut layout = jln::Layout::default();
     while let Some(a) = it.next() {
         match a.as_str() {
             "-o" => output = it.next().cloned(),
             "--map" => map = true,
+            "--base" | "-Ttext" => {
+                // relocating link: place objects sequentially from this address
+                match it.next().and_then(|s| parse_num(s)) {
+                    Some(v) => layout.base = Some(v),
+                    None => {
+                        eprintln!("jln: --base needs an address");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            "--align" => {
+                if let Some(v) = it.next().and_then(|s| parse_num(s)) {
+                    layout.align = v.max(1);
+                }
+            }
+            "--entry" | "-e" => layout.entry = it.next().cloned(),
+            "--defsym" => {
+                // NAME=ADDR, or NAME=@end for the end of the placed image
+                if let Some(def) = it.next() {
+                    if let Some((name, val)) = def.split_once('=') {
+                        let dv = if val.trim() == "@end" {
+                            jln::DefVal::ImageEnd
+                        } else {
+                            jln::DefVal::Addr(parse_num(val).unwrap_or(0))
+                        };
+                        layout.defsyms.push((name.trim().to_string(), dv));
+                    }
+                }
+            }
             s if s.starts_with('-') => {
                 eprintln!("jln: unknown option `{s}`");
                 return ExitCode::FAILURE;
@@ -62,7 +101,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let img = match link(&objects) {
+    let img = match jln::link_with(&objects, &layout) {
         Ok(i) => i,
         Err(e) => {
             eprintln!("jln: {e}");
