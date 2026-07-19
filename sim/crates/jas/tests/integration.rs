@@ -67,6 +67,60 @@ fn poll_kernel(cmd_addr: u32, mark: u32) -> String {
 }
 
 #[test]
+fn loadp_hidata_is_stale_inside_the_load_shadow() {
+    // COBWEB_GAP §"corroborating divergence": G_HIDATA is NOT scoreboarded on
+    // silicon — reading it soon after LOADP does not stall, it returns the STALE
+    // value (a kernel that did so rendered garbage on hardware while jsim, which
+    // landed it instantly, looked correct). Needs a timed profile to observe.
+    let src = "        .gpu\n\
+         \x20       movei #$00F02118,r2\n\
+         \x20       movei #$AAAAAAAA,r1\n\
+         \x20       store r1,(r2)\n\
+         \x20       movei #$00100020,r3\n\
+         \x20       movei #$11112222,r4\n\
+         \x20       store r4,(r3)\n\
+         \x20       movei #$00100024,r5\n\
+         \x20       movei #$33334444,r6\n\
+         \x20       store r6,(r5)\n\
+         \x20       loadp (r3),r7\n\
+         \x20       load (r2),r8\n\
+         \x20       nop\n\
+         \x20       nop\n\
+         \x20       movei #$00100000,r9\n\
+         \x20       store r8,(r9)\n\
+         \x20       .rept 24\n\
+         \x20       nop\n\
+         \x20       .endr\n\
+         \x20       load (r2),r10\n\
+         \x20       nop\n\
+         \x20       nop\n\
+         \x20       movei #$00100004,r11\n\
+         \x20       store r10,(r11)\n";
+    let out = assemble(src, &Options { check_hazards: false, ..Default::default() });
+    assert_eq!(out.errors(), 0, "assembly errors: {:#?}", out.diags);
+    let mut bus = Bus::new();
+    for (i, b) in out.bytes.iter().enumerate() {
+        bus.write8(mem::G_RAM + i as u32, *b);
+    }
+    bus.write32(mem::G_PC, mem::G_RAM);
+    bus.write32(mem::G_CTRL, mem::RISCGO);
+    let mut gpu = Risc::new(RiscKind::Gpu);
+    gpu.fidelity = jag_core::risc::Fidelity::Silicon;
+    gpu.run(&mut bus, 4000);
+
+    assert_eq!(
+        bus.read32(0x0010_0000),
+        0xAAAA_AAAA,
+        "G_HIDATA read inside the LOADP shadow must see the STALE value (silicon does not scoreboard it)"
+    );
+    assert_eq!(
+        bus.read32(0x0010_0004),
+        0x1111_2222,
+        "G_HIDATA must settle to the phrase's high long once the load lands"
+    );
+}
+
+#[test]
 fn storep_loadp_phrase_byte_order() {
     // COBWEB_BUG_storep_loadp_byteorder (hardware-confirmed): the Jaguar is
     // big-endian, so a phrase's HIGH long (G_HIDATA) lands at the LOWER address

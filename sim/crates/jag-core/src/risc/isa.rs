@@ -349,7 +349,9 @@ pub(super) fn execute(core: &mut Risc, bus: &mut Bus, iw: u16) {
             } else {
                 // LOADP — 64-bit, big-endian: the HIGH long is at the lower
                 // address. hidata (bits 63..32) ← [A]; Rd (bits 31..0) ← [A+4].
-                core.hidata = bus.read32(s);
+                // The high long lands LATE and unscoreboarded (see
+                // Risc::hidata_now) — stage it rather than applying instantly.
+                core.hidata_next = bus.read32(s);
                 core.set_reg(b, r2, bus.read32(s.wrapping_add(4)));
             }
         }
@@ -385,7 +387,8 @@ pub(super) fn execute(core: &mut Risc, bus: &mut Bus, iw: u16) {
             } else {
                 // STOREP — 64-bit, big-endian: the HIGH long lands at the lower
                 // address. hidata (bits 63..32) → [A]; Rd (bits 31..0) → [A+4].
-                bus.write32(s, core.hidata);
+                let hi = core.hidata_now(); // stale if still in a LOADP shadow
+                bus.write32(s, hi);
                 bus.write32(s.wrapping_add(4), d);
             }
         }

@@ -68,7 +68,16 @@ pub struct Risc {
     pub ctrl: u32,
     pub div_remainder: u32,
     pub div_offset: bool, // 16.16 divide mode (DIV_OFFSET)
-    pub hidata: u32,      // G_HIDATA for LOADP/STOREP (GPU)
+    /// G_HIDATA for LOADP/STOREP (GPU) — the *settled* value.
+    pub hidata: u32,
+    /// A LOADP's high long in flight, and the tick it becomes visible. Unlike a
+    /// register result, G_HIDATA is NOT scoreboarded on hardware: reading it
+    /// inside the load shadow does not stall, it returns the STALE value (a
+    /// kernel that reads G_HIDATA two instructions after LOADP renders garbage
+    /// on silicon while jsim, which landed it instantly, looked fine). Modeled
+    /// with the same load latency the register result gets.
+    pub hidata_next: u32,
+    pub hidata_ready: u64,
     pub modulo: u32,      // D_MOD for ADDQMOD/SUBQMOD (DSP)
     pub mac: i64,         // MAC accumulator (40-bit on DSP, modeled as i64)
     pub mtxc: u32,
@@ -116,6 +125,8 @@ impl Risc {
             div_remainder: 0,
             div_offset: false,
             hidata: 0,
+            hidata_next: 0,
+            hidata_ready: 0,
             modulo: 0,
             mac: 0,
             mtxc: 0,
@@ -143,6 +154,8 @@ impl Risc {
         self.div_remainder = 0;
         self.div_offset = false;
         self.hidata = 0;
+        self.hidata_next = 0;
+        self.hidata_ready = 0;
         self.modulo = 0;
         self.mac = 0;
         self.mtxc = 0;
@@ -156,6 +169,18 @@ impl Risc {
         self.prev_was_jump = false;
         self.budget_debt = 0;
         // fidelity is a harness setting, not machine state: survives reset.
+    }
+
+    /// G_HIDATA as currently *visible*. A LOADP's high long lands with the same
+    /// latency as its register half, but unlike a register it is NOT
+    /// scoreboarded — reading inside the shadow does not stall, it just sees the
+    /// previous (stale) value, exactly as silicon does.
+    #[inline]
+    pub fn hidata_now(&mut self) -> u32 {
+        if self.cycles >= self.hidata_ready {
+            self.hidata = self.hidata_next;
+        }
+        self.hidata
     }
 
     /// Is `addr` inside this core's local SRAM?
@@ -285,7 +310,7 @@ impl Risc {
                 0x00 => self.flags,
                 0x10 => self.pc,
                 0x14 => self.ctrl,
-                0x18 if !self.kind.is_dsp() => self.hidata,
+                0x18 if !self.kind.is_dsp() => self.hidata_now(),
                 0x18 => self.modulo,
                 0x1C => self.div_remainder,
                 _ => self.win_r32(bus, addr),
@@ -316,7 +341,11 @@ impl Risc {
                         self.running = false;
                     }
                 }
-                0x18 if !self.kind.is_dsp() => self.hidata = val,
+                0x18 if !self.kind.is_dsp() => {
+                    self.hidata = val;
+                    self.hidata_next = val;
+                    self.hidata_ready = 0;
+                }
                 0x18 => self.modulo = val,
                 0x1C => self.div_offset = val & mem::DIV_OFFSET != 0,
                 _ => self.win_w32(bus, addr, val),
@@ -575,6 +604,12 @@ impl Risc {
                     ),
                 };
                 self.pipe.push_slow(id, end - 1 + lat, kind, newv, old);
+                // LOADP's high long (G_HIDATA) lands with the same latency as
+                // the register half, but unscoreboarded — a read before this
+                // tick sees the stale value, as on silicon.
+                if op == 42 && is_gpu {
+                    self.hidata_ready = end - 1 + lat;
+                }
             } else if !matches!(op, 34 | 35 | 36 | 37 | 38 | 51 | 19) {
                 // ALU-class results are written at cycle 3: one bubble for an
                 // immediate consumer. MOVE-class (cycle 2) never stalls.
