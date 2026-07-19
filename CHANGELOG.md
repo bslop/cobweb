@@ -31,6 +31,12 @@ that had been silently dropping conditional blocks is fixed.
 
 ### jsim — the cycle-honest simulator
 
+- **STOREP/LOADP phrase long order corrected** (big-endian: the high long,
+  G_HIDATA, belongs at the *lower* address; jsim had both ops swapped). A silent
+  bug — phrase transactions round-tripped fine in jsim but ran transposed on
+  silicon (hardware-confirmed on Skunkboard: gpu_geotex vertices came out with
+  x/y swapped). Unblocks verifying `storep`/`loadp` bus-traffic optimizations in
+  jsim. *(commit f5197f3)*
 - **Blitter XADDINC is a real 16.16 affine DDA** (was approximated as a flat +1
   step), so textured spans sample the atlas correctly. *(commit 0d0a2fc)*
 - **GPU/DSP restart on re-kick.** A core kicked after its boot self-test was
