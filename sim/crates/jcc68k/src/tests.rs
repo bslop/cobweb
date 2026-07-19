@@ -535,3 +535,34 @@ fn relocating_link_assigns_addresses() {
                 int main() { return dbl(20) + inc(1); }";
     assert_eq!(run_autoplaced(main, &[dbl, inc]), 42);
 }
+
+// ── register eval stack: deep nesting (spill) + call survival ────────────────
+
+#[test]
+fn deep_expression_spills_correctly() {
+    // 10-deep left-nested sum forces the data eval stack past d2–d7 into the
+    // memory spill path; the result must still be exact.
+    let src = "int main() { int a=1,b=2,c=3,d=4,e=5,f=6,g=7,h=8,i=9,j=10;\
+               return ((((((((a+b)+c)+d)+e)+f)+g)+h)+i)+j; }";
+    assert_eq!(run(src), 55);
+}
+
+#[test]
+fn calls_inside_expression_preserve_temps() {
+    // Operands held in callee-saved temp registers must survive the calls in
+    // sibling sub-expressions. id(x)=x, so this is 3*100 + 4*100 = 700 with the
+    // held partial products interleaved with calls.
+    let src = "int id(int x){ return x; }\
+               int main(){ return id(3)*id(100) + id(4)*id(100); }";
+    assert_eq!(run(src), 700);
+}
+
+#[test]
+fn nested_assign_and_incdec_in_expr() {
+    // Assign holds the dest address in an address temp across the rhs eval;
+    // post-inc holds the old value across the store. Sequenced to avoid relying
+    // on operand evaluation order.
+    let src = "int main(){ int x=10, y=20; x = y + 3; int p = y++; return x*1000 + y*10 + p; }";
+    // x = 23; p = 20 (old y), y = 21  →  23000 + 210 + 20 = 23230
+    assert_eq!(run(src), 23 * 1000 + 21 * 10 + 20);
+}

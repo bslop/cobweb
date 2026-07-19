@@ -27,7 +27,19 @@ pub struct Gen {
     ret_label: String,
     break_labels: Vec<String>,
     cont_labels: Vec<String>,
+    /// Evaluation-stack depth for data temporaries (operands of an outer op held
+    /// while an inner one is evaluated). Values live in callee-saved d2–d7 (which
+    /// survive calls and runtime helpers), spilling to the stack past depth 6.
+    dtemp: usize,
+    /// Same, for address temporaries — callee-saved a2–a5, spilling past depth 4.
+    atemp: usize,
 }
+
+/// Callee-saved data registers used as the expression eval stack (they survive
+/// function calls and the runtime helpers, which all preserve d2–d7).
+const DTEMP_REGS: &[&str] = &["d2", "d3", "d4", "d5", "d6", "d7"];
+/// Callee-saved address registers for held lvalue addresses.
+const ATEMP_REGS: &[&str] = &["a2", "a3", "a4", "a5"];
 
 /// A short, stable per-unit tag from the program's strings and symbol names, so
 /// two distinct translation units don't emit colliding string-pool labels.
@@ -57,6 +69,8 @@ pub fn generate(prog: &Program) -> Result<String, String> {
         ret_label: String::new(),
         break_labels: Vec::new(),
         cont_labels: Vec::new(),
+        dtemp: 0,
+        atemp: 0,
     };
     for gl in &prog.globals {
         g.globals.insert(gl.name.clone(), gl.ty.clone());
@@ -84,6 +98,41 @@ impl Gen {
     }
     fn lbl(&mut self, s: &str) {
         writeln!(self.out, "{s}:").unwrap();
+    }
+
+    /// Save D0 (an operand of an outer expression) onto the register eval stack,
+    /// returning the slot spelling. Uses a callee-saved data register while any
+    /// remain, else the machine stack. Pair with [`pop_dtemp_to`].
+    fn push_dtemp(&mut self) -> String {
+        let slot = DTEMP_REGS.get(self.dtemp).map(|r| r.to_string()).unwrap_or_else(|| "-(a7)".into());
+        self.line(&format!("move.l d0,{slot}"));
+        self.dtemp += 1;
+        slot
+    }
+    /// Restore a value saved by [`push_dtemp`] into `dst` (usually `d1`).
+    fn pop_dtemp_to(&mut self, slot: &str, dst: &str) {
+        self.dtemp -= 1;
+        if slot == "-(a7)" {
+            self.line(&format!("move.l (a7)+,{dst}"));
+        } else {
+            self.line(&format!("move.l {slot},{dst}"));
+        }
+    }
+    /// Save A0 (a held lvalue address) onto the address eval stack.
+    fn push_atemp(&mut self) -> String {
+        let slot = ATEMP_REGS.get(self.atemp).map(|r| r.to_string()).unwrap_or_else(|| "-(a7)".into());
+        self.line(&format!("move.l a0,{slot}"));
+        self.atemp += 1;
+        slot
+    }
+    /// Restore an address saved by [`push_atemp`] into `dst` (usually `a0`).
+    fn pop_atemp_to(&mut self, slot: &str, dst: &str) {
+        self.atemp -= 1;
+        if slot == "-(a7)" {
+            self.line(&format!("move.l (a7)+,{dst}"));
+        } else {
+            self.line(&format!("move.l {slot},{dst}"));
+        }
     }
 
     fn emit_prelude(&mut self) {
@@ -327,24 +376,23 @@ impl Gen {
             }
             ExprK::Assign(lhs, rhs) => {
                 self.gen_addr(lhs)?;
-                self.line("move.l a0,-(a7)"); // save dest addr
+                let slot = self.push_atemp(); // hold dest addr in a callee-saved areg
                 self.gen_expr(rhs)?; // value in D0
                 self.cast(&rhs.ty, &lhs.ty); // implicit conversion (int↔fixed, widen)
-                self.line("move.l (a7)+,a0"); // restore dest
+                self.pop_atemp_to(&slot, "a0"); // restore dest
                 self.store(&lhs.ty);
                 // result of assignment is the stored value (already in D0)
             }
             ExprK::PostIncDec(lhs, delta) => {
                 self.gen_addr(lhs)?;
-                self.line("move.l a0,-(a7)");
+                let aslot = self.push_atemp(); // hold dest addr
                 self.load(&lhs.ty); // old value in D0
-                self.line("move.l d0,-(a7)"); // save old value
+                let dslot = self.push_dtemp(); // hold old value (the result)
                 self.load_imm_into("d1", *delta as i32);
                 self.line("add.l d1,d0");
-                self.line("move.l 4(a7),a0"); // dest addr
+                self.pop_atemp_to(&aslot, "a0"); // dest addr
                 self.store(&lhs.ty);
-                self.line("move.l (a7)+,d0"); // result = old value
-                self.line("addq.l #4,a7"); // drop saved addr
+                self.pop_dtemp_to(&dslot, "d0"); // result = old value
             }
             ExprK::Comma(a, b) => {
                 self.gen_expr(a)?;
@@ -391,11 +439,11 @@ impl Gen {
                 self.lbl(&format!(".Lend_{lend}"));
             }
             ExprK::Binary(op, a, b) => {
-                // rhs first, push; lhs into D0; rhs into D1
+                // rhs first, held on the register eval stack; lhs into D0; rhs → D1
                 self.gen_expr(b)?;
-                self.line("move.l d0,-(a7)");
+                let slot = self.push_dtemp();
                 self.gen_expr(a)?;
-                self.line("move.l (a7)+,d1"); // D0=lhs, D1=rhs
+                self.pop_dtemp_to(&slot, "d1"); // D0=lhs, D1=rhs
                 self.gen_binop(*op, &a.ty, &b.ty);
             }
             ExprK::Call(callee, args) => {
