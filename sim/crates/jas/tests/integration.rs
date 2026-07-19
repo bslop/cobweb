@@ -22,6 +22,131 @@ fn run_gpu(src: &str) -> (Bus, jas::Assembled) {
     (bus, out)
 }
 
+/// Assemble a DSP program at Jerry's D_RAM and stage it started (RISCGO), so the
+/// caller can `dsp.run(&mut bus, n)` in chunks and inject "68k" bus writes in
+/// between — the shape of a resident poll-loop / mailbox handshake.
+fn dsp_staged(src: &str) -> (Bus, Risc) {
+    let opts = Options { target: Target::Dsp, org: mem::D_RAM, ..Default::default() };
+    let out = assemble(src, &opts);
+    assert_eq!(out.errors(), 0, "assembly errors: {:#?}", out.diags);
+    let mut bus = Bus::new();
+    for (i, b) in out.bytes.iter().enumerate() {
+        bus.write8(mem::D_RAM + i as u32, *b);
+    }
+    bus.write32(mem::D_PC, mem::D_RAM);
+    bus.write32(mem::D_CTRL, mem::RISCGO);
+    (bus, Risc::new(RiscKind::Dsp))
+}
+
+/// A resident DSP poll loop over a mailbox at `cmd_addr`: spin until the word is
+/// nonzero, then write it to the `mark` address (proving 68k→DSP visibility of
+/// the command) and clear the mailbox to 0 (proving DSP→68k visibility of the
+/// acknowledgement), then halt-spin. Mirrors dsp_pose.das's main_loop.
+fn poll_kernel(cmd_addr: u32, mark: u32) -> String {
+    format!(
+        "        .dsp\n\
+         main_loop:\n\
+         \x20       movei #${cmd_addr:08X},r0\n\
+         \x20       load (r0),r1\n\
+         \x20       nop\n\
+         \x20       nop\n\
+         \x20       movei #main_loop,r2\n\
+         \x20       cmpq #0,r1\n\
+         \x20       jump EQ,(r2)\n\
+         \x20       nop\n\
+         \x20       nop\n\
+         \x20       movei #${mark:08X},r3\n\
+         \x20       store r1,(r3)\n\
+         \x20       moveq #0,r4\n\
+         \x20       store r4,(r0)\n\
+         done:   movei #done,r5\n\
+         \x20       jump T,(r5)\n\
+         \x20       nop\n\
+         \x20       nop\n"
+    )
+}
+
+#[test]
+fn dsp_cmd_mailbox_jerry_sram() {
+    // COBWEB_ISSUE_dsp_dcmd_unverified: the 68k↔DSP D_CMD mailbox in Jerry SRAM.
+    // A resident DSP poll loop must observe a command the 68k writes into Jerry
+    // SRAM ($F1C338, the real dsp_pose CMD_D), dispatch on it, and clear it
+    // visibly back to the 68k — no stale/cached read in either direction.
+    const CMD_D: u32 = 0x00F1_C338; // Jerry SRAM
+    const MARK: u32 = 0x0000_1000; // DRAM marker
+    let (mut bus, mut dsp) = dsp_staged(&poll_kernel(CMD_D, MARK));
+
+    // The DSP polls with no command pending: it must NOT dispatch.
+    dsp.run(&mut bus, 300);
+    assert_eq!(bus.read32(MARK), 0, "DSP dispatched with no command pending");
+    assert!(dsp.running, "resident DSP loop should still be running");
+
+    // The 68k writes the command into Jerry SRAM while the DSP is mid-poll.
+    bus.write32(CMD_D, 1);
+    dsp.run(&mut bus, 800);
+
+    assert_eq!(bus.read32(MARK), 1, "68k→DSP: the DSP never observed the command");
+    assert_eq!(bus.read32(CMD_D), 0, "DSP→68k: the DSP's clear is not visible");
+}
+
+#[test]
+fn dsp_cmd_mailbox_dram() {
+    // Same handshake through a DRAM mailbox (some handshakes use dsp_mailbox in
+    // DRAM); 68k↔DSP visibility must hold there too, not just in Jerry SRAM.
+    const CMD: u32 = 0x0000_2000; // DRAM mailbox
+    const MARK: u32 = 0x0000_1000; // DRAM marker
+    let (mut bus, mut dsp) = dsp_staged(&poll_kernel(CMD, MARK));
+
+    dsp.run(&mut bus, 300);
+    assert_eq!(bus.read32(MARK), 0, "DSP dispatched with no command pending");
+
+    bus.write32(CMD, 2);
+    dsp.run(&mut bus, 800);
+
+    assert_eq!(bus.read32(MARK), 2, "68k→DSP: DRAM command not observed");
+    assert_eq!(bus.read32(CMD), 0, "DSP→68k: DRAM clear not visible");
+}
+
+#[test]
+fn dsp_mailbox_serviced_while_68k_stopped() {
+    // COBWEB_ISSUE_dsp_dcmd_unverified, the STOP scenario: the 68k writes the
+    // command and parks itself in STOP; the resident DSP must service the mailbox
+    // and clear it CONCURRENTLY, driven by the scheduler — not by the 68k running.
+    // The scheduler gives the DSP its budget every step even while the CPU sleeps
+    // (a stopped 68k still advances time at 4 cyc/step), so the co-transform makes
+    // progress and the clear is visible without the 68k executing an instruction.
+    const CMD_D: u32 = 0x00F1_C338;
+    const MARK: u32 = 0x0000_1000;
+    let mut jag = jag_core::Jaguar::new();
+    jag.reset_to_ssp(0x4000, mem::DRAM_END);
+
+    // Stage the resident DSP poll kernel and start it.
+    let opts = Options { target: Target::Dsp, org: mem::D_RAM, ..Default::default() };
+    let out = assemble(&poll_kernel(CMD_D, MARK), &opts);
+    assert_eq!(out.errors(), 0, "assembly errors: {:#?}", out.diags);
+    for (i, b) in out.bytes.iter().enumerate() {
+        jag.bus.write8(mem::D_RAM + i as u32, *b);
+    }
+    jag.bus.write32(mem::D_PC, mem::D_RAM);
+    jag.bus.write32(mem::D_CTRL, mem::RISCGO);
+
+    // The 68k has issued the command and gone to sleep in STOP.
+    jag.bus.write32(CMD_D, 1);
+    jag.cpu.stopped = true;
+
+    // Drive the scheduler; the CPU stays asleep, the DSP does the work.
+    for _ in 0..4000 {
+        jag.step_instruction();
+        if jag.bus.read32(CMD_D) == 0 {
+            break;
+        }
+    }
+
+    assert!(jag.cpu.stopped, "the 68k should have stayed asleep in STOP");
+    assert_eq!(jag.bus.read32(MARK), 1, "DSP did not service the mailbox while the 68k slept");
+    assert_eq!(jag.bus.read32(CMD_D), 0, "DSP→68k: the clear is not visible after servicing");
+}
+
 fn errors_of(src: &str) -> Vec<String> {
     let out = assemble(src, &Options::default());
     out.diags
