@@ -61,14 +61,18 @@ fn target_of(t: RiscKind) -> jas::Target {
     }
 }
 
-/// Assemble source; None if it does not assemble clean (errors).
-fn assemble(src: &str, target: RiscKind) -> Option<(Vec<u8>, u32)> {
+/// Assemble source; None if it does not assemble clean (errors). With
+/// `allow_hazards`, the static hazard pass is skipped — pre-existing (and any
+/// transform-introduced) hazards no longer block assembly; the jsim Silicon
+/// equivalence certificate remains the safety guarantee.
+fn assemble(src: &str, target: RiscKind, allow_hazards: bool) -> Option<(Vec<u8>, u32)> {
     let opts = jas::Options {
         target: target_of(target),
         org: match target {
             RiscKind::Gpu => 0xF0_3000,
             RiscKind::Dsp => 0xF1_B000,
         },
+        check_hazards: !allow_hazards,
         ..Default::default()
     };
     let out = jas::assemble(src, &opts);
@@ -154,7 +158,16 @@ fn fillable(m: &str) -> bool {
 /// Optimize `src`. Greedy: for each `... <fill> ; jump ; nop ...`, try moving
 /// `<fill>` into the slot, verify, keep on success.
 pub fn optimize(src: &str, target: RiscKind) -> OptResult {
-    let (base_bytes, org) = match assemble(src, target) {
+    optimize_opts(src, target, false)
+}
+
+/// Like [`optimize`], with `allow_input_hazards`: assemble past pre-existing
+/// (benign, hardware-correct) hazards so the delay-slot fill can still run. Only
+/// the jsim equivalence certificate gates the output — a transform that changes
+/// behavior (including one that introduces a harmful hazard, which jsim models at
+/// Silicon fidelity) is still rejected.
+pub fn optimize_opts(src: &str, target: RiscKind, allow_input_hazards: bool) -> OptResult {
+    let (base_bytes, org) = match assemble(src, target, allow_input_hazards) {
         Some(x) => x,
         None => {
             // don't optimize code that doesn't assemble; return unchanged
@@ -220,7 +233,7 @@ pub fn optimize(src: &str, target: RiscKind) -> OptResult {
             let cand_src = cand.join("\n");
 
             let line_no = ji + 1;
-            match verify(&cand_src, target, org, base_fp.as_ref()) {
+            match verify(&cand_src, target, org, base_fp.as_ref(), allow_input_hazards) {
                 Ok(()) => {
                     lines = cand;
                     transforms.push(Transform {
@@ -245,7 +258,8 @@ pub fn optimize(src: &str, target: RiscKind) -> OptResult {
     }
 
     let new_src = lines.join("\n");
-    let bytes_after = assemble(&new_src, target).map(|(b, _)| b.len()).unwrap_or(bytes_before);
+    let bytes_after =
+        assemble(&new_src, target, allow_input_hazards).map(|(b, _)| b.len()).unwrap_or(bytes_before);
     OptResult { source: new_src, bytes_before, bytes_after, transforms }
 }
 
@@ -263,8 +277,9 @@ fn verify(
     target: RiscKind,
     _org: u32,
     base_fp: Option<&jtest::RunResult>,
+    allow_hazards: bool,
 ) -> Result<(), String> {
-    let (bytes, org) = assemble(cand_src, target)
+    let (bytes, org) = assemble(cand_src, target, allow_hazards)
         .ok_or_else(|| "candidate did not assemble (jas rejected it — hazard or range)".to_string())?;
     let fp = fingerprint(bytes, org, target).ok_or_else(|| "candidate did not run".to_string())?;
     match base_fp {
@@ -300,7 +315,7 @@ mod tests {
         let res = optimize(&src, RiscKind::Gpu);
         // At least the fill should be attempted; the result must still be
         // correct (15 at $100000) — the certificate guarantees it.
-        let (bytes, org) = assemble(&res.source, RiscKind::Gpu).unwrap();
+        let (bytes, org) = assemble(&res.source, RiscKind::Gpu, false).unwrap();
         let r = run(&Spec { bytes, target: RiscKind::Gpu, org, budget: 100_000, capture: (0x0010_0000, 4), fidelity: Fidelity::Silicon });
         assert_eq!(u32::from_be_bytes([r.captured[0], r.captured[1], r.captured[2], r.captured[3]]), 15);
     }
@@ -331,7 +346,7 @@ mod tests {
         // the only fill candidate is neg -> skip's (labelled) slot: must be refused
         assert_eq!(res.accepted(), 0, "jopt filled a branch-reachable jump slot (unsound!)");
         // and behaviour is preserved: positive value stays +7
-        let (bytes, org) = assemble(&res.source, RiscKind::Gpu).unwrap();
+        let (bytes, org) = assemble(&res.source, RiscKind::Gpu, false).unwrap();
         let r = run(&Spec { bytes, target: RiscKind::Gpu, org, budget: 50_000, capture: (0x0010_0000, 4), fidelity: Fidelity::Silicon });
         assert_eq!(u32::from_be_bytes([r.captured[0], r.captured[1], r.captured[2], r.captured[3]]), 7,
             "positive value was wrongly negated");
@@ -352,8 +367,8 @@ mod tests {
              \x20       store r1,(r3)\n{STOP}"
         );
         let res = optimize(&src, RiscKind::Gpu);
-        let base = assemble(&src, RiscKind::Gpu).unwrap();
-        let opt = assemble(&res.source, RiscKind::Gpu).unwrap();
+        let base = assemble(&src, RiscKind::Gpu, false).unwrap();
+        let opt = assemble(&res.source, RiscKind::Gpu, false).unwrap();
         let a = run(&Spec { bytes: base.0, target: RiscKind::Gpu, org: base.1, budget: 100_000, capture: (0x0010_0000, 4096), fidelity: Fidelity::Silicon });
         let b = run(&Spec { bytes: opt.0, target: RiscKind::Gpu, org: opt.1, budget: 100_000, capture: (0x0010_0000, 4096), fidelity: Fidelity::Silicon });
         assert!(compare(&a, &b).is_empty(), "jopt changed behavior — certificate should have prevented this");

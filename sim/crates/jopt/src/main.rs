@@ -9,7 +9,6 @@
 use std::process::ExitCode;
 
 use jag_core::RiscKind;
-use jopt::optimize;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -28,12 +27,16 @@ fn main() -> ExitCode {
     let mut input = None;
     let mut output = None;
     let mut target = RiscKind::Gpu;
+    let mut allow_input_hazards = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "-o" => output = it.next().cloned(),
             "--dsp" => target = RiscKind::Dsp,
             "--gpu" => target = RiscKind::Gpu,
+            // optimize past pre-existing (benign) input hazards; the jsim
+            // equivalence certificate still guarantees the output is safe.
+            "--allow-input-hazards" | "--no-input-hazard-check" => allow_input_hazards = true,
             s if s.starts_with('-') => {
                 eprintln!("jopt: unknown option `{s}`");
                 return ExitCode::FAILURE;
@@ -54,7 +57,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let res = optimize(&src, target);
+    let res = jopt::optimize_opts(&src, target, allow_input_hazards);
 
     for t in &res.transforms {
         let mark = if t.accepted { "✓ accepted" } else { "· rejected" };
