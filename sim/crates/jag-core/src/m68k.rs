@@ -12,6 +12,12 @@
 use crate::bus::Bus;
 use crate::debug::Debugger;
 
+/// Extra 68k cycles per external bus cycle, in TENTHS. Fractional because the
+/// hardware value falls between 2 and 3 and an integer constant leaves ~2% on
+/// the table; the remainder is carried in `bus_debt` so per-instruction
+/// truncation cannot accumulate a bias.
+const M68K_BUS_WAIT_X10: u32 = 29;
+
 // Condition-code register bits (in the low byte of SR).
 const FLAG_C: u16 = 1 << 0;
 const FLAG_V: u16 = 1 << 1;
@@ -80,6 +86,8 @@ pub struct M68k {
     /// `STOP` halted the CPU until an interrupt arrives.
     pub stopped: bool,
     pub cycles: u64,
+    /// Sub-cycle remainder of the external-bus wait charge (tenths).
+    bus_debt: u32,
     pub instret: u64,
     /// Set when an unrecognized opcode is hit, for the debugger: (pc, opcode).
     pub last_illegal: Option<u32>,
@@ -107,6 +115,7 @@ impl M68k {
             pending_level: 0,
             stopped: false,
             cycles: 0,
+            bus_debt: 0,
             instret: 0,
             last_illegal: None,
             last_illegal_op: 0,
@@ -220,8 +229,34 @@ impl M68k {
         v
     }
 
+/// Extra 68k cycles per external bus cycle. The 68000 has no cache: every
+/// fetch and every operand goes off-chip through Tom's memory controller, and
+/// jsim was charging textbook 68000 timings as if that memory were free.
+///
+/// HARDWARE-CALIBRATED against `calib` probe `m68kbus` (Skunkboard, 2026-07-19):
+/// a fixed 68k DRAM read stream completes 8279 blocks in 30 fields on silicon
+/// vs 12923 in jsim — the real 68000 is 1.56x slower. Two probes of different
+/// shape (work-bounded and time-bounded) agree to within 1%.
+///
+/// Measured with the OP idle AND saturating scan-out: the delta was +2.5% on
+/// silicon vs +1.5% in jsim, i.e. the Object Processor does NOT measurably
+/// contend with the 68000. So this is a flat per-access cost, not contention —
+/// which is why it is a constant here and not a bus-arbitration model.
+
     /// Execute one instruction (or take a pending interrupt). Returns cycles.
+    /// Charges `M68K_BUS_WAIT` per external bus cycle on top of the textbook
+    /// instruction timing.
     pub fn step(&mut self, bus: &mut Bus, dbg: &mut Debugger) -> u32 {
+        bus.m68k_bus_cycles = 0;
+        let c = self.step_uncharged(bus, dbg);
+        self.bus_debt += std::mem::take(&mut bus.m68k_bus_cycles) * M68K_BUS_WAIT_X10;
+        let extra = self.bus_debt / 10;
+        self.bus_debt -= extra * 10;
+        self.cycles += extra as u64;
+        c + extra
+    }
+
+    fn step_uncharged(&mut self, bus: &mut Bus, dbg: &mut Debugger) -> u32 {
         // Service interrupts first.
         if self.pending_level != 0 {
             let lvl = self.pending_level;

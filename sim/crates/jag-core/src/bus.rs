@@ -148,6 +148,12 @@ pub struct Bus {
     /// taxing GPU/DSP external page-hit accesses (row thrash; see timing.rs).
     /// Maintained by the scheduler; defaults to true (games run the 68k).
     pub m68k_on_bus: bool,
+    /// Bus cycles consumed by the CURRENT 68000 instruction. Zeroed by
+    /// `M68k::step` before each instruction and charged back after, so the
+    /// RISCs bumping it between steps is harmless (the scheduler runs the 68k
+    /// instruction to completion before granting GPU/DSP budget). Hardware-
+    /// calibrated against `calib` probe `m68kbus` — see M68K_BUS_WAIT.
+    pub m68k_bus_cycles: u32,
     /// 2 MB main DRAM.
     pub dram: Box<[u8]>,
     /// Cartridge ROM image (empty if none loaded).
@@ -178,6 +184,7 @@ impl Bus {
     pub fn new() -> Self {
         Bus {
             m68k_on_bus: true,
+            m68k_bus_cycles: 0,
             dram: vec![0u8; mem::DRAM_SIZE].into_boxed_slice(),
             cart: Vec::new(),
             bootrom: Vec::new(),
@@ -200,6 +207,7 @@ impl Bus {
 
     #[inline]
     pub fn read8(&mut self, addr: u32) -> u8 {
+        self.m68k_bus_cycles += 1;
         self.access_count += 1;
         let a = addr & ADDR_MASK;
         if mem::is_dram(a) {
@@ -222,6 +230,7 @@ impl Bus {
 
     #[inline]
     pub fn write8(&mut self, addr: u32, v: u8) {
+        self.m68k_bus_cycles += 1;
         self.access_count += 1;
         let a = addr & ADDR_MASK;
         if mem::is_dram(a) {
@@ -241,9 +250,11 @@ impl Bus {
     pub fn read16(&mut self, addr: u32) -> u16 {
         let a = addr & ADDR_MASK;
         if mem::is_dram(a) && a + 1 < mem::DRAM_END {
+            self.m68k_bus_cycles += 1;
             let i = a as usize;
             u16::from_be_bytes([self.dram[i], self.dram[i + 1]])
         } else if mem::is_tom(a) {
+            self.m68k_bus_cycles += 1;
             self.tom_read16(a)
         } else {
             ((self.read8(a) as u16) << 8) | self.read8(a.wrapping_add(1)) as u16
@@ -254,6 +265,7 @@ impl Bus {
     pub fn write16(&mut self, addr: u32, v: u16) {
         let a = addr & ADDR_MASK;
         if mem::is_dram(a) && a + 1 < mem::DRAM_END {
+            self.m68k_bus_cycles += 1;
             let i = a as usize;
             let b = v.to_be_bytes();
             self.dram[i] = b[0];
@@ -296,6 +308,7 @@ impl Bus {
     pub fn read32(&mut self, addr: u32) -> u32 {
         let a = addr & ADDR_MASK;
         if mem::is_dram(a) && a + 3 < mem::DRAM_END {
+            self.m68k_bus_cycles += 2; // a long is two bus cycles
             let i = a as usize;
             u32::from_be_bytes([
                 self.dram[i],
@@ -304,6 +317,7 @@ impl Bus {
                 self.dram[i + 3],
             ])
         } else if mem::is_tom(a) {
+            self.m68k_bus_cycles += 2;
             self.tom_read32(a)
         } else {
             // JERRY (incl. the joypad at $F14000) composes via the byte path so
@@ -316,6 +330,7 @@ impl Bus {
     pub fn write32(&mut self, addr: u32, v: u32) {
         let a = addr & ADDR_MASK;
         if mem::is_dram(a) && a + 3 < mem::DRAM_END {
+            self.m68k_bus_cycles += 2;
             let i = a as usize;
             let b = v.to_be_bytes();
             self.dram[i..i + 4].copy_from_slice(&b);
