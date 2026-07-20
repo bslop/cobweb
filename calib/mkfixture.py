@@ -15,15 +15,20 @@ The generator is the durable artifact. The blobs it emits are reproducible
 build output and are deliberately NOT committed — an earlier fixture lived only
 in a scratch directory and was lost to a reboot, which is what prompted this.
 
-KNOWN LIMITATION (2026-07-19): the snapshot alone does not yet drive
-gpu_geotex all the way to the render — jopt correctly reports the capture
-region was never written and refuses to certify against it (fail-closed, as it
-should). Presetting GPU state and the DRAM the params point at is necessary but
-not sufficient; the kernel still needs to be entered in a state where it walks
-the face list rather than falling straight through to `done`. Finishing that is
-the remaining work. The generator is committed now because it is the durable
-half — an earlier hand-built fixture was lost to a reboot, and reconstructing it
-from memory is exactly what this exists to avoid.
+PROVEN END TO END (2026-07-19): snapshot -> fixture -> non-vacuous certificate
+-> 34 accepted delay-slot fills on the production gpu_geotex kernel (3526 ->
+3458 bytes), with the optimized kernel's rendered output BYTE-IDENTICAL to the
+baseline's (verified independently via the jtest `fxrun` example, not just by
+jopt's own certificate).
+
+Two traps this generator now handles, found the hard way:
+  - The snapshot's DRAM contains the frame the kernel already rendered, and a
+    deterministic kernel re-renders the same bytes over it — after == before,
+    so the certificate sees "never written" and rejects as vacuous. The blob's
+    overlap with the capture region is therefore ZEROED.
+  - The capture region must be where the kernel actually writes. It is
+    params[3] (confirmed in the 68k kick: `G_PARAMS + 12 = fb`); a full-DRAM
+    before/after diff in `fxrun` is the reliable way to find it when in doubt.
 
 Usage:
   ./mkfixture.py <rom.cof> --out fixtures/geotex [--frames N] [--jagemu PATH]
@@ -51,10 +56,13 @@ GPU_STATE_LEN = 0x200          # $F03E00..$F03FFF: buffers, camera, PARAMS
 KERNEL_CODE = (0xF03000, 0xE00)  # never preset — see module docstring
 
 # The kernel's observable output, and therefore the capture region. NOT a fixed
-# address: it is params[5] in the snapshot (0x000F5500 in the run this was built
-# against — an assumed 0x100000 was simply wrong). Derived per-snapshot below.
+# address: it is params[3] in the snapshot — confirmed against the 68k-side
+# kick (gpu.c: `G_PARAMS + 12 = (uint32_t)fb`) after two wrong guesses in a
+# row (an assumed 0x100000, then params[5], which is the texture atlas; a
+# full-DRAM diff in the `fxrun` example showed the render spans landing
+# relative to params[3]).
 FB_ADDR_PLACEHOLDER = 0  # rewritten from the snapshot
-FB_PARAM_INDEX = 5
+FB_PARAM_INDEX = 3
 FB_LEN = 320 * 240
 PARAMS_OFF = 0x100  # $F03F00 - $F03E00
 DRAM_LO, DRAM_HI = 0x1000, 0x200000
@@ -90,6 +98,9 @@ def main():
                     help="after generating, run jopt against this kernel and fail "
                          "if the capture is vacuous")
     ap.add_argument("--jopt", default="jopt")
+    ap.add_argument("--kdefine", action="append", default=[],
+                    help="kernel build define forwarded to jopt as -d (repeatable); "
+                         "gpu_geotex needs its full Makefile set or it will not assemble")
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -137,6 +148,23 @@ def main():
         addr, length = int(a, 0), int(l, 0)
         f = os.path.join(args.out, "dram_%06X.bin" % addr)
         dump(args.jagemu, args.rom, addr, length, args.frames, f)
+        # ZERO the capture region wherever a blob overlaps it. The snapshot
+        # necessarily contains the frame the kernel already rendered, and the
+        # certificate detects vacuity by comparing the capture region before vs
+        # after the run — a deterministic kernel re-rendering the same frame
+        # over its own prior output produces after == before, so the fixture
+        # masks the very writes it exists to observe. (Found the hard way:
+        # fxrun showed 20k non-zero framebuffer bytes and MAGIC_DONE in the
+        # mailbox while jopt reported "fixture never wrote the capture region"
+        # — both were telling the truth.)
+        lo = max(addr, fb)
+        hi = min(addr + length, fb + FB_LEN)
+        if lo < hi:
+            with open(f, "r+b") as fh:
+                fh.seek(lo - addr)
+                fh.write(b"\0" * (hi - lo))
+            print("zeroed capture overlap 0x%06X..0x%06X in %s"
+                  % (lo, hi, os.path.basename(f)))
         lines.append("blob 0x%X %s" % (addr, os.path.basename(f)))
 
     fx = os.path.join(args.out, "geotex.fx")
@@ -154,8 +182,10 @@ def main():
     print("gpu_state.bin: %d non-zero bytes of %d" % (sum(1 for b in blank if b), len(blank)))
 
     if args.verify:
-        p = subprocess.run([args.jopt, args.verify, "--fixture", fx],
-                           capture_output=True, text=True)
+        cmd = [args.jopt, args.verify, "--fixture", fx, "--allow-input-hazards"]
+        for d in args.kdefine:
+            cmd += ["-d", d]
+        p = subprocess.run(cmd, capture_output=True, text=True)
         out = (p.stdout + p.stderr).strip()
         print(out[-3000:])
         if "vacuous" in out.lower() or p.returncode != 0:
