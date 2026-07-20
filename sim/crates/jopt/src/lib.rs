@@ -125,6 +125,15 @@ fn org_of(t: RiscKind) -> u32 {
     }
 }
 
+/// Preprocessor defines (`-d NAME=VALUE`) applied to every assembly jopt does.
+///
+/// Process-wide rather than threaded through every call site: jopt is a
+/// single-shot CLI, and the defines must be identical for the baseline and
+/// every candidate or the certificate would be comparing different programs.
+/// A real kernel is usually unbuildable without them — gpu_geotex needs six
+/// from its Makefile and does not assemble clean with none.
+pub static DEFINES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
 /// Assemble source into a full [`jas::Assembled`]; None if it does not assemble
 /// clean (errors). With `allow_hazards`, the static hazard pass is skipped —
 /// pre-existing (and any transform-introduced) hazards no longer block
@@ -134,6 +143,7 @@ fn assemble_full(src: &str, target: RiscKind, allow_hazards: bool) -> Option<jas
         target: target_of(target),
         org: org_of(target),
         check_hazards: !allow_hazards,
+        defines: DEFINES.get().cloned().unwrap_or_default(),
         ..Default::default()
     };
     let out = jas::assemble(src, &opts);

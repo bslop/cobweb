@@ -92,6 +92,9 @@ fn main() -> ExitCode {
              \x20 --gpu | --dsp          target core (default gpu)\n\
              \x20 --allow-input-hazards  optimize past pre-existing (benign) input\n\
              \x20                        hazards; the jsim certificate still gates output\n\
+             \x20 -d NAME[=VALUE]        preprocessor define, repeatable (as rmac -d);\n\
+             \x20                        a kernel that needs build defines will not\n\
+             \x20                        assemble clean without them\n\
              \x20 --fixture <file>       certify against a fixture (kernel input state)\n\
              \x20                        so a kernel that never halts in isolation runs\n\
              \x20                        to a real, observable end; captures its output\n\
@@ -110,6 +113,7 @@ fn main() -> ExitCode {
     let mut target = RiscKind::Gpu;
     let mut allow_input_hazards = false;
     let mut fixture_path = None;
+    let mut defines: Vec<String> = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -122,6 +126,11 @@ fn main() -> ExitCode {
             // certify against a fixture (kernel input state) so a kernel that
             // never halts in isolation runs to a real, observable end.
             "--fixture" => fixture_path = it.next().cloned(),
+            "-d" | "-D" | "--define" => {
+                if let Some(d) = it.next() {
+                    defines.push(d.clone());
+                }
+            }
             s if s.starts_with('-') => {
                 eprintln!("jopt: unknown option `{s}`");
                 return ExitCode::FAILURE;
@@ -153,6 +162,9 @@ fn main() -> ExitCode {
         }
     };
 
+    // Must be set before any assembly: baseline and candidates have to see the
+    // same defines or the certificate compares different programs.
+    let _ = jopt::DEFINES.set(defines);
     let res = jopt::optimize_fixture(&src, target, allow_input_hazards, fixture.as_ref());
 
     for t in &res.transforms {

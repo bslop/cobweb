@@ -46,6 +46,14 @@ fn main() -> ExitCode {
             "-c" => opts.object_mode = true,   // emit a relocatable object (.jo)
             "--no-hazard-check" => opts.check_hazards = false,
             "-Werror" => opts.warnings_as_errors = true,
+            // rmac spells this -d; accept both, and NAME with no value means 1.
+            "-d" | "-D" | "--define" => match it.next() {
+                Some(d) => opts.defines.push(d.clone()),
+                None => {
+                    eprintln!("jas: -d needs NAME[=VALUE]");
+                    return ExitCode::FAILURE;
+                }
+            },
             "--gas" => opts.gas = Some(true),   // force the GNU-as frontend
             "--no-gas" => opts.gas = Some(false),
             "-r" | "--relocatable" => {
