@@ -80,6 +80,8 @@ pub struct M68k {
     /// `STOP` halted the CPU until an interrupt arrives.
     pub stopped: bool,
     pub cycles: u64,
+    /// Nesting depth of interrupt handlers (for ISR-vs-main attribution).
+    pub isr_depth: u32,
     pub instret: u64,
     /// Set when an unrecognized opcode is hit, for the debugger: (pc, opcode).
     pub last_illegal: Option<u32>,
@@ -107,6 +109,7 @@ impl M68k {
             pending_level: 0,
             stopped: false,
             cycles: 0,
+            isr_depth: 0,
             instret: 0,
             last_illegal: None,
             last_illegal_op: 0,
@@ -221,7 +224,25 @@ impl M68k {
     }
 
     /// Execute one instruction (or take a pending interrupt). Returns cycles.
+    ///
+    /// Wraps the core step so the profiler can attribute cycles to the PC that
+    /// *issued* the instruction (not the PC after it), and can tell a sleeping
+    /// 68000 apart from a spinning one.
     pub fn step(&mut self, bus: &mut Bus, dbg: &mut Debugger) -> u32 {
+        if dbg.prof.is_none() {
+            return self.step_inner(bus, dbg);
+        }
+        let pc0 = self.pc;
+        let was_stopped = self.stopped;
+        let c = self.step_inner(bus, dbg);
+        let in_isr = self.isr_depth > 0;
+        if let Some(p) = dbg.prof.as_mut() {
+            p.record(pc0, c, in_isr, was_stopped);
+        }
+        c
+    }
+
+    fn step_inner(&mut self, bus: &mut Bus, dbg: &mut Debugger) -> u32 {
         // Service interrupts first.
         if self.pending_level != 0 {
             let lvl = self.pending_level;
@@ -264,6 +285,7 @@ impl M68k {
         // to the architectural autovector for any other level.
         let vector = if level == 2 { 64 } else { 24 + level as u32 };
         self.pc = bus.read32(vector * 4);
+        self.isr_depth += 1;
         self.pending_level = 0; // acknowledged
         44
     }

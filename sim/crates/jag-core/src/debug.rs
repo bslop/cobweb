@@ -50,6 +50,8 @@ pub struct Debugger {
     /// Stop the run loop when the CPU hits an illegal/unimplemented opcode.
     /// Off by default (illegal opcodes vector normally); invaluable in bring-up.
     pub stop_on_illegal: bool,
+    /// Exact 68k cycle profiler. `None` = off (zero hot-loop cost).
+    pub prof: Option<Box<Profile>>,
 }
 
 impl Debugger {
@@ -64,6 +66,7 @@ impl Debugger {
             trace_log: std::collections::VecDeque::new(),
             trace_cap: 4096,
             stop_on_illegal: false,
+            prof: None,
         }
     }
 
@@ -136,5 +139,111 @@ impl Debugger {
     #[inline]
     pub fn take_stop(&mut self) -> Option<StopReason> {
         self.pending_stop.take()
+    }
+}
+
+// ── 68k profiler ────────────────────────────────────────────────────────────
+
+/// Exact per-PC cycle attribution for the 68000.
+///
+/// Not a sampling profiler: every instruction's cycles are attributed to the PC
+/// that issued it, so there is no sampling error and short hot routines cannot
+/// hide between samples. Requested in `COBWEB_REQ_68k_pc_histogram.md`, where
+/// the reporter specifically asked for CYCLE attribution over instruction
+/// counts — they had measured +48% instructions retired with *zero* fps change,
+/// which makes retirement count a poor proxy for frame cost on this workload.
+///
+/// `STOP`-sleeping cycles are tracked separately: a 68000 asleep waiting for an
+/// interrupt is not spending frame time on anything, and folding that into the
+/// PC where it happens to be parked would read as a hot spot.
+pub struct Profile {
+    /// Cycles indexed by word address within the 2 MB main-RAM window.
+    cycles: Vec<u64>,
+    instrs: Vec<u32>,
+    pub isr_cycles: u64,
+    pub isr_instrs: u64,
+    pub main_cycles: u64,
+    pub main_instrs: u64,
+    pub stopped_cycles: u64,
+    pub total_cycles: u64,
+}
+
+const PROF_SLOTS: usize = 0x200000 >> 1;
+
+impl Default for Profile {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Profile {
+    pub fn new() -> Self {
+        Profile {
+            cycles: vec![0; PROF_SLOTS],
+            instrs: vec![0; PROF_SLOTS],
+            isr_cycles: 0,
+            isr_instrs: 0,
+            main_cycles: 0,
+            main_instrs: 0,
+            stopped_cycles: 0,
+            total_cycles: 0,
+        }
+    }
+
+    pub fn record(&mut self, pc: u32, cyc: u32, in_isr: bool, was_stopped: bool) {
+        self.total_cycles += cyc as u64;
+        if was_stopped {
+            self.stopped_cycles += cyc as u64;
+            return; // asleep in STOP — not frame cost, and not this PC's fault
+        }
+        let i = ((pc & 0x1FFFFF) >> 1) as usize;
+        if i < self.cycles.len() {
+            self.cycles[i] += cyc as u64;
+            self.instrs[i] += 1;
+        }
+        if in_isr {
+            self.isr_cycles += cyc as u64;
+            self.isr_instrs += 1;
+        } else {
+            self.main_cycles += cyc as u64;
+            self.main_instrs += 1;
+        }
+    }
+
+    /// Hottest addresses by cycles: `(pc, cycles, instrs)`, descending.
+    pub fn top(&self, k: usize) -> Vec<(u32, u64, u32)> {
+        let mut v: Vec<(u32, u64, u32)> = self
+            .cycles
+            .iter()
+            .enumerate()
+            .filter(|(_, &c)| c > 0)
+            .map(|(i, &c)| ((i as u32) << 1, c, self.instrs[i]))
+            .collect();
+        v.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        v.truncate(k);
+        v
+    }
+
+    /// Hot regions: cycles summed into `gran`-byte buckets, descending. Better
+    /// than raw PCs for locating a *routine* rather than its hottest single
+    /// instruction.
+    pub fn top_buckets(&self, gran: u32, k: usize) -> Vec<(u32, u64, u32)> {
+        let g = (gran.max(2) >> 1) as usize;
+        let mut buckets: std::collections::HashMap<usize, (u64, u32)> =
+            std::collections::HashMap::new();
+        for (i, &c) in self.cycles.iter().enumerate() {
+            if c > 0 {
+                let e = buckets.entry(i / g).or_insert((0, 0));
+                e.0 += c;
+                e.1 += self.instrs[i];
+            }
+        }
+        let mut v: Vec<(u32, u64, u32)> = buckets
+            .into_iter()
+            .map(|(b, (c, n))| (((b * g) as u32) << 1, c, n))
+            .collect();
+        v.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        v.truncate(k);
+        v
     }
 }

@@ -395,6 +395,7 @@ impl M68k {
             }
             0x4E73 => {
                 // RTE (privileged)
+                self.isr_depth = self.isr_depth.saturating_sub(1);
                 if !self.supervisor() {
                     return self.exception(bus, 8, false);
                 }

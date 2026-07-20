@@ -261,10 +261,65 @@ fn cmd_info(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// `symbol.map` / `rln -m` style map: lines with a hex address and a name.
+/// Anything unparseable is skipped, so a map from any toolchain is safe to pass.
+fn load_map(path: &str) -> Result<Vec<(u32, String)>, String> {
+    let txt = std::fs::read_to_string(path).map_err(|e| format!("reading {path}: {e}"))?;
+    let mut v: Vec<(u32, String)> = Vec::new();
+    for line in txt.lines() {
+        let mut addr: Option<u32> = None;
+        let mut name: Option<String> = None;
+        for tok in line.split_whitespace() {
+            let t = tok.trim_start_matches("0x").trim_start_matches('$');
+            if addr.is_none() && t.len() >= 4 && t.chars().all(|c| c.is_ascii_hexdigit()) {
+                addr = u32::from_str_radix(t, 16).ok();
+            } else if addr.is_some() && name.is_none() && !tok.is_empty() {
+                name = Some(tok.to_string());
+            }
+        }
+        if let (Some(a), Some(n)) = (addr, name) {
+            v.push((a, n));
+        }
+    }
+    v.sort_by_key(|e| e.0);
+    Ok(v)
+}
+
+/// Nearest preceding symbol, as `name+0xNN`.
+fn sym_for(map: &[(u32, String)], addr: u32) -> String {
+    match map.binary_search_by_key(&addr, |e| e.0) {
+        Ok(i) => map[i].1.clone(),
+        // Err(0) means the address precedes every symbol: there is no preceding
+        // entry to name it with, and `map[i - 1]` below would underflow.
+        Err(0) => String::new(),
+        Err(i) => {
+            let (a, ref n) = map[i - 1];
+            if addr - a > 0x2000 { String::new() } else { format!("{n}+0x{:X}", addr - a) }
+        }
+    }
+}
+
 fn cmd_run(args: &[String]) -> Result<(), String> {
     let (path, data) = load_rom(args)?;
     let frames = flag_val(args, "--frames").map(parse_u64).transpose()?.unwrap_or(60);
     let (btn, after) = press_args(args)?;
+    let prof = has_flag(args, "--pc-histogram") || has_flag(args, "--profile68k");
+    if prof {
+        let top = flag_val(args, "--top").map(parse_u32).transpose()?.unwrap_or(25) as usize;
+        let gran = flag_val(args, "--bucket").map(parse_u32).transpose()?.unwrap_or(0);
+        let map = match flag_val(args, "--map") {
+            Some(m) => load_map(m)?,
+            None => Vec::new(),
+        };
+        let jag = boot_profiled(&data, frames, btn, after, fidelity_arg(args)?, gran, top, &map)?;
+        println!(
+            "{{\"ok\":true,\"path\":{},\"frames\":{},\"state\":{}}}",
+            jstr(&path),
+            frames,
+            state_json(&jag)
+        );
+        return Ok(());
+    }
     let jag = boot_input(&data, frames, btn, after, fidelity_arg(args)?)?;
     println!(
         "{{\"ok\":true,\"path\":{},\"frames\":{},\"state\":{}}}",
@@ -273,6 +328,84 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
         state_json(&jag)
     );
     Ok(())
+}
+
+/// Boot with the 68k profiler armed, then print the histogram to stderr (stdout
+/// stays a single JSON object, as every other command guarantees).
+#[allow(clippy::too_many_arguments)]
+fn boot_profiled(
+    rom: &[u8],
+    frames: u64,
+    buttons: u32,
+    press_after: u64,
+    fid: Fidelity,
+    gran: u32,
+    top: usize,
+    map: &[(u32, String)],
+) -> Result<Jaguar, String> {
+    let mut jag = Jaguar::new();
+    jag.load(rom).map_err(|e| e.to_string())?;
+    attach_sd(&mut jag);
+    jag.gpu.fidelity = fid;
+    jag.dsp.fidelity = fid;
+    jag.dbg.prof = Some(Box::new(jag_core::debug::Profile::new()));
+    if buttons != 0 && press_after < frames {
+        jag.run_frames(press_after);
+        jag.set_pad(0, buttons);
+        jag.run_frames(frames - press_after);
+    } else if frames > 0 {
+        jag.run_frames(frames);
+    }
+    let p = jag.dbg.prof.as_ref().unwrap();
+    let awake = p.main_cycles + p.isr_cycles;
+    let tot = p.total_cycles.max(1);
+    eprintln!("=== 68k cycle profile ({frames} frames) ===");
+    eprintln!(
+        "  total charged   {:>12}",
+        p.total_cycles
+    );
+    eprintln!(
+        "  asleep in STOP  {:>12}  {:5.1}%   (waiting on an interrupt — not frame cost)",
+        p.stopped_cycles,
+        100.0 * p.stopped_cycles as f64 / tot as f64
+    );
+    eprintln!(
+        "  awake           {:>12}  {:5.1}%",
+        awake,
+        100.0 * awake as f64 / tot as f64
+    );
+    eprintln!(
+        "    in vblank ISR {:>12}  {:5.1}% of awake   ({} instrs)",
+        p.isr_cycles,
+        100.0 * p.isr_cycles as f64 / awake.max(1) as f64,
+        p.isr_instrs
+    );
+    eprintln!(
+        "    main line     {:>12}  {:5.1}% of awake   ({} instrs)",
+        p.main_cycles,
+        100.0 * p.main_cycles as f64 / awake.max(1) as f64,
+        p.main_instrs
+    );
+    let rows = if gran > 0 { p.top_buckets(gran, top) } else { p.top(top) };
+    eprintln!(
+        "\n  {:<10} {:>12} {:>7} {:>12}  {}",
+        if gran > 0 { "bucket" } else { "pc" },
+        "cycles",
+        "% awake",
+        "instrs",
+        "symbol"
+    );
+    for (pc, cyc, n) in rows {
+        eprintln!(
+            "  0x{:06X}   {:>12} {:>6.2}% {:>12}  {}",
+            pc,
+            cyc,
+            100.0 * cyc as f64 / awake.max(1) as f64,
+            n,
+            sym_for(map, pc)
+        );
+    }
+    Ok(jag)
 }
 
 fn cmd_screenshot(args: &[String]) -> Result<(), String> {
