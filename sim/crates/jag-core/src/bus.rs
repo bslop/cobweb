@@ -136,6 +136,17 @@ pub struct Tom {
     /// RISC step charges it to the launching `B_CMD` store, so the GPU's
     /// bwait-spin costs real time — HARDWARE-CALIBRATED, see `blit::cost`).
     pub last_blit_ticks: u64,
+    /// Ticks until the in-flight blit completes — the Blitter is ASYNCHRONOUS.
+    /// HARDWARE (calib 2026-07-19, 1/2/4/8/256-px probes + OpenLara's NOFILL
+    /// delta): per-blit cost matches jsim within ~5% at every span length, yet
+    /// the whole-frame fill charge was 24% (jsim) vs ~10% (silicon). The
+    /// difference is concurrency, not cost: gpu_geotex launches a span and
+    /// runs the next span's DDA math (GPU-SRAM-local) WHILE the Blitter works,
+    /// bwaiting only at the top of the next launch — serialized charging bills
+    /// the overlap twice. B_CMD reads report busy until this drains (GPU
+    /// instruction time while the GPU runs; scheduler wall time while it
+    /// doesn't).
+    pub blit_busy: u64,
 }
 
 impl Tom {
@@ -148,6 +159,7 @@ impl Tom {
             presented: crate::tom::Framebuffer::solid(320, 240, 0, 0, 0),
             op: crate::tom::OpState::default(),
             last_blit_ticks: 0,
+            blit_busy: 0,
         }
     }
 }
@@ -356,8 +368,13 @@ impl Bus {
 
     fn tom_read32(&self, a: u32) -> u32 {
         if a == mem::B_CMD {
-            // The Blitter is synchronous in this model, so it always reads idle.
-            return crate::tom::blit::BLIT_IDLE;
+            // Data-wise the blit completed at launch; TIME-wise it is still on
+            // the bus until blit_busy drains. bit0 = idle.
+            return if self.tom.blit_busy > 0 {
+                crate::tom::blit::BLIT_IDLE & !1
+            } else {
+                crate::tom::blit::BLIT_IDLE
+            };
         }
         self.tom.win.r32(a)
     }

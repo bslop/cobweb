@@ -184,6 +184,14 @@ impl Scheduler {
         // (The scheduler advances once per 68k instruction, so the GO-low slice
         // is always observed.)
         gpu.run(bus, budget);
+        // The blit drains against GPU instruction time while the GPU runs
+        // (risc.rs); when the GPU is halted the Blitter still owns the bus and
+        // finishes on wall time — drain by this window's ticks instead. Without
+        // this, a 68k- or DSP-launched blit (or one outliving its kernel) never
+        // completes and every B_CMD poll spins forever.
+        if !gpu.running {
+            bus.tom.blit_busy = bus.tom.blit_busy.saturating_sub(risc_ticks.max(0) as u64);
+        }
         dsp.run(bus, budget);
     }
 

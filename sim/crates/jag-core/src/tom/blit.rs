@@ -442,8 +442,9 @@ pub fn run(bus: &mut Bus, cmd: u32) {
     let per_line = |g: &AddrGen| -> u64 { (inner as u64).div_ceil(ppp(g)) };
     let dst_phrases = outer as u64 * per_line(&gens[dst]);
     let src_phrases = if srcen { outer as u64 * per_line(&gens[src]) } else { 0 };
-    bus.tom.last_blit_ticks =
-        BLIT_LAUNCH_TICKS + (dst_phrases + src_phrases) * BLIT_ACCESS_TICKS_X10 / 10;
+    let ticks = BLIT_LAUNCH_TICKS + (dst_phrases + src_phrases) * BLIT_ACCESS_TICKS_X10 / 10;
+    bus.tom.last_blit_ticks = ticks;
+    bus.tom.blit_busy += ticks; // asynchronous: drains as wall time passes
 }
 
 #[cfg(test)]

@@ -418,7 +418,16 @@ impl Risc {
                 self.bp_hit = Some(self.pc);
                 break;
             }
-            spent += self.step_one(bus);
+            let c = self.step_one(bus);
+            // The GPU's own execution IS wall time for the in-flight blit —
+            // drain here so a bwait poll loop observes completion. (The DSP
+            // does not drain: when both run, the scheduler interleaves them
+            // over the same wall clock and draining twice would finish blits
+            // at double speed.)
+            if self.kind == RiscKind::Gpu {
+                bus.tom.blit_busy = bus.tom.blit_busy.saturating_sub(c as u64);
+            }
+            spent += c;
             // The core can stop itself by clearing RISCGO via a STORE.
             if self.ctrl & mem::RISCGO == 0 {
                 self.running = false;
@@ -627,14 +636,18 @@ impl Risc {
             self.pipe.set_flags_ready(end - 1 + timing::Lat::ALU);
         }
 
-        // A blit launched by this instruction (a store to B_CMD) costs the GPU
-        // real DRAM-bus time — on hardware the GPU spins in bwait until the
-        // Blitter finishes. blit::run stashed the tick cost; charge it here so
-        // the frame time reflects the fill (see tom::blit BLIT_* constants).
+        // A blit launched by this instruction (a store to B_CMD) runs
+        // ASYNCHRONOUSLY: blit::run put its duration in bus.tom.blit_busy, and
+        // B_CMD reads report busy until it drains. The launch itself costs the
+        // GPU nothing beyond the store — real kernels (gpu_geotex) overlap the
+        // next span's DDA math with the blit and only bwait at the next launch.
+        // Charging the full duration here (the old model) serialized that
+        // overlap and over-billed the frame 2.4x vs silicon's NOFILL delta.
+        // stats.blit still accumulates the duration: it is "Blitter busy
+        // time", the number the wall-clock accounting reports.
         let blit_ticks = std::mem::take(&mut bus.tom.last_blit_ticks);
         if blit_ticks > 0 {
             self.pipe.stats.blit += blit_ticks;
-            cost = cost.saturating_add(blit_ticks.min(u32::MAX as u64) as u32);
         }
         cost
     }
