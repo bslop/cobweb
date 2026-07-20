@@ -14,7 +14,17 @@ make bench    # calibration table in the simulator (needs calib ROMs built)
 Every `jagemu` command prints exactly one JSON object on stdout (human
 notes go to stderr). Use `run` for machine state, `peek` for memory,
 `screenshot` for the true Object-Processor scan-out, `disasm` for 68k
-disassembly, `serve`/`ctl` for persistent interactive sessions.
+disassembly, `serve`/`ctl` for persistent interactive sessions, `audio`
+to capture a WAV, and `audiocheck <wav|rom> [--against <wav|rom>]` for
+the audio counterpart of the pixel-diff: silence/DC/clipping/dropout/
+spectral health, plus lag-aligned envelope+spectrum comparison against
+an oracle capture (works on hardware WAVs too — same analyzer).
+
+For live hardware sessions, `sim/tools/jagtap.py --device /dev/videoN`
+splits the USB capture of the real Jaguar: the human watches
+`http://localhost:8471/`, you fetch `/frame.jpg` (or Read the `--snap`
+file), and `--audio hw:N` keeps a WAV ring that `audiocheck` can read.
+Never open the V4L2 device directly — jagtap replaces that for everyone.
 
 ## Measuring performance (the point of this suite)
 

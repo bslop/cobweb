@@ -34,6 +34,7 @@ fn main() -> ExitCode {
         "screenshot" | "shot" => cmd_screenshot(rest),
         "video" | "film" => cmd_video(rest),
         "audio" | "sound" => cmd_audio(rest),
+        "audiocheck" | "audio-check" => cmd_audiocheck(rest),
         "playtest" => cmd_playtest(rest),
         "disasm" => cmd_disasm(rest),
         "peek" => cmd_peek(rest),
@@ -75,6 +76,7 @@ fn usage() {
          \x20 jagemu screenshot <rom> [--frames N] [-o out.png]\n\
          \x20 jagemu video <rom> [--count N] [--every K] [--start S] [--cols C] [--dir D] -o film.png\n\
          \x20 jagemu audio <rom> [--frames N] [--press a] -o out.wav\n\
+         \x20 jagemu audiocheck <wav|rom> [--against <wav|rom>] [--frames N] [--press a]\n\
          \x20 jagemu disasm <rom> --at 0xADDR [--count N] [--frames N]\n\
          \x20 jagemu peek <rom> --at 0xADDR [--len N] [--frames N] [--press a]\n\
          \x20 jagemu dump <rom> --at 0xADDR --len N -o file.bin   # full-region export, no cap\n\
@@ -658,6 +660,114 @@ fn cmd_audio(args: &[String]) -> Result<(), String> {
         "{{\"ok\":true,\"path\":{},\"out\":{},\"sample_rate\":{},\"samples\":{},\"peak\":{},\"rms\":{:.1},\"silent\":{}}}",
         jstr(&path), jstr(out), rate, samples.len() / 2, peak, rms, peak == 0
     );
+    Ok(())
+}
+
+/// Load `path` as an audio capture: a `.wav` is decoded directly; anything
+/// else is treated as a ROM, booted, and captured with the shared
+/// `--frames`/`--press`/`--press-after` arguments.
+fn audio_source(path: &str, args: &[String]) -> Result<(u32, u16, Vec<i16>), String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+    if bytes.len() >= 4 && &bytes[0..4] == b"RIFF" {
+        return jag_headless::wav::decode_pcm16(&bytes).map_err(|e| format!("{path}: {e}"));
+    }
+    let frames = flag_val(args, "--frames").map(parse_u64).transpose()?.unwrap_or(400);
+    let (btn, after) = press_args(args)?;
+    let mut jag = Jaguar::new();
+    jag.load(&bytes).map_err(|e| format!("{path}: {e}"))?;
+    attach_sd(&mut jag);
+    let (rate, samples, _) = jag_headless::capture_audio(&mut jag, frames, btn, after);
+    Ok((rate, 2, samples))
+}
+
+/// `jagemu audiocheck <wav|rom> [--against <wav|rom>]` — the audio counterpart
+/// of the screenshot pixel-diff. Alone: a health report (silence, DC,
+/// clipping, dropouts, spectral peaks). With `--against`: lag-aligned
+/// comparison of loudness envelope + spectrum against a reference capture
+/// (builds boot at different speeds; the lag is measured, not assumed).
+fn cmd_audiocheck(args: &[String]) -> Result<(), String> {
+    // first true positional: skip flags AND their values
+    const VALUE_FLAGS: &[&str] =
+        &["--against", "--frames", "--press", "--press-after", "--sd", "-o", "--out"];
+    let mut target = None;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if VALUE_FLAGS.contains(&a) {
+            i += 2;
+            continue;
+        }
+        if a.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        target = Some(args[i].clone());
+        break;
+    }
+    let target = target.ok_or("audiocheck needs a .wav capture or a ROM")?;
+    let (rate, ch, samples) = audio_source(&target, args)?;
+    let a = jag_headless::wav::analyze(rate, ch, &samples);
+
+    let peaks_json: Vec<String> = a
+        .spectral_peaks
+        .iter()
+        .map(|(hz, db)| format!("{{\"hz\":{hz:.1},\"db\":{db:.1}}}"))
+        .collect();
+    let dc_json: Vec<String> = a.dc_offset.iter().map(|d| format!("{d:.4}")).collect();
+    let mut json = format!(
+        "{{\"ok\":true,\"capture\":{},\"sample_rate\":{},\"duration_s\":{:.2},\
+         \"silent\":{},\"peak_dbfs\":{:.1},\"rms_dbfs\":{:.1},\"clipped_samples\":{},\
+         \"dc_offset\":[{}],\"silence_ratio\":{:.3},\"leading_silence_s\":{:.2},\
+         \"longest_gap_s\":{:.2},\"channel_correlation\":{},\"spectral_peaks\":[{}]",
+        jstr(&target),
+        rate,
+        a.duration_s,
+        a.silent,
+        a.peak_dbfs,
+        a.rms_dbfs,
+        a.clipped,
+        dc_json.join(","),
+        a.silence_ratio,
+        a.leading_silence_s,
+        a.longest_gap_s,
+        a.channel_correlation.map(|c| format!("{c:.4}")).unwrap_or("null".into()),
+        peaks_json.join(","),
+    );
+    eprintln!(
+        "jagemu: {} — {:.1}s @ {} Hz, peak {:.1} dBFS, rms {:.1} dBFS, {}% silent{}",
+        target,
+        a.duration_s,
+        rate,
+        a.peak_dbfs,
+        a.rms_dbfs,
+        (a.silence_ratio * 100.0).round(),
+        if a.silent { " (NO AUDIO AT ALL)" } else { "" }
+    );
+
+    if let Some(refpath) = flag_val(args, "--against") {
+        let (rr, rc, rsamples) = audio_source(refpath, args)?;
+        let c = jag_headless::wav::compare((rate, ch, &samples), (rr, rc, &rsamples))?;
+        json.push_str(&format!(
+            ",\"against\":{},\"lag_s\":{:.2},\"envelope_correlation\":{:.4},\
+             \"envelope_mae_db\":{:.2},\"spectral_mae_db\":{:.2},\"matches\":{}",
+            jstr(refpath),
+            c.lag_s,
+            c.envelope_correlation,
+            c.envelope_mae_db,
+            c.spectral_mae_db,
+            c.matches
+        ));
+        eprintln!(
+            "jagemu: vs {} — lag {:+.2}s, envelope corr {:.3}, spectral MAE {:.1} dB → {}",
+            refpath,
+            c.lag_s,
+            c.envelope_correlation,
+            c.spectral_mae_db,
+            if c.matches { "MATCH" } else { "MISMATCH" }
+        );
+    }
+    json.push('}');
+    println!("{json}");
     Ok(())
 }
 

@@ -10,6 +10,29 @@ Headline: the simulator now renders OpenLara's textured 3D room, the optimizer
 proves its wins against real rendered output, and a one-character assembler bug
 that had been silently dropping conditional blocks is fixed.
 
+### 2026-07-20 — audio gets its instruments
+
+- **`jagemu audiocheck <wav|rom> [--against <wav|rom>]`** — the audio
+  counterpart of the screenshot pixel-diff. Alone: a health report
+  (peak/RMS dBFS, DC offset, clipping, silence ratio, leading silence,
+  longest dropout gap, L/R correlation, top spectral peaks via a
+  hand-rolled std-only FFT). With `--against`: lag-aligned comparison of
+  loudness envelope + average spectrum against an oracle capture —
+  builds boot at different speeds, so the lag is measured (envelope
+  cross-correlation), not assumed. Passing a ROM instead of a .wav
+  captures on the fly. Validated on OpenLara: same-build captures
+  pressed 100 frames apart → lag −1.65s detected, envelope corr 0.997,
+  MATCH; non-equivalent stimuli → honest MISMATCH. Reads any 16-bit PCM
+  WAV, so hardware captures go through the SAME analyzer as simulator
+  output. 11 unit tests (tone/clip/DC/dropout/delay synthesis).
+- **`sim/tools/jagtap.py`** — splits the USB capture of the real Jaguar
+  between the human and Claude (a V4L2 device allows one consumer; the
+  tap opens it once, MJPEG passthrough, no transcode). Human: live
+  browser view. Claude: `/frame.jpg` or an atomically-rewritten `--snap`
+  file. `--audio` keeps a 2-file WAV ring `audiocheck` can read.
+  Verified live against the console mid-session (OpenLara on silicon,
+  28 fps through the tap).
+
 ### 2026-07-20 — adoption report round 2: the full-TU switch
 
 OpenLara switched three TUs to jcc68k the same day and filed round 2:
