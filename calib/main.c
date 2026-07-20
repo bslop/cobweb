@@ -86,7 +86,9 @@ struct probe {
     int bonly;        /* 1 = mode B only (mode A's busy-poll would be starved) */
     int cpubench;     /* 68k-side benchmark, not a GPU kernel (see bench68k):
                        * 1 = DRAM read stream (fetch + data both external)
-                       * 2 = register-only dbra loop (fetch-only bus traffic) */
+                       * 2 = register-only dbra loop (fetch-only bus traffic)
+                       * 3 = OpenLara's exact framebuffer-copy loop (the
+                       *     measured critical path: move.b (aX)+,(aY)+) */
 };
 
 #define D_RAM 0xF1B000UL
@@ -169,6 +171,7 @@ static const struct probe probes[] = {
      * is mergeable with a data-only charge; if near 1.56x the whole model is
      * wrong somewhere subtler. */
     { "m68kreg ", 0, 0, 0, 0, 30, 0, 0, 0, 0, 0, 2 },
+    { "m68kcpy ", 0, 0, 0, 0, 30, 0, 0, 0, 0, 0, 3 },
     /* lddramj (Tom stream + concurrent DSP hammer) is RETIRED from the default
      * run: it answered its question (Jerry does not measurably contend with Tom
      * — 656 vs 656 ticks mode B, twice, with DSPMARK proving the DSP ran), and
@@ -264,7 +267,24 @@ static void bench68k(int idx, int mode)
         op_display(1);
     prev = R16(VC_REG) & 0x7FF;
     while (wraps < p->reps) {
-        if (p->cpubench == 2) {
+        if (p->cpubench == 3) {
+            /* The three instructions holding ~64% of OpenLara's frame
+             * (histogram 714ea70): move.b (a0)+,(a1)+ / cmpa.l / bne. One
+             * unit = 64 bytes copied, DRAM_BUF -> DRAM_BUF+64K, exactly the
+             * hot loop's shape so the hw/sim ratio applies to the REAL
+             * critical path — the fetch/data probes measure other mixes and
+             * their ratios (1.26x/1.51x) contradict the whole-program fps
+             * unless this loop times differently. */
+            __asm__ volatile(
+                "movea.l %0,%%a0\n"
+                "movea.l %1,%%a1\n"
+                "lea 64(%%a0),%%a2\n"
+                "1: move.b (%%a0)+,(%%a1)+\n"
+                "cmpa.l %%a2,%%a0\n"
+                "bne.s 1b\n"
+                : : "r"(DRAM_BUF), "r"(DRAM_BUF + 0x10000UL)
+                : "a0", "a1", "a2", "cc", "memory");
+        } else if (p->cpubench == 2) {
             /* Register-only unit of work: 16 taken DBRAs, no data access.
              * Inline asm so -O2 cannot delete the "useless" loop. The 68000
              * still FETCHES every iteration from DRAM — that is the point:

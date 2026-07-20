@@ -1,0 +1,13 @@
+jcp v02.04.02 built on Jul  6 2026
+
+COFF File:  Skip 168 bytes, base addr is $4000, length is 21408 bytes
+Sending...|/-\| 
+/-Jag accepted start request at $00004000.
+ 
+Finished in 3093 millis, 6KB/second.
+ 
+Starting console...
+Cobweb jsim calibration suite v1
+CAL m68kbus  A s=00000000 e=00001E26 w=00000000 r=0000001E
+CAL m68kreg  A s=00000000 e=000041CD w=00000000 r=0000001E
+CAL m68kcpy  A s=00000000 e=000008F2 w=00000000 r=0000001E

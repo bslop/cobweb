@@ -1,0 +1,33 @@
+=== 68k cycle profile (2600 frames) ===
+  total charged      576295200
+  asleep in STOP     329144720   57.1%   (waiting on an interrupt — not frame cost)
+  awake              247150480   42.9%
+    in vblank ISR       672344    0.3% of awake   (53761 instrs)
+    main line        246478136   99.7% of awake   (24388095 instrs)
+
+=== wall-clock accounting (43.38 s simulated) ===
+  68000 awake       18.589 s   42.9%
+  Tom GPU busy      24.810 s   57.2%   (of which Blitter 6.486 s, 15.0%)
+  Jerry DSP busy    42.651 s   98.3%
+
+  pc               cycles % awake       instrs  symbol
+  0x0064D6       16129806   6.53%      1612842  main+0x23E
+  0x0064CC       12905348   5.22%      1612867  main+0x234
+  0x0064CE       12905172   5.22%      1612863  main+0x236
+  0x0064D4        9679396   3.92%      1612859  main+0x23C
+  0x007492        9466080   3.83%       947200  main+0x11FA
+  0x00748C        7577600   3.07%       947200  main+0x11F4
+  0x007490        5683200   2.30%       947200  main+0x11F8
+  0x004936        3307932   1.34%        44703  0xec8+0x7F2
+  0x00493A        3307800   1.34%        44700  0xec8+0x7F6
+  0x0048D2        3307800   1.34%        44700  0xec8+0x78E
+  0x004910        3307800   1.34%        44700  0xec8+0x7CC
+  0x004922        3307800   1.34%        44700  0xec8+0x7DE
+  0x004928        3307800   1.34%        44700  0xec8+0x7E4
+  0x0048D8        3307800   1.34%        44700  0xec8+0x794
+  0x0048DE        3307800   1.34%        44700  0xec8+0x79A
+  0x0048F2        3307800   1.34%        44700  0xec8+0x7AE
+  0x0048F8        3307800   1.34%        44700  0xec8+0x7B4
+  0x0048FE        3307800   1.34%        44700  0xec8+0x7BA
+  0x004904        3307800   1.34%        44700  0xec8+0x7C0
+  0x00490A        3307800   1.34%        44700  0xec8+0x7C6
