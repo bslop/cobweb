@@ -489,3 +489,56 @@ impl M68k {
 }
 
 mod exec;
+
+impl M68k {
+    /// Service a GameDrive GDBIOS call. The synthetic BIOS block's dispatch
+    /// entries are `trap #n ; rts`, so the 68000 arrives here with the ROM's
+    /// register ABI intact (see `gamedrive` and OpenLara's `gdbios.S`):
+    ///
+    /// | fn | trap | in | out (d0) |
+    /// |----|------|----|----|
+    /// | INIT   | 1  | —                                   | 0 |
+    /// | CARDIN | 9  | —                                   | 1 = card present |
+    /// | FOPEN  | 10 | a0=name, d0.w=mode                  | handle, or -1 |
+    /// | FCLOSE | 11 | d0.w=handle                         | 0 |
+    /// | FREAD  | 13 | d0=(flags<<16)|handle, a0=buf, d1=n | **0 = success** |
+    /// | FSIZE  | 0  | d0.w=handle                         | size |
+    ///
+    /// Returns `None` for a trap we don't own, so it takes the normal path.
+    fn gamedrive_trap(&mut self, bus: &mut Bus, trap: u8) -> Option<u32> {
+        use crate::gamedrive as gd;
+        let (d0, d1, a0) = (self.d[0], self.d[1], self.a[0]);
+        if std::env::var_os("JAGEMU_GD_DEBUG").is_some() {
+            eprintln!("GDTRAP #{trap} d0={d0:#010X} d1={d1:#010X} a0={a0:#010X}");
+        }
+        let result = match trap {
+            gd::FN_INIT => 0,
+            gd::FN_CARDIN => bus.gamedrive.as_ref()?.card_in(),
+            gd::FN_FOPEN => {
+                let mut name = String::new();
+                for i in 0..64u32 {
+                    let c = bus.read8(a0.wrapping_add(i));
+                    if c == 0 {
+                        break;
+                    }
+                    name.push(c as char);
+                }
+                bus.gamedrive.as_mut()?.fopen(&name)
+            }
+            gd::FN_FCLOSE => bus.gamedrive.as_mut()?.fclose(d0 as u16),
+            gd::FN_FREAD => match bus.gamedrive.as_mut()?.fread(d0 as u16, d1) {
+                Some(data) => {
+                    for (i, b) in data.iter().enumerate() {
+                        bus.write8(a0.wrapping_add(i as u32), *b);
+                    }
+                    0 // upstream convention: 0 means SUCCESS, not a byte count
+                }
+                None => u32::MAX,
+            },
+            gd::TRAP_FOR_FSIZE => bus.gamedrive.as_ref()?.fsize(d0 as u16),
+            _ => return None,
+        };
+        self.d[0] = result;
+        Some(20)
+    }
+}

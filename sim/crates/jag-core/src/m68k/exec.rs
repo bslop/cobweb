@@ -425,8 +425,15 @@ impl M68k {
             }
             _ => {
                 if op & 0xFFF0 == 0x4E40 {
-                    // TRAP #n
+                    // TRAP #n. With a GameDrive attached, the traps used by our
+                    // synthetic GDBIOS block are serviced host-side instead of
+                    // vectoring (see `gamedrive`); everything else is a real trap.
                     let n = (op & 0xF) as u32;
+                    if bus.gamedrive.is_some() {
+                        if let Some(c) = self.gamedrive_trap(bus, n as u8) {
+                            return c;
+                        }
+                    }
                     return self.exception(bus, 32 + n, false);
                 }
                 if op & 0xFFF8 == 0x4E50 {

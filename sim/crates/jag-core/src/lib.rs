@@ -14,6 +14,7 @@ pub mod debug;
 pub mod jerry;
 pub mod m68k;
 pub mod mem;
+pub mod gamedrive;
 pub mod risc;
 pub mod scheduler;
 pub mod tom;

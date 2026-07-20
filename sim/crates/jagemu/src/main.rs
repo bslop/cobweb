@@ -27,6 +27,7 @@ fn main() -> ExitCode {
     }
     let cmd = args[0].as_str();
     let rest = &args[1..];
+    let _ = SD_DIR.set(flag_val(rest, "--sd").map(|s| s.to_string()));
     let result = match cmd {
         "info" => cmd_info(rest),
         "run" => cmd_run(rest),
@@ -151,6 +152,19 @@ fn fidelity_arg(args: &[String]) -> Result<Fidelity, String> {
 
 /// Boot, optionally pressing `buttons` (joyedge bit word) on port 1 from frame
 /// `press_after` onward (idle before, so edge-sensitive title screens trigger).
+/// Host directory attached as the GameDrive SD card (`--sd <dir>`), parsed once
+/// in `main` so every boot path picks it up.
+static SD_DIR: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+/// Attach the emulated GameDrive if `--sd` was given. Without it the SPI window
+/// floats and `gd_install` fails its bounded waits — i.e. "no GameDrive", which
+/// is exactly the state a ROM must already handle.
+fn attach_sd(jag: &mut Jaguar) {
+    if let Some(Some(dir)) = SD_DIR.get() {
+        jag.bus.gamedrive = Some(jag_core::gamedrive::GameDrive::new(dir));
+    }
+}
+
 fn boot_input(
     rom: &[u8],
     frames: u64,
@@ -160,6 +174,7 @@ fn boot_input(
 ) -> Result<Jaguar, String> {
     let mut jag = Jaguar::new();
     jag.load(rom).map_err(|e| e.to_string())?;
+    attach_sd(&mut jag);
     jag.gpu.fidelity = fid;
     jag.dsp.fidelity = fid;
     if buttons != 0 && press_after < frames {
@@ -221,6 +236,7 @@ fn cmd_info(args: &[String]) -> Result<(), String> {
     let (path, data) = load_rom(args)?;
     let mut jag = Jaguar::new();
     let cart = jag.load(&data).map_err(|e| e.to_string())?;
+    attach_sd(&mut jag);
     let secs: Vec<String> = cart
         .sections
         .iter()
@@ -297,6 +313,7 @@ fn cmd_video(args: &[String]) -> Result<(), String> {
 
     let mut jag = Jaguar::new();
     jag.load(&data).map_err(|e| e.to_string())?;
+    attach_sd(&mut jag);
     let frames = jag_headless::capture_sequence(&mut jag, start, count, every, btn);
 
     // Optionally write each frame individually.
@@ -372,6 +389,7 @@ fn cmd_playtest(args: &[String]) -> Result<(), String> {
 
     let mut jag = Jaguar::new();
     jag.load(&data).map_err(|e| e.to_string())?;
+    attach_sd(&mut jag);
 
     // Capture `shots` frames evenly across the run, applying inputs on schedule.
     let mut frames_out: Vec<jag_core::Framebuffer> = Vec::new();
@@ -464,6 +482,7 @@ fn cmd_audio(args: &[String]) -> Result<(), String> {
     let out = flag_val(args, "-o").or_else(|| flag_val(args, "--out")).unwrap_or("audio.wav");
     let mut jag = Jaguar::new();
     jag.load(&data).map_err(|e| e.to_string())?;
+    attach_sd(&mut jag);
     let (rate, samples, wav) = jag_headless::capture_audio(&mut jag, frames, btn, after);
     std::fs::write(out, &wav).map_err(|e| format!("writing {out}: {e}"))?;
     let (peak, rms) = jag_headless::wav::stats(&samples);
@@ -607,6 +626,7 @@ fn cmd_break(args: &[String]) -> Result<(), String> {
     };
     let mut jag = Jaguar::new();
     jag.load(&data).map_err(|e| e.to_string())?;
+    attach_sd(&mut jag);
     jag.gpu.fidelity = fidelity_arg(args)?;
     jag.dsp.fidelity = fidelity_arg(args)?;
     // Apply input timing: idle to `after`, press, then arm the breakpoint so we
@@ -915,6 +935,7 @@ fn cmd_serve(args: &[String]) -> Result<(), String> {
 
     let mut jag = Jaguar::new();
     let cart = jag.load(&data).map_err(|e| e.to_string())?;
+    attach_sd(&mut jag);
     let entry = cart.entry;
 
     println!(

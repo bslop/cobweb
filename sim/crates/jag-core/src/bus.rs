@@ -155,6 +155,9 @@ pub struct Bus {
     /// Optional boot ROM.
     pub bootrom: Vec<u8>,
     pub tom: Tom,
+    /// Attached GameDrive/SD (emulated SPI device at $F16002-5). None = absent,
+    /// which is what `gd_install` detects via its bounded SPI waits.
+    pub gamedrive: Option<crate::gamedrive::GameDrive>,
     pub jerry: Jerry,
     /// Count of bus accesses, for the debugger / profiler.
     pub access_count: u64,
@@ -179,6 +182,7 @@ impl Bus {
             cart: Vec::new(),
             bootrom: Vec::new(),
             tom: Tom::new(),
+            gamedrive: None,
             jerry: Jerry::new(),
             access_count: 0,
             audio: Vec::new(),
@@ -354,6 +358,14 @@ impl Bus {
     // ── JERRY register dispatch ─────────────────────────────────────────────
 
     fn jerry_read8(&mut self, a: u32) -> u8 {
+        if let Some(gd) = self.gamedrive.as_ref() {
+            match a {
+                crate::gamedrive::SPI_DATAB => return gd.read_datab(),
+                crate::gamedrive::SPI_STATUS => return (gd.status() >> 8) as u8,
+                x if x == crate::gamedrive::SPI_STATUS + 1 => return gd.status() as u8,
+                _ => {}
+            }
+        }
         // The joypad lives at $F14000 (JOYSTICK<<16 | JOYBUTS, read as 32-bit).
         if (mem::JOYSTICK..mem::JOYSTICK + 4).contains(&a) {
             let joy = crate::jerry::joy32(self.jerry.strobe, self.jerry.pads[0]);
@@ -364,6 +376,16 @@ impl Bus {
     }
 
     fn jerry_write8(&mut self, a: u32, v: u8) {
+        if self.gamedrive.is_some() && (crate::gamedrive::SPI_STATUS..=crate::gamedrive::SPI_DATAB).contains(&a) {
+            // byte-wide access into the SPI window: compose onto the word path
+            let gd = self.gamedrive.as_mut().unwrap();
+            match a {
+                crate::gamedrive::SPI_DATAB => gd.write_data(v as u16),
+                x if x == crate::gamedrive::SPI_STATUS + 1 => gd.write_status(v as u16),
+                _ => {}
+            }
+            return;
+        }
         self.jerry.win.w8(a, v);
         // A write to JOYSTICK selects the controller-scan column.
         if a == mem::JOYSTICK || a == mem::JOYSTICK + 1 {
