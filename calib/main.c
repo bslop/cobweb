@@ -159,7 +159,7 @@ static const struct probe probes[] = {
      * the Blitter and both RISCs. Mode A = OP parked on a bare STOP, mode B =
      * OP scanning a full 320x240 bitmap. The A/B delta IS the 68k's scan-out
      * tax, which jsim currently models as exactly zero. */
-    { "m68kbus ", 0, 0, 0, 0, 32, 0, 0, 0, 0, 0, 1 },
+    { "m68kbus ", 0, 0, 0, 0, 30, 0, 0, 0, 0, 0, 1 },
     /* lddramj (Tom stream + concurrent DSP hammer) is RETIRED from the default
      * run: it answered its question (Jerry does not measurably contend with Tom
      * — 656 vs 656 ticks mode B, twice, with DSPMARK proving the DSP ran), and
@@ -232,38 +232,43 @@ static u32 slot_of(int idx, int mode)
  * Safe by construction: nothing here can wedge the console. The 68k never
  * waits on another master (no busy-poll, no cpu_stop), video timing and the VI
  * are untouched, and op_display only swaps OLP between a bitmap and a STOP. */
+/* Time-bounded 68k throughput: run for a FIXED number of fields and count how
+ * much work completed. Reported as blocks-of-16-longs in the `end` slot, so a
+ * HIGHER number is faster and mode A / mode B / jsim are directly comparable.
+ *
+ * The first design was work-bounded (fixed reps, measure elapsed time) and that
+ * was wrong: it sampled VC once per rep, so once a saturating OP stretched a rep
+ * past one field the wrap count silently undercounted, the self-abort could
+ * never fire, and mode B simply never reported inside a 150 s capture window —
+ * twice. Fixing the bound rather than guessing how slow "slow" gets: this form
+ * terminates in `p->reps` fields no matter how badly the 68000 is starved, and
+ * VC is sampled every 16 longs so a wrap cannot hide between samples even at a
+ * 50x slowdown. */
 static void bench68k(int idx, int mode)
 {
     const struct probe *p = &probes[idx];
     u32 res = slot_of(idx, mode);
     volatile u32 *q;
-    u32 start, cur, prev, wraps = 0, i, j;
+    u32 cur, prev, wraps = 0, blocks = 0, j;
 
     if (mode)
         op_display(1);
-    start = R16(VC_REG) & 0x7FF;
-    prev = start;
-    for (i = 0; i < p->reps; i++) {
+    prev = R16(VC_REG) & 0x7FF;
+    while (wraps < p->reps) {
         q = (volatile u32 *)DRAM_BUF;
-        for (j = 0; j < 256; j++)
+        for (j = 0; j < 16; j++)
             (void)*q++;
+        blocks++;
         cur = R16(VC_REG) & 0x7FF;
         if (cur < prev)
-            wraps++; /* checked once per rep — far too often to miss a wrap */
+            wraps++;
         prev = cur;
-        /* Hard abort. A saturating OP starves the 68000 badly enough that the
-         * original 256-rep workload never reported inside a 150 s capture, so
-         * the bench bounds itself rather than trusting an estimate: ~400 fields
-         * is 6.7 s, well past any legitimate result. */
-        if (wraps > 400)
-            break;
     }
-    cur = R16(VC_REG) & 0x7FF;
     if (mode)
         op_display(0);
-    R32(res) = start;
-    R32(res + 4) = cur;
-    R32(res + 8) = wraps;
+    R32(res) = 0;
+    R32(res + 4) = blocks; /* the measurement: work done in p->reps fields */
+    R32(res + 8) = 0;
     R32(res + 12) = MAGIC_DONE;
 }
 
