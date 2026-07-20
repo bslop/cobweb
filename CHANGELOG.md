@@ -10,6 +10,49 @@ Headline: the simulator now renders OpenLara's textured 3D room, the optimizer
 proves its wins against real rendered output, and a one-character assembler bug
 that had been silently dropping conditional blocks is fixed.
 
+### 2026-07-19 — the asynchronous Blitter, a 68k profiler, and the fixture pipeline
+
+- **jsim: the Blitter is asynchronous** — resolves OpenLara's reported 2.4x
+  fill over-charge, and every cost-side hypothesis died on hardware first:
+  XADDINC source coalescing (refuted — `du=0.25` costs the same as `du=1.0` on
+  silicon), short-span launch overhead (refuted — new 1/2/4-px probes match
+  within ~5% across the whole 1–256 px curve). The real mechanism was
+  concurrency: gpu_geotex overlaps each blit with the next span's DDA math and
+  jsim serialized it by charging the full duration to the launching `B_CMD`
+  store. Launch now costs a store; `B_CMD` reads report busy until the
+  (unchanged, silicon-calibrated) duration drains. NOFILL fill share: 24% →
+  **10.5% vs 10.1% on hardware**; Caves fps 4.59 → 5.37 vs hw 4.9.
+  *(commits d384217, f64f3f7, 168a834)*
+- **jagemu: exact 68k cycle profiler** (`run --pc-histogram [--map] [--bucket]
+  [--top]`) — per-PC cycle attribution (not sampled), STOP-sleep tracked
+  separately, ISR-vs-main split, plus wall-clock accounting per master.
+  Requested by OpenLara; first run also caught its own trap: the tree's stale
+  non-AUTOSTART binary sits on the title screen forever, and profiling it
+  produced a convincing wrong answer for three reply files before a screenshot
+  exposed it. Corrections issued same-day. *(commits 714ea70, 6b52c50, 737fbf4)*
+- **jsim: wild bus accesses no longer abort the process** — `Window` accessors
+  are bounds-checked (reads off the end return 0, writes drop), fixing the
+  reported crash that killed long profiling runs. *(commit 7336d6a)*
+- **jas/jopt: `-d NAME[=VALUE]` build defines** — previously neither tool
+  could assemble a kernel that needs its Makefile define set (gpu_geotex needs
+  eight), which made jopt unusable on the one kernel that matters.
+  *(commit c122535)*
+- **jopt: fixture pipeline proven end to end** — `calib/mkfixture.py`
+  snapshots live state out of jagemu into a certificate fixture (deriving the
+  capture region from the kernel's own params, zeroing the self-masking
+  overlap), and jopt now lands **34 certified delay-slot fills on the
+  production gpu_geotex** (3526 → 3458 bytes) with byte-identical rendered
+  output, verified independently via the new `jtest` `fxrun` post-mortem
+  example. *(commits c122535, e9041c4)*
+- **calib: 68k timing calibration set** — the 68000 measured against silicon
+  at three instruction mixes (fetch-only 1.29x, DRAM reads 1.54x, bytewise
+  copy 1.73x — jsim too fast in all three), OP-vs-68k contention null three
+  ways. A flat per-bus-cycle charge is calibrated and parked on
+  `wip/m68k-bus-wait`: correct on the bench, wrong to merge until a split
+  fetch/data model exists (the async-Blitter fix leaves jsim ~10% fast on the
+  Caves scene, the expected size of this term). *(commits 4595b82, 78a6808,
+  ea50a5c, 87dd39e)*
+
 ### jas — the hazard-aware assembler
 
 - **`.if`/`.rept` conditions accept a lone `=` as equality.** The expression
