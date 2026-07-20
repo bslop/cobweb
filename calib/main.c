@@ -84,7 +84,9 @@ struct probe {
     char *ds, *de;    /* optional DSP hammer: run on Jerry concurrently */
     int op;           /* 1 = run with the OP scanning a full-screen bitmap */
     int bonly;        /* 1 = mode B only (mode A's busy-poll would be starved) */
-    int cpubench;     /* 1 = 68k-side benchmark, not a GPU kernel (see bench68k) */
+    int cpubench;     /* 68k-side benchmark, not a GPU kernel (see bench68k):
+                       * 1 = DRAM read stream (fetch + data both external)
+                       * 2 = register-only dbra loop (fetch-only bus traffic) */
 };
 
 #define D_RAM 0xF1B000UL
@@ -160,6 +162,13 @@ static const struct probe probes[] = {
      * OP scanning a full 320x240 bitmap. The A/B delta IS the 68k's scan-out
      * tax, which jsim currently models as exactly zero. */
     { "m68kbus ", 0, 0, 0, 0, 30, 0, 0, 0, 0, 0, 1 },
+    /* Fetch-only companion to m68kbus. jsim's 68000 is 1.56x too fast on a
+     * DRAM READ stream (fetch + data conflated); this register-only loop has
+     * no data accesses, so its hw/sim ratio isolates the FETCH penalty. If it
+     * comes back near 1.0x the wait belongs on data only and wip/m68k-bus-wait
+     * is mergeable with a data-only charge; if near 1.56x the whole model is
+     * wrong somewhere subtler. */
+    { "m68kreg ", 0, 0, 0, 0, 30, 0, 0, 0, 0, 0, 2 },
     /* lddramj (Tom stream + concurrent DSP hammer) is RETIRED from the default
      * run: it answered its question (Jerry does not measurably contend with Tom
      * — 656 vs 656 ticks mode B, twice, with DSPMARK proving the DSP ran), and
@@ -255,9 +264,23 @@ static void bench68k(int idx, int mode)
         op_display(1);
     prev = R16(VC_REG) & 0x7FF;
     while (wraps < p->reps) {
-        q = (volatile u32 *)DRAM_BUF;
-        for (j = 0; j < 16; j++)
-            (void)*q++;
+        if (p->cpubench == 2) {
+            /* Register-only unit of work: 16 taken DBRAs, no data access.
+             * Inline asm so -O2 cannot delete the "useless" loop. The 68000
+             * still FETCHES every iteration from DRAM — that is the point:
+             * the hw/sim ratio of this probe isolates the instruction-fetch
+             * cost, while m68kbus (DRAM reads) conflates fetch + data. The
+             * wip/m68k-bus-wait question is exactly which of the two carries
+             * the measured 1.56x. */
+            __asm__ volatile(
+                "moveq #15,%%d0\n"
+                "1: dbra %%d0,1b\n"
+                : : : "d0", "cc");
+        } else {
+            q = (volatile u32 *)DRAM_BUF;
+            for (j = 0; j < 16; j++)
+                (void)*q++;
+        }
         blocks++;
         cur = R16(VC_REG) & 0x7FF;
         if (cur < prev)
