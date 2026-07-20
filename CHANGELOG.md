@@ -10,6 +10,18 @@ Headline: the simulator now renders OpenLara's textured 3D room, the optimizer
 proves its wins against real rendered output, and a one-character assembler bug
 that had been silently dropping conditional blocks is fixed.
 
+### 2026-07-20 — the 68000 pays for its bus
+
+- **jsim: 68k external-bus wait charge, split fetch/data** — the cacheless
+  68000 no longer gets textbook timings against free memory. Whole-program
+  validation on OpenLara's Caves: **4.95 fps vs 4.90 on hardware (+1.0%)**,
+  NOFILL 5.43 vs 5.45 (−0.4%), fill share 8.8% vs 10.1%. Constants are
+  game-anchored; the disclosed gap is that dense synthetic access streams
+  (the calib probes) need ~16x the data charge to match silicon — no linear
+  model fits both regimes, the evidence points at bus-grant queueing, and a
+  density-sweep probe family is queued to pin it. Supersedes
+  `wip/m68k-bus-wait`. *(commit 147eda8)*
+
 ### 2026-07-19 — the asynchronous Blitter, a 68k profiler, and the fixture pipeline
 
 - **jsim: the Blitter is asynchronous** — resolves OpenLara's reported 2.4x
@@ -49,9 +61,8 @@ that had been silently dropping conditional blocks is fixed.
   copy 1.73x — jsim too fast in all three), OP-vs-68k contention null three
   ways. A flat per-bus-cycle charge is calibrated and parked on
   `wip/m68k-bus-wait`: correct on the bench, wrong to merge until a split
-  fetch/data model exists (the async-Blitter fix leaves jsim ~10% fast on the
-  Caves scene, the expected size of this term). *(commits 4595b82, 78a6808,
-  ea50a5c, 87dd39e)*
+  fetch/data model exists. *(commits 4595b82, 78a6808, ea50a5c, 87dd39e;
+  resolved next day by 147eda8 — see 2026-07-20 above)*
 
 ### jas — the hazard-aware assembler
 
