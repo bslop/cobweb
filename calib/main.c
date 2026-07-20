@@ -84,6 +84,7 @@ struct probe {
     char *ds, *de;    /* optional DSP hammer: run on Jerry concurrently */
     int op;           /* 1 = run with the OP scanning a full-screen bitmap */
     int bonly;        /* 1 = mode B only (mode A's busy-poll would be starved) */
+    int cpubench;     /* 1 = 68k-side benchmark, not a GPU kernel (see bench68k) */
 };
 
 #define D_RAM 0xF1B000UL
@@ -151,6 +152,14 @@ static const struct probe probes[] = {
     { "blittex1", p_blittex1_s, p_blittex1_e, 0, 0, 128, DRAM_BUF },
     { "blittexq", p_blittexq_s, p_blittexq_e, 0, 0, 128, DRAM_BUF },
     { "lddramop", p_lddram_s, p_lddram_e, 0, 0, 512, DRAM_BUF, 0, 0, 1, 1 },
+    /* 68k-side: the ONLY probe that times the 68000 itself rather than Tom.
+     * jsim charges the 68k textbook instruction cycles against a free bus, and
+     * feeds m68k_on_bus one way only (68k slows the GPU, never the reverse) —
+     * but on silicon the 68000 is the LOWEST-priority master, below the OP,
+     * the Blitter and both RISCs. Mode A = OP parked on a bare STOP, mode B =
+     * OP scanning a full 320x240 bitmap. The A/B delta IS the 68k's scan-out
+     * tax, which jsim currently models as exactly zero. */
+    { "m68kbus ", 0, 0, 0, 0, 32, 0, 0, 0, 0, 0, 1 },
     /* lddramj (Tom stream + concurrent DSP hammer) is RETIRED from the default
      * run: it answered its question (Jerry does not measurably contend with Tom
      * — 656 vs 656 ticks mode B, twice, with DSPMARK proving the DSP ran), and
@@ -211,6 +220,51 @@ static void say(const char *s)
 static u32 slot_of(int idx, int mode)
 {
     return RESULTS + ((u32)idx << 5) + ((u32)mode << 4);
+}
+
+#define VC_REG 0xF00006UL
+
+/* Time a fixed 68k DRAM read stream against the VC half-line counter. No GPU
+ * kernel is involved: this measures the 68000's own throughput, with the OP
+ * either idle (mode A) or saturating scan-out (mode B). Same result-slot
+ * format as the GPU probes, so report()/parse_results.py need no special case.
+ *
+ * Safe by construction: nothing here can wedge the console. The 68k never
+ * waits on another master (no busy-poll, no cpu_stop), video timing and the VI
+ * are untouched, and op_display only swaps OLP between a bitmap and a STOP. */
+static void bench68k(int idx, int mode)
+{
+    const struct probe *p = &probes[idx];
+    u32 res = slot_of(idx, mode);
+    volatile u32 *q;
+    u32 start, cur, prev, wraps = 0, i, j;
+
+    if (mode)
+        op_display(1);
+    start = R16(VC_REG) & 0x7FF;
+    prev = start;
+    for (i = 0; i < p->reps; i++) {
+        q = (volatile u32 *)DRAM_BUF;
+        for (j = 0; j < 256; j++)
+            (void)*q++;
+        cur = R16(VC_REG) & 0x7FF;
+        if (cur < prev)
+            wraps++; /* checked once per rep — far too often to miss a wrap */
+        prev = cur;
+        /* Hard abort. A saturating OP starves the 68000 badly enough that the
+         * original 256-rep workload never reported inside a 150 s capture, so
+         * the bench bounds itself rather than trusting an estimate: ~400 fields
+         * is 6.7 s, well past any legitimate result. */
+        if (wraps > 400)
+            break;
+    }
+    cur = R16(VC_REG) & 0x7FF;
+    if (mode)
+        op_display(0);
+    R32(res) = start;
+    R32(res + 4) = cur;
+    R32(res + 8) = wraps;
+    R32(res + 12) = MAGIC_DONE;
 }
 
 static int run_probe(int idx, int mode)
@@ -310,15 +364,33 @@ void cal_main(void)
     op_display(0);
 
     for (i = 0; i < NPROBES; i++) {
+#ifdef CPUBENCH_ONLY
+        if (!probes[i].cpubench)
+            continue; /* fast ROM: 68k bench only, completes inside one capture */
+#endif
         if (probes[i].bonly)
             continue; /* would starve the 68k's busy-poll — mode B only */
-        ok = run_probe(i, 0);
+        if (probes[i].cpubench) {
+            bench68k(i, 0);
+            ok = 1; /* self-timed: cannot wedge, and `ok` must not stay unset */
+        } else {
+            ok = run_probe(i, 0);
+        }
         report(i, 0, ok);
         if (!ok)
             goto wedged;
     }
     for (i = 1; i < NPROBES; i++) { /* vcmod runs once; skip in mode B */
-        ok = run_probe(i, 1);
+#ifdef CPUBENCH_ONLY
+        if (!probes[i].cpubench)
+            continue;
+#endif
+        if (probes[i].cpubench) {
+            bench68k(i, 1);
+            ok = 1; /* self-timed: cannot wedge, and `ok` must not stay unset */
+        } else {
+            ok = run_probe(i, 1);
+        }
         report(i, 1, ok);
         if (!ok)
             goto wedged;
