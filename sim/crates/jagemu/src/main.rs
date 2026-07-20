@@ -1223,7 +1223,7 @@ fn timing_json(t: &TimingStats) -> String {
         "{{\"stall_alu\":{},\"stall_load\":{},\"stall_div\":{},\"stall_flags\":{},\
          \"stall_div_busy\":{},\"jump_refill\":{},\"fetch_external\":{},\"mem_external\":{},\
          \"waw_hazards\":{},\"indexed_store_stale\":{},\"slot_movei\":{},\"slot_jump\":{},\
-         \"bigpemu_divergence\":{},\"contention\":{}}}",
+         \"bigpemu_divergence\":{},\"contention\":{},\"blit\":{}}}",
         t.stall_alu,
         t.stall_load,
         t.stall_div,
@@ -1237,7 +1237,8 @@ fn timing_json(t: &TimingStats) -> String {
         t.slot_movei,
         t.slot_jump,
         t.bigpemu_divergence,
-        t.contention
+        t.contention,
+        t.blit
     )
 }
 
