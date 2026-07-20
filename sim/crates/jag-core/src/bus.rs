@@ -37,46 +37,73 @@ impl Window {
     fn new(base: u32, size: usize) -> Self {
         Window { bytes: vec![0u8; size].into_boxed_slice(), base }
     }
+    /// Offset of `addr` within the window, or `None` if it falls outside.
+    ///
+    /// Every accessor below is bounds-checked. A wild address used to index the
+    /// backing array directly and ABORT THE PROCESS
+    /// (COBWEB_BUG_bus_oob_panic.md: "index out of bounds: the len is 65536 but
+    /// the index is 65536", from a 16-bit read straddling the final byte).
+    /// Real hardware floats the bus and returns garbage for an unmapped access;
+    /// it does not halt the machine, and a panic here killed long profiling
+    /// runs and made any experiment that put a kernel into a bad state unusable.
+    /// Reads off the end now return 0 and writes are dropped.
     #[inline]
-    fn off(&self, addr: u32) -> usize {
-        (addr - self.base) as usize
+    fn off(&self, addr: u32) -> Option<usize> {
+        let o = addr.wrapping_sub(self.base) as usize;
+        if o < self.bytes.len() {
+            Some(o)
+        } else {
+            None
+        }
+    }
+    #[inline]
+    fn get(&self, addr: u32, n: usize) -> Option<usize> {
+        let o = self.off(addr)?;
+        if o + n <= self.bytes.len() {
+            Some(o)
+        } else {
+            None
+        }
     }
     #[inline]
     pub fn r8(&self, addr: u32) -> u8 {
-        self.bytes[self.off(addr)]
+        self.get(addr, 1).map_or(0, |o| self.bytes[o])
     }
     #[inline]
     pub fn w8(&mut self, addr: u32, v: u8) {
-        let o = self.off(addr);
-        self.bytes[o] = v;
+        if let Some(o) = self.get(addr, 1) {
+            self.bytes[o] = v;
+        }
     }
     #[inline]
     pub fn r16(&self, addr: u32) -> u16 {
-        let o = self.off(addr);
-        u16::from_be_bytes([self.bytes[o], self.bytes[o + 1]])
+        self.get(addr, 2)
+            .map_or(0, |o| u16::from_be_bytes([self.bytes[o], self.bytes[o + 1]]))
     }
     #[inline]
     pub fn w16(&mut self, addr: u32, v: u16) {
-        let o = self.off(addr);
-        let b = v.to_be_bytes();
-        self.bytes[o] = b[0];
-        self.bytes[o + 1] = b[1];
+        if let Some(o) = self.get(addr, 2) {
+            let b = v.to_be_bytes();
+            self.bytes[o] = b[0];
+            self.bytes[o + 1] = b[1];
+        }
     }
     #[inline]
     pub fn r32(&self, addr: u32) -> u32 {
-        let o = self.off(addr);
-        u32::from_be_bytes([
-            self.bytes[o],
-            self.bytes[o + 1],
-            self.bytes[o + 2],
-            self.bytes[o + 3],
-        ])
+        self.get(addr, 4).map_or(0, |o| {
+            u32::from_be_bytes([
+                self.bytes[o],
+                self.bytes[o + 1],
+                self.bytes[o + 2],
+                self.bytes[o + 3],
+            ])
+        })
     }
     #[inline]
     pub fn w32(&mut self, addr: u32, v: u32) {
-        let o = self.off(addr);
-        let b = v.to_be_bytes();
-        self.bytes[o..o + 4].copy_from_slice(&b);
+        if let Some(o) = self.get(addr, 4) {
+            self.bytes[o..o + 4].copy_from_slice(&v.to_be_bytes());
+        }
     }
 }
 
@@ -477,5 +504,32 @@ mod tests {
         bus.write32(mem::VMODE, 0x06C7_1234);
         assert_eq!(bus.read16(mem::VMODE), 0x06C7);
         assert_eq!(bus.read16(mem::BORD1), 0x1234);
+    }
+}
+
+#[cfg(test)]
+mod oob_tests {
+    use super::*;
+
+    /// COBWEB_BUG_bus_oob_panic.md — a wild or straddling access must not abort
+    /// the process. Hardware floats the bus; jsim returns 0 and drops writes.
+    #[test]
+    fn window_access_past_the_end_does_not_panic() {
+        let mut w = Window::new(0xF00000, 0x10000);
+        let last = 0xF00000 + 0xFFFF;
+        assert_eq!(w.r8(last + 1), 0, "one past the end reads 0");
+        assert_eq!(w.r16(last), 0, "16-bit read straddling the end reads 0");
+        assert_eq!(w.r32(last - 1), 0, "32-bit read straddling the end reads 0");
+        assert_eq!(w.r32(0xFFFFFFFF), 0, "wild address reads 0");
+        // Writes off the end are dropped, not panics, and do not corrupt the tail.
+        w.w16(last, 0xDEAD);
+        w.w32(last - 1, 0xDEADBEEF);
+        w.w8(last + 1, 0xFF);
+        w.w32(0xFFFFFFFF, 0xDEADBEEF);
+        assert_eq!(w.r8(last), 0, "dropped write left the last byte untouched");
+        // In-range accesses still work.
+        w.w32(0xF00000, 0x01020304);
+        assert_eq!(w.r32(0xF00000), 0x01020304);
+        assert_eq!(w.r16(0xF00002), 0x0304);
     }
 }
