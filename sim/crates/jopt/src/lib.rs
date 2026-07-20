@@ -163,6 +163,38 @@ fn fingerprint(
 }
 
 /// True if two runs are behaviorally identical (captured region + registers).
+/// True if a register difference is only a **relocated label**: both the old
+/// and new values point inside this kernel's own code, so the register holds a
+/// code address that moved because the transform removed an instruction.
+///
+/// Filling a delay slot necessarily shifts every label after the fill site by
+/// one word, so any `movei #label,rN` live at the end of the run reports a
+/// 2-byte difference. That is the transform doing exactly its job, not a
+/// behavioural change — and without this the certificate rejected *every*
+/// offered fill (104 offered, 104 rejected on a real kernel) while the captured
+/// output was byte-identical.
+///
+/// Deliberately strict: BOTH values must be in range. A register that changes
+/// from a code address to something else (or the reverse) is a real divergence
+/// and still fails.
+fn only_relocated_label(x: u32, y: u32, code: (u32, u32)) -> bool {
+    let (org, len) = code;
+    let in_code = |v: u32| v >= org && v < org.saturating_add(len);
+    in_code(x) && in_code(y)
+}
+
+/// Behavioural equivalence: the captured output must match exactly, and any
+/// register difference must be a relocated label (see above). The captured
+/// region is the real observable — registers are a corroborating signal.
+fn equivalent_in(a: &jtest::RunResult, b: &jtest::RunResult, code: (u32, u32)) -> bool {
+    let d = compare(a, b);
+    if d.mem.is_some() {
+        return false;
+    }
+    d.regs.iter().all(|(_, x, y)| only_relocated_label(*x, *y, code))
+}
+
+#[allow(dead_code)]
 fn equivalent(a: &jtest::RunResult, b: &jtest::RunResult) -> bool {
     compare(a, b).is_empty()
 }
@@ -482,6 +514,7 @@ pub fn optimize_fixture(
                             base_fp.as_ref(),
                             allow_input_hazards,
                             fixture,
+                            bytes_before,
                         ) {
                             Ok(()) => {
                                 transforms.push(Transform {
@@ -559,12 +592,17 @@ fn verify(
     base_fp: Option<&jtest::RunResult>,
     allow_hazards: bool,
     fx: Option<&Fixture>,
+    base_len: usize,
 ) -> Result<(), String> {
     let (bytes, org) = assemble(cand_src, target, allow_hazards)
         .ok_or_else(|| "candidate did not assemble (jas rejected it — hazard or range)".to_string())?;
+    // The kernel's own code span, so a register holding a label that the
+    // transform relocated is not mistaken for a behavioural difference. Span
+    // the larger of the two images: the candidate is a word shorter.
+    let code = (org, bytes.len().max(base_len) as u32);
     let fp = fingerprint(bytes, org, target, fx).ok_or_else(|| "candidate did not run".to_string())?;
     match base_fp {
-        Some(base) if equivalent(base, &fp) => Ok(()),
+        Some(base) if equivalent_in(base, &fp, code) => Ok(()),
         Some(_) => Err("candidate diverged from the original in jsim (certificate failed)".into()),
         None => Err("no baseline fingerprint".into()),
     }
@@ -721,6 +759,50 @@ mod tests {
             &fx.pre,
         );
         assert_eq!(word_at(&r.captured, 0), 0x1234_5678, "fill changed the fixture output");
+    }
+
+    #[test]
+    fn relocated_label_is_not_a_divergence() {
+        // Filling a slot removes an instruction, so every label after the fill
+        // site shifts one word. A register holding such a label reports a 2-byte
+        // difference that is NOT behavioural — before this rule the certificate
+        // rejected every offered fill on a real kernel while the captured output
+        // was byte-identical.
+        let code = (0x00F0_3000, 0x40);
+        // code -> code: a relocated label, ignorable
+        assert!(only_relocated_label(0x00F0_3010, 0x00F0_300E, code));
+        // but a register leaving/entering the code range is a real difference
+        assert!(!only_relocated_label(0x00F0_3010, 0x0000_0012, code));
+        assert!(!only_relocated_label(0x0000_0012, 0x00F0_3010, code));
+        // and two ordinary data values are never excused
+        assert!(!only_relocated_label(12, 13, code));
+        // nor an address outside this kernel's own span
+        assert!(!only_relocated_label(0x00F0_3050, 0x00F0_3052, code));
+    }
+
+    #[test]
+    fn accepts_a_safe_fill_that_only_moves_a_label() {
+        // The minimal repro: sinking `add r1,r2` into the wasted slot is
+        // trivially safe (5+7=12 stored either way), but `movei #tgt,r22` makes
+        // r22 hold a label that the fill relocates.
+        let src = "        .gpu\n\
+             \x20       moveq #5,r1\n\
+             \x20       moveq #7,r2\n\
+             \x20       movei #tgt,r22\n\
+             \x20       add r1,r2\n\
+             \x20       jump T,(r22)\n\
+             \x20       nop\n\
+             tgt:    movei #$00100000,r3\n\
+             \x20       store r2,(r3)\n"
+            .to_string()
+            + STOP;
+        let res = optimize(&src, RiscKind::Gpu);
+        assert_eq!(res.accepted(), 1, "a fill whose only effect is a moved label must certify");
+        assert!(res.bytes_after < res.bytes_before, "the nop should be gone");
+        // and the program still computes 5+7
+        let (bytes, org) = assemble(&res.source, RiscKind::Gpu, false).unwrap();
+        let r = run(&Spec { bytes, target: RiscKind::Gpu, org, budget: 50_000, capture: (0x0010_0000, 4), fidelity: Fidelity::Silicon });
+        assert_eq!(word_at(&r.captured, 0), 12);
     }
 
     #[test]
