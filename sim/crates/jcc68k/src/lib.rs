@@ -65,8 +65,11 @@ pub fn compile_program(src: &str) -> Result<String, String> {
 }
 
 /// The C runtime: 32-bit multiply/divide/modulo helpers the 68000 can't do in
-/// hardware (it only has 16×16 MUL and 32÷16 DIV). All take operands in D0/D1
-/// and return in D0, C-clobbering only caller-saved registers.
+/// hardware (it only has 16×16 MUL and 32÷16 DIV). **libgcc calling
+/// convention**: both operands on the stack (first at 4(sp)), result in D0,
+/// caller pops — so these are drop-in interchangeable with libgcc's own
+/// helpers (or a project's re-assembled copy) at link time, in both
+/// directions. Only D0/D1 are clobbered.
 pub fn runtime() -> &'static str {
     RUNTIME
 }
@@ -91,7 +94,10 @@ _start_halt:
 "#;
 
 const RUNTIME: &str = r#"
-; ── 32-bit runtime helpers (operands D0,D1 → result D0) ──────────────────────
+; ── 32-bit runtime helpers ───────────────────────────────────────────────────
+; libgcc calling convention: a at 4(sp), b at 8(sp), result in D0, caller
+; pops. Public entries load the stack args then fall into register-based
+; cores (the `_regs` labels, used for the internal calls).
 	.68000
 	.text
 	.globl __mulsi3
@@ -102,8 +108,10 @@ const RUNTIME: &str = r#"
 	.globl __mulfix
 	.globl __divfix
 
-; D0 = D0 * D1  (32×32→32, low 32 bits)
+; D0 = a * b  (32×32→32, low 32 bits)
 __mulsi3:
+	move.l	4(a7),d0
+	move.l	8(a7),d1
 	movem.l	d2-d5,-(a7)
 	move.l	d0,d2			; a
 	move.l	d1,d3			; b
@@ -122,8 +130,11 @@ __mulsi3:
 	movem.l	(a7)+,d2-d5
 	rts
 
-; D0 = D0 / D1 (unsigned), remainder left in D1
+; D0 = a / b (unsigned), remainder left in D1
 __udivsi3:
+	move.l	4(a7),d0
+	move.l	8(a7),d1
+__udivsi3_regs:
 	movem.l	d2-d4,-(a7)
 	move.l	d0,d2			; dividend
 	move.l	d1,d3			; divisor
@@ -144,14 +155,18 @@ __udiv_skip:
 	movem.l	(a7)+,d2-d4
 	rts
 
-; D0 = D0 % D1 (unsigned)
+; D0 = a % b (unsigned)
 __umodsi3:
-	bsr.w	__udivsi3
+	move.l	4(a7),d0
+	move.l	8(a7),d1
+	bsr.w	__udivsi3_regs
 	move.l	d1,d0
 	rts
 
-; D0 = D0 / D1 (signed)
+; D0 = a / b (signed)
 __divsi3:
+	move.l	4(a7),d0
+	move.l	8(a7),d1
 	movem.l	d5,-(a7)
 	moveq	#0,d5
 	tst.l	d0
@@ -164,7 +179,7 @@ __div_p1:
 	neg.l	d1
 	not.l	d5
 __div_p2:
-	bsr.w	__udivsi3
+	bsr.w	__udivsi3_regs
 	tst.l	d5
 	beq.w	__div_done
 	neg.l	d0
@@ -172,8 +187,10 @@ __div_done:
 	movem.l	(a7)+,d5
 	rts
 
-; D0 = D0 % D1 (signed; result takes the dividend's sign)
+; D0 = a % b (signed; result takes the dividend's sign)
 __modsi3:
+	move.l	4(a7),d0
+	move.l	8(a7),d1
 	movem.l	d5,-(a7)
 	moveq	#0,d5
 	tst.l	d0
@@ -185,7 +202,7 @@ __mod_p1:
 	bpl.w	__mod_p2
 	neg.l	d1
 __mod_p2:
-	bsr.w	__udivsi3
+	bsr.w	__udivsi3_regs
 	move.l	d1,d0
 	tst.l	d5
 	beq.w	__mod_done
@@ -194,10 +211,12 @@ __mod_done:
 	movem.l	(a7)+,d5
 	rts
 
-; ── 16.16 fixed-point helpers ────────────────────────────────────────────────
-; D0 = (D0 * D1) >> 16, signed 16.16. Builds the full 64-bit product from four
+; ── 16.16 fixed-point helpers (same stack ABI) ───────────────────────────────
+; D0 = (a * b) >> 16, signed 16.16. Builds the full 64-bit product from four
 ; 16×16 partials, then shifts right 16.
 __mulfix:
+	move.l	4(a7),d0
+	move.l	8(a7),d1
 	movem.l	d2-d7,-(a7)
 	moveq	#0,d7			; sign
 	tst.l	d0
@@ -256,10 +275,12 @@ __mf_done:
 	movem.l	(a7)+,d2-d7
 	rts
 
-; D0 = (D0 << 16) / D1, signed 16.16. Shift-subtract with 48 iterations: after
+; D0 = (a << 16) / b, signed 16.16. Shift-subtract with 48 iterations: after
 ; the 32 dividend bits are consumed the shift feeds zeros, producing the 16
 ; fractional quotient bits.
 __divfix:
+	move.l	4(a7),d0
+	move.l	8(a7),d1
 	movem.l	d2-d5,-(a7)
 	moveq	#0,d5			; sign
 	tst.l	d0

@@ -10,6 +10,48 @@ Headline: the simulator now renders OpenLara's textured 3D room, the optimizer
 proves its wins against real rendered output, and a one-character assembler bug
 that had been silently dropping conditional blocks is fixed.
 
+### 2026-07-20 — adoption report round 2: the full-TU switch
+
+OpenLara switched three TUs to jcc68k the same day and filed round 2:
+what broke when they tried the rest. All four items, root causes found:
+
+- **Runtime-helper ABI (their item 2, "runtime miscompile")** — jcc68k
+  called its libgcc-NAMED helpers (`__mulsi3`…) with operands in D0/D1;
+  their link satisfies those symbols with divmod68k.S, which implements
+  libgcc's STACK-argument convention — so every mul/div computed stack
+  garbage, and gpu.c/jerry.c (mul-heavy boot paths) died on a black
+  screen. The suspected volatile-MMIO ordering was a red herring. jcc68k
+  now uses the libgcc convention at every call site and in its own
+  `--runtime` (drop-in interchangeable both directions, test-pinned).
+  **gpu.c and jerry.c now boot and render** — verified in jagemu against
+  the all-gcc oracle (387/76800 px animation-phase diff).
+- **Inline asm (their item 1)** — never silently dropped again: basic
+  `asm("…")` passes through (`%` prefixes normalized), extended asm
+  supports the corpus subset (one `"+d"/"=d"` output, one `"d"` input —
+  covers main.c's `muls.w %1,%0` hot-path idiom, execution-tested),
+  anything richer is a hard error with true file:line. jas learned
+  `stop #imm` for the interrupt-sleep idiom.
+- **Sections & statics (their item 3)** — zero-initialized and
+  uninitialized globals land in `.bss` (NOBITS in ELF: main.c's 607KB of
+  literal zeros became 8KB of .data), `aligned(N)` attributes are honored
+  (GPU-shared mailboxes were previously aligned by luck), volatile locals
+  are never register-promoted, and unreferenced statics plus
+  statically-unreachable tails (code after `for(;;)`) are eliminated like
+  gcc -O2 — main.o: 80KB text/599KB bss → 52KB/101KB.
+- **Code size (their item 4, partial)** — mul/div/mod by power-of-two
+  constants (array index scaling included) are shifts/masks now, not
+  runtime calls; video.c's framebuffer clear was ~460k `__mulsi3` calls
+  (≈8 real seconds of boot — their "video.c miscompile" was actually
+  this slowdown; it now boots normally).
+- **`long long` is a hard error** — jcc68k silently sized it at 32 bits;
+  main.c's frustum cull overflowed and discarded every room (Lara on a
+  black void). No 64-bit support on the 68000 yet, so it errors with
+  file:line instead of wrong-rendering.
+
+End state: **7 of 8 OpenLara C TUs build, boot, and render with jcc68k**
+(byte-for-byte scene parity with the gcc oracle in jagemu); main.c waits
+only on its two `long long` sites being restructured source-side.
+
 ### 2026-07-20 — the jcc68k adoption report, worked through
 
 OpenLara filed `COBWEB_REQ_jcc68k_adoption.md` after switching its six

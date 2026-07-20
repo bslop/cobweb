@@ -25,15 +25,19 @@ oracle: build both ways, diff the linked image.
 
 `jcc68k` lowers 32-bit multiply/divide/modulo (the 68000 only has 16×16 and
 32÷16 hardware forms) and the 16.16 `fix` helpers to calls on `__mulsi3`,
-`__udivsi3`, `__umodsi3`, `__divsi3`, `__modsi3`, `__mulfix`, `__divfix`.
-When linking with `-nostdlib` (no libgcc), build them once as an object:
+`__udivsi3`, `__umodsi3`, `__divsi3`, `__modsi3`, `__mulfix`, `__divfix` —
+using the **libgcc calling convention** (operands on the stack, first at
+4(sp); result in D0; caller pops; only D0/D1 clobbered). That means any
+provider of those symbols works: libgcc itself, a project's re-assembled
+copy (OpenLara's `divmod68k.S`), or jcc68k's own:
 
 ```sh
 jcc68k --runtime -o jrt68k.s
 jas jrt68k.s --68000 --elf-obj -o jrt68k.o   # add to your OBJS
 ```
 
-(All helpers take operands in D0/D1, return in D0, and preserve d2–d7/a2–a5.)
+Multiplies/divides by power-of-two constants (array index scaling included)
+compile to shifts/masks and never call the runtime.
 
 ## What lands in which section
 
@@ -51,6 +55,23 @@ silent corruption:
   swapped half-word pair no standard m68k reloc describes). Keep GPU/DSP
   code as assembled blobs (`.incbin` / `dsp_blob.S`, as the ports already
   do), or link the RISC side with `jln`.
+
+## Language notes
+
+- **Inline asm**: basic `asm("text")` passes through (GNU `%` register
+  prefixes normalized); extended asm supports one data-register output and
+  one input (`"+d"/"=d"` and `"d"` — enough for the `muls.w %1,%0` idiom);
+  clobber lists are accepted and ignored. Anything richer is a hard error —
+  never a silent drop.
+- **`__attribute__((aligned(N)))`** is honored for globals up to N=16
+  (GPU/DSP-shared buffers need it: RISC stores force-align to 4, phrase ops
+  to 8).
+- **`volatile` locals** are never register-promoted; zero/uninitialized
+  globals go to `.bss`; unreferenced statics (and statically-unreachable
+  tails after `for(;;)` etc.) are eliminated, like gcc -O2.
+- **`long long` is a hard error** (no 64-bit support on the 68000 yet) —
+  restructure with pre-shifted 32-bit math; silent 32-bit wrapping is worse
+  than the error.
 
 ## Symbol naming
 

@@ -65,6 +65,7 @@ fn unit_tag(prog: &Program) -> String {
 }
 
 pub fn generate(prog: &Program) -> Result<String, String> {
+    let live = reachable(prog);
     let mut g = Gen {
         out: String::new(),
         label: 0,
@@ -88,10 +89,278 @@ pub fn generate(prog: &Program) -> Result<String, String> {
     }
     g.emit_prelude();
     for f in &prog.functions {
+        if f.is_static && !live.contains(&f.name) {
+            continue; // unreferenced static: no text
+        }
         g.gen_function(f)?;
     }
-    g.emit_data(prog);
+    g.emit_data(prog, &live);
     Ok(peephole(&g.out))
+}
+
+/// Names of statics reachable from this unit's externally-visible definitions
+/// (non-static functions and globals). gcc -O2 discards unreferenced statics
+/// — OpenLara's main.c carries ~570KB of static buffers belonging to compiled-
+/// out render paths, and emitting them blew the 2MB console budget (adoption
+/// report round 2). Non-static definitions are always emitted.
+fn reachable(prog: &Program) -> std::collections::HashSet<String> {
+    use std::collections::HashSet;
+    // per-definition reference sets
+    let mut fn_refs: HashMap<&str, HashSet<String>> = HashMap::new();
+    for f in &prog.functions {
+        let mut refs = HashSet::new();
+        for s in live_prefix(&f.body) {
+            collect_stmt_refs(s, &mut refs);
+        }
+        fn_refs.insert(&f.name, refs);
+    }
+    let mut gl_refs: HashMap<&str, HashSet<String>> = HashMap::new();
+    for g in &prog.globals {
+        let mut refs = HashSet::new();
+        if let Some(init) = &g.init {
+            for b in init {
+                if let InitByte::Addr(sym, _) = b {
+                    refs.insert(sym.clone());
+                }
+            }
+        }
+        gl_refs.insert(&g.name, refs);
+    }
+    let mut live: HashSet<String> = HashSet::new();
+    let mut work: Vec<String> = prog
+        .functions
+        .iter()
+        .filter(|f| !f.is_static)
+        .map(|f| f.name.clone())
+        .chain(
+            prog.globals
+                .iter()
+                .filter(|g| !g.is_static && !g.is_extern)
+                .map(|g| g.name.clone()),
+        )
+        .collect();
+    while let Some(n) = work.pop() {
+        if !live.insert(n.clone()) {
+            continue;
+        }
+        if let Some(refs) = fn_refs.get(n.as_str()) {
+            work.extend(refs.iter().cloned());
+        }
+        if let Some(refs) = gl_refs.get(n.as_str()) {
+            work.extend(refs.iter().cloned());
+        }
+    }
+    live
+}
+
+// ── unreachable-tail pruning ─────────────────────────────────────────────────
+// OpenLara's main() ends its active render path in `for (;;)`; everything
+// after it — a compiled-out path referencing 570KB of static buffers — is
+// unreachable. gcc -O2 removes it; we must too, in BOTH the reachability walk
+// and emission (emitting code that names eliminated statics would leave
+// undefined references at link time).
+
+/// Does control ever reach the statement AFTER `s`?
+fn falls_through(s: &Stmt) -> bool {
+    let const_true = |e: &Expr| matches!(&e.kind, ExprK::Num(n) if *n != 0);
+    match s {
+        Stmt::Return(_) | Stmt::Break | Stmt::Continue | Stmt::Goto(_) => false,
+        Stmt::For(_, cond, _, body) => match cond {
+            None => loop_escapes(body),
+            Some(c) if const_true(c) => loop_escapes(body),
+            Some(_) => true,
+        },
+        Stmt::While(c, body) if const_true(c) => loop_escapes(body),
+        Stmt::DoWhile(body, c) if const_true(c) => loop_escapes(body),
+        Stmt::If(_, t, Some(e)) => falls_through(t) || falls_through(e),
+        Stmt::Label(_, inner) => falls_through(inner),
+        Stmt::Block(items) => {
+            let p = live_prefix(items);
+            p.len() == items.len() && p.last().map(falls_through).unwrap_or(true)
+        }
+        _ => true,
+    }
+}
+
+/// Can control escape this loop body to the loop's successor: a `break` bound
+/// to THIS loop, or a `goto` whose label is defined outside the body.
+fn loop_escapes(body: &Stmt) -> bool {
+    if break_at_level(body) {
+        return true;
+    }
+    let mut labels = std::collections::HashSet::new();
+    let mut gotos = std::collections::HashSet::new();
+    collect_labels_gotos(body, &mut labels, &mut gotos);
+    gotos.iter().any(|g| !labels.contains(g))
+}
+
+/// A `break` binding to the current level (nested loops/switches own theirs).
+fn break_at_level(s: &Stmt) -> bool {
+    match s {
+        Stmt::Break => true,
+        Stmt::While(..) | Stmt::DoWhile(..) | Stmt::For(..) | Stmt::Switch(..) => false,
+        Stmt::Block(v) => v.iter().any(break_at_level),
+        Stmt::If(_, t, e) => {
+            break_at_level(t) || e.as_deref().map(break_at_level).unwrap_or(false)
+        }
+        Stmt::Label(_, inner) => break_at_level(inner),
+        _ => false,
+    }
+}
+
+fn collect_labels_gotos(
+    s: &Stmt,
+    labels: &mut std::collections::HashSet<String>,
+    gotos: &mut std::collections::HashSet<String>,
+) {
+    match s {
+        Stmt::Label(n, inner) => {
+            labels.insert(n.clone());
+            collect_labels_gotos(inner, labels, gotos);
+        }
+        Stmt::Goto(n) => {
+            gotos.insert(n.clone());
+        }
+        Stmt::Block(v) => v.iter().for_each(|s| collect_labels_gotos(s, labels, gotos)),
+        Stmt::If(_, t, e) => {
+            collect_labels_gotos(t, labels, gotos);
+            if let Some(e) = e {
+                collect_labels_gotos(e, labels, gotos);
+            }
+        }
+        Stmt::While(_, b) | Stmt::DoWhile(b, _) | Stmt::Switch(_, b, _, _) => {
+            collect_labels_gotos(b, labels, gotos)
+        }
+        Stmt::For(i, _, _, b) => {
+            if let Some(i) = i {
+                collect_labels_gotos(i, labels, gotos);
+            }
+            collect_labels_gotos(b, labels, gotos);
+        }
+        _ => {}
+    }
+}
+
+/// Can control enter `s` from outside sequential flow (a goto label or a
+/// switch case/default)? Tails containing one are never pruned.
+fn has_entry_point(s: &Stmt) -> bool {
+    match s {
+        Stmt::Label(..) | Stmt::Case(_) | Stmt::Default(_) => true,
+        Stmt::Block(v) => v.iter().any(has_entry_point),
+        Stmt::If(_, t, e) => {
+            has_entry_point(t) || e.as_deref().map(has_entry_point).unwrap_or(false)
+        }
+        Stmt::While(_, b) | Stmt::DoWhile(b, _) | Stmt::Switch(_, b, _, _) => has_entry_point(b),
+        Stmt::For(i, _, _, b) => {
+            i.as_deref().map(has_entry_point).unwrap_or(false) || has_entry_point(b)
+        }
+        _ => false,
+    }
+}
+
+/// The reachable prefix of a statement list: cut after the first statement
+/// control cannot fall out of, unless something later is a jump target.
+fn live_prefix(items: &[Stmt]) -> &[Stmt] {
+    for (i, s) in items.iter().enumerate() {
+        if !falls_through(s) {
+            let tail = &items[i + 1..];
+            if tail.iter().any(has_entry_point) {
+                return items; // a label/case makes the tail reachable — keep all
+            }
+            return &items[..=i];
+        }
+    }
+    items
+}
+
+/// Collect every name a statement references (variables, calls, inline-asm
+/// text) — the edges of the reachability graph. Inline asm is scanned as raw
+/// text, so a symbol named there keeps its definition alive.
+fn collect_stmt_refs(s: &Stmt, out: &mut std::collections::HashSet<String>) {
+    fn expr(e: &Expr, out: &mut std::collections::HashSet<String>) {
+        match &e.kind {
+            ExprK::Var(n) => {
+                out.insert(n.clone());
+            }
+            ExprK::Num(_) | ExprK::StrLit(_) => {}
+            ExprK::Unary(_, a) | ExprK::Cast(a) | ExprK::Member(a, _) | ExprK::PostIncDec(a, _) => {
+                expr(a, out)
+            }
+            ExprK::Binary(_, a, b) | ExprK::Assign(a, b) | ExprK::Comma(a, b) => {
+                expr(a, out);
+                expr(b, out);
+            }
+            ExprK::Cond(c, t, f) => {
+                expr(c, out);
+                expr(t, out);
+                expr(f, out);
+            }
+            ExprK::Call(callee, args) => {
+                expr(callee, out);
+                args.iter().for_each(|a| expr(a, out));
+            }
+        }
+    }
+    fn init(i: &Init, out: &mut std::collections::HashSet<String>) {
+        match i {
+            Init::Scalar(e) => expr(e, out),
+            Init::List(items) => items.iter().for_each(|it| init(it, out)),
+        }
+    }
+    let asm_text = |t: &str, out: &mut std::collections::HashSet<String>| {
+        // conservative: every identifier-looking token in the asm text
+        for tok in t.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+            if !tok.is_empty() && !tok.starts_with(|c: char| c.is_ascii_digit()) {
+                out.insert(tok.to_string());
+            }
+        }
+    };
+    match s {
+        Stmt::Expr(e) | Stmt::Return(Some(e)) => expr(e, out),
+        Stmt::Return(None) | Stmt::Break | Stmt::Continue | Stmt::Goto(_)
+        | Stmt::Case(_) | Stmt::Default(_) | Stmt::Null => {}
+        Stmt::Asm(t) => asm_text(t, out),
+        Stmt::AsmExt { template, output, input } => {
+            asm_text(template, out);
+            if let Some((_, e)) = output {
+                expr(e, out);
+            }
+            if let Some(e) = input {
+                expr(e, out);
+            }
+        }
+        Stmt::If(c, t, e) => {
+            expr(c, out);
+            collect_stmt_refs(t, out);
+            if let Some(e) = e {
+                collect_stmt_refs(e, out);
+            }
+        }
+        Stmt::While(c, b) | Stmt::DoWhile(b, c) => {
+            expr(c, out);
+            collect_stmt_refs(b, out);
+        }
+        Stmt::For(i, c, st, b) => {
+            if let Some(i) = i {
+                collect_stmt_refs(i, out);
+            }
+            if let Some(c) = c {
+                expr(c, out);
+            }
+            if let Some(st) = st {
+                expr(st, out);
+            }
+            collect_stmt_refs(b, out);
+        }
+        Stmt::Block(ss) => live_prefix(ss).iter().for_each(|s| collect_stmt_refs(s, out)),
+        Stmt::Switch(e, b, _, _) => {
+            expr(e, out);
+            collect_stmt_refs(b, out);
+        }
+        Stmt::Label(_, b) => collect_stmt_refs(b, out),
+        Stmt::Decl(_, _, Some(i)) => init(i, out),
+        Stmt::Decl(_, _, None) => {}
+    }
 }
 
 impl Gen {
@@ -164,12 +433,23 @@ impl Gen {
         for s in &f.body {
             analyze_stmt(s, &mut refs, &mut addr);
         }
+        // Volatile locals are excluded: every access must be a real memory
+        // access (a volatile delay-loop counter promoted to a register would
+        // collapse the delay the code is written for).
+        let volatile_names: std::collections::HashSet<&str> = f
+            .locals
+            .iter()
+            .filter(|l| l.is_volatile)
+            .map(|l| l.name.as_str())
+            .collect();
         let mut cand: Vec<(&str, &Type)> = f
             .params
             .iter()
             .map(|(n, t)| (n.as_str(), t))
             .chain(f.locals.iter().map(|l| (l.name.as_str(), &l.ty)))
-            .filter(|(n, t)| is_scalar4(t) && !addr.contains(*n) && refs.contains_key(*n))
+            .filter(|(n, t)| {
+                is_scalar4(t) && !addr.contains(*n) && refs.contains_key(*n) && !volatile_names.contains(*n)
+            })
             .collect();
         // hottest first; then drop duplicates (a param appears in both lists).
         cand.sort_by(|a, b| refs[b.0].cmp(&refs[a.0]).then(a.0.cmp(b.0)));
@@ -215,7 +495,7 @@ impl Gen {
         // body touches. A leaf like `blit_wait()` (a 3-instruction spin) gets
         // no prologue at all instead of a full link + movem of ten registers.
         let outer = std::mem::take(&mut self.out);
-        for s in &f.body {
+        for s in live_prefix(&f.body) {
             self.gen_stmt(s)?;
         }
         let body = std::mem::replace(&mut self.out, outer);
@@ -273,6 +553,52 @@ impl Gen {
             Stmt::Expr(e) => {
                 self.gen_expr(e)?;
             }
+            Stmt::Asm(text) => {
+                // Basic inline asm: emit the text verbatim, GNU `%` register
+                // prefixes normalized to the jas spelling, one line per
+                // newline-separated piece.
+                for l in text.lines() {
+                    let l = normalize_gas_asm(l);
+                    let l = l.trim();
+                    if !l.is_empty() {
+                        self.line(l);
+                    }
+                }
+            }
+            Stmt::AsmExt { template, output, input } => {
+                // Operand plan (GCC numbering, output first): %0 → d0, %1 → d1.
+                // Evaluate the input, hold it, load a `+` output's old value,
+                // emit the substituted template, store d0 back to the output.
+                let slot = match input {
+                    Some(inp) => {
+                        self.gen_expr(inp)?;
+                        Some(self.push_dtemp())
+                    }
+                    None => None,
+                };
+                if let Some((read_write, out_lv)) = output {
+                    if *read_write {
+                        self.gen_expr(out_lv)?; // old value in d0
+                    }
+                }
+                let in_reg = if output.is_some() { "d1" } else { "d0" };
+                if let Some(slot) = slot {
+                    self.pop_dtemp_to(&slot, in_reg);
+                }
+                let subst = template.replace("%0", "__R0__").replace("%1", "__R1__");
+                let (r0, r1) = if output.is_some() { ("d0", in_reg) } else { (in_reg, "") };
+                for l in subst.lines() {
+                    let l = normalize_gas_asm(l);
+                    let l = l.replace("__R0__", r0).replace("__R1__", r1);
+                    let l = l.trim();
+                    if !l.is_empty() {
+                        self.line(l);
+                    }
+                }
+                if let Some((_, out_lv)) = output {
+                    self.store_d0_to_lvalue(out_lv)?;
+                }
+            }
             Stmt::Null => {}
             Stmt::Return(e) => {
                 if let Some(e) = e {
@@ -282,7 +608,7 @@ impl Gen {
                 self.line(&format!("bra.w {rl}"));
             }
             Stmt::Block(items) => {
-                for it in items {
+                for it in live_prefix(items) {
                     self.gen_stmt(it)?;
                 }
             }
@@ -566,6 +892,21 @@ impl Gen {
         Ok(())
     }
 
+    /// Store D0 into an lvalue (used by extended-asm output write-back).
+    fn store_d0_to_lvalue(&mut self, lv: &Expr) -> Result<(), String> {
+        if let ExprK::Var(name) = &lv.kind {
+            if let Some(r) = self.reg_of.get(name).cloned() {
+                self.line(&format!("move.l d0,{r}"));
+                return Ok(());
+            }
+        }
+        let slot = self.push_dtemp(); // save the value across gen_addr
+        self.gen_addr(lv)?;
+        self.pop_dtemp_to(&slot, "d0");
+        self.store(&lv.ty);
+        Ok(())
+    }
+
     /// Compute the address of an lvalue into A0.
     fn gen_addr(&mut self, e: &Expr) -> Result<(), String> {
         match &e.kind {
@@ -631,6 +972,61 @@ impl Gen {
         Ok(())
     }
 
+    /// Integer mul/div/mod by a power-of-two constant, as shifts (D0 in
+    /// place). Returns false when the value can't be reduced (the caller
+    /// falls back to the runtime helper). Signed division only reduces for
+    /// n == 1 (an arithmetic shift rounds toward −∞, C truncates toward 0).
+    fn fold_pow2(&mut self, op: BinOp, lt: &Type, rt: &Type, n: i64) -> bool {
+        let unsigned = !(lt.is_signed() && rt.is_signed());
+        if n <= 0 || (n & (n - 1)) != 0 {
+            return false;
+        }
+        let k = n.trailing_zeros();
+        match op {
+            BinOp::Mul => {
+                match k {
+                    0 => {}
+                    1..=8 => self.line(&format!("asl.l #{k},d0")),
+                    _ => {
+                        self.line(&format!("moveq #{k},d1"));
+                        self.line("asl.l d1,d0");
+                    }
+                }
+                true
+            }
+            BinOp::Div if unsigned || k == 0 => {
+                match k {
+                    0 => {}
+                    1..=8 => self.line(&format!("lsr.l #{k},d0")),
+                    _ => {
+                        self.line(&format!("moveq #{k},d1"));
+                        self.line("lsr.l d1,d0");
+                    }
+                }
+                true
+            }
+            BinOp::Mod if unsigned => {
+                self.line(&format!("and.l #{},d0", n - 1));
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Call a runtime helper with the **libgcc calling convention**: both
+    /// operands pushed (right-to-left, so `a` sits at 4(sp)), caller pops,
+    /// result in D0. jcc68k emits calls to libgcc-NAMED symbols (`__mulsi3`
+    /// …), so it must use libgcc's ABI — a project linking against libgcc or
+    /// a drop-in like OpenLara's divmod68k.S would otherwise read stack
+    /// garbage as operands and miscompile silently (the gpu.c/jerry.c
+    /// black-screen boot from the adoption report, round 2).
+    fn call_runtime(&mut self, name: &str) {
+        self.line("move.l d1,-(a7)");
+        self.line("move.l d0,-(a7)");
+        self.line(&format!("jsr {name}"));
+        self.line("addq.l #8,a7");
+    }
+
     // ── binops (D0 = D0 op D1) ────────────────────────────────────────────────
     fn gen_binop(&mut self, op: BinOp, lt: &Type, rt: &Type) {
         let unsigned = !(lt.is_signed() && rt.is_signed());
@@ -650,25 +1046,25 @@ impl Gen {
             }
             BinOp::Mul => {
                 if lt.is_fixed() || rt.is_fixed() {
-                    self.line("jsr __mulfix");
+                    self.call_runtime("__mulfix");
                 } else {
-                    self.line("jsr __mulsi3");
+                    self.call_runtime("__mulsi3");
                 }
             }
             BinOp::Div => {
                 if lt.is_fixed() || rt.is_fixed() {
-                    self.line("jsr __divfix");
+                    self.call_runtime("__divfix");
                 } else if unsigned {
-                    self.line("jsr __udivsi3");
+                    self.call_runtime("__udivsi3");
                 } else {
-                    self.line("jsr __divsi3");
+                    self.call_runtime("__divsi3");
                 }
             }
             BinOp::Mod => {
                 if unsigned {
-                    self.line("jsr __umodsi3");
+                    self.call_runtime("__umodsi3");
                 } else {
-                    self.line("jsr __modsi3");
+                    self.call_runtime("__modsi3");
                 }
             }
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
@@ -767,8 +1163,18 @@ impl Gen {
                 self.line(&format!("{cc} d0"));
                 self.line("and.l #1,d0");
             }
-            // multiply/divide/modulo need the rhs in D1 for the runtime helper
+            // multiply/divide/modulo: a power-of-two constant strength-reduces
+            // to shifts/masks — pointer-index scaling made every array store a
+            // __mulsi3 CALL (OpenLara's video_init: ~460k calls to clear three
+            // framebuffers, ~8 seconds of boot). Otherwise the runtime helper.
             BinOp::Mul | BinOp::Div | BinOp::Mod => {
+                if !lt.is_fixed() && !rt.is_fixed() {
+                    if let Some(n) = parse_imm(src, _is_imm) {
+                        if self.fold_pow2(op, lt, rt, n) {
+                            return;
+                        }
+                    }
+                }
                 self.line(&format!("move.l {src},d1"));
                 self.gen_binop(op, lt, rt);
             }
@@ -941,10 +1347,12 @@ impl Gen {
     }
 
     // ── data + rodata ─────────────────────────────────────────────────────────
-    fn emit_data(&mut self, prog: &Program) {
+    fn emit_data(&mut self, prog: &Program, live: &std::collections::HashSet<String>) {
+        // an unreferenced static never earns bytes (matches the text side)
+        let emit = |g: &Global| !g.is_extern && (!g.is_static || live.contains(&g.name));
         // strings
         if !prog.strings.is_empty() {
-            self.out.push_str("\t.data\n");
+            self.out.push_str("\t.align 16\n\t.data\n");
             for (i, s) in prog.strings.iter().enumerate() {
                 writeln!(self.out, "{}_{i}:", self.str_prefix).unwrap();
                 self.out.push_str("\t.dc.b ");
@@ -954,33 +1362,61 @@ impl Gen {
             }
             self.out.push_str("\t.even\n");
         }
-        // globals with initializers, then bss
-        let has_data = prog.globals.iter().any(|g| g.init.is_some() && !g.is_extern);
+        // Globals split by content: only a nonzero initializer earns .data
+        // bytes in the image. Uninitialized AND all-zero-initialized globals
+        // go to .bss — C zero-initializes both, the loader/startup clears
+        // .bss, and emitting literal zeros put 607KB of padding into a 2MB
+        // console image (adoption report round 2, item 3). .bss is emitted
+        // last so --elf-obj's section carve stays contiguous.
+        let is_zero = |g: &Global| match &g.init {
+            None => true,
+            Some(bytes) => bytes.iter().all(|b| matches!(b, InitByte::Byte(0))),
+        };
+        let align_line = |out: &mut String, g: &Global| {
+            if g.align > 2 {
+                writeln!(out, "\t.align {}", g.align).unwrap();
+            } else {
+                out.push_str("\t.even\n");
+            }
+        };
+        // Sections open on a 16-byte boundary so `aligned(N<=16)` members keep
+        // their alignment after the linker places the section (the ELF section
+        // addralign is 16 to match; a member's `.align` is blob-relative, so
+        // start-of-section and member alignment must agree mod 16).
+        // The `.align 16` BEFORE each section switch pads the *previous*
+        // section, so the new one starts 16-aligned in the blob and
+        // `aligned(N<=16)` members keep their alignment after the linker
+        // places the section (ELF section addralign is 16 to match).
+        let has_data = prog.globals.iter().any(|g| emit(g) && !is_zero(g));
         if has_data {
-            self.out.push_str("\t.data\n\t.even\n");
+            self.out.push_str("\t.align 16\n\t.data\n");
             for g in &prog.globals {
-                if g.is_extern {
+                if !emit(g) || is_zero(g) {
                     continue;
                 }
-                if let Some(init) = &g.init {
-                    if !g.is_static {
-                        writeln!(self.out, "\t.globl {}", mangle(&g.name)).unwrap();
-                    }
-                    writeln!(self.out, "{}:", mangle(&g.name)).unwrap();
-                    emit_init(&mut self.out, init);
+                align_line(&mut self.out, g);
+                if !g.is_static {
+                    writeln!(self.out, "\t.globl {}", mangle(&g.name)).unwrap();
                 }
+                writeln!(self.out, "{}:", mangle(&g.name)).unwrap();
+                emit_init(&mut self.out, g.init.as_ref().unwrap());
             }
         }
-        for g in &prog.globals {
-            if g.is_extern || g.init.is_some() {
-                continue;
+        let has_bss = prog.globals.iter().any(|g| emit(g) && is_zero(g));
+        if has_bss {
+            self.out.push_str("\t.align 16\n\t.bss\n");
+            for g in &prog.globals {
+                if !emit(g) || !is_zero(g) {
+                    continue;
+                }
+                let sz = ((g.ty.size().max(1) + 1) / 2) * 2;
+                align_line(&mut self.out, g);
+                if !g.is_static {
+                    writeln!(self.out, "\t.globl {}", mangle(&g.name)).unwrap();
+                }
+                writeln!(self.out, "{}:", mangle(&g.name)).unwrap();
+                writeln!(self.out, "\t.ds.b {sz}").unwrap();
             }
-            let sz = ((g.ty.size().max(1) + 1) / 2) * 2;
-            if !g.is_static {
-                writeln!(self.out, "\t.globl {}", mangle(&g.name)).unwrap();
-            }
-            writeln!(self.out, "{}:", mangle(&g.name)).unwrap();
-            writeln!(self.out, "\t.ds.b {sz}").unwrap();
         }
     }
 }
@@ -1062,6 +1498,38 @@ fn peephole(asm: &str) -> String {
     out
 }
 
+/// The integer value of a folded immediate operand (`#N`), if it is one.
+fn parse_imm(src: &str, is_imm: bool) -> Option<i64> {
+    if !is_imm {
+        return None;
+    }
+    src.strip_prefix('#')?.parse().ok()
+}
+
+/// Normalize a GNU-as m68k line for jas: `%d0`/`%sr` → `d0`/`sr`, `%%` → `%`.
+/// (Basic asm strings in the ports are written in gas syntax.)
+fn normalize_gas_asm(line: &str) -> String {
+    let b: Vec<char> = line.chars().collect();
+    let mut out = String::with_capacity(line.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == '%' {
+            if b.get(i + 1) == Some(&'%') {
+                out.push('%');
+                i += 2;
+                continue;
+            }
+            if b.get(i + 1).map(|c| c.is_ascii_alphabetic()).unwrap_or(false) {
+                i += 1; // drop the register prefix
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    out
+}
+
 /// Which callee-saved registers a generated function body actually names, in
 /// save order. Token-boundary matching so a symbol like `fixed2int` doesn't
 /// count as a `d2` use (a false positive would only cost an extra save, but
@@ -1137,7 +1605,15 @@ fn analyze_stmt(s: &Stmt, refs: &mut HashMap<String, usize>, addr: &mut std::col
     match s {
         Stmt::Expr(e) | Stmt::Return(Some(e)) => analyze_expr(e, refs, addr),
         Stmt::Return(None) | Stmt::Break | Stmt::Continue | Stmt::Goto(_)
-        | Stmt::Case(_) | Stmt::Default(_) | Stmt::Null => {}
+        | Stmt::Case(_) | Stmt::Default(_) | Stmt::Null | Stmt::Asm(_) => {}
+        Stmt::AsmExt { output, input, .. } => {
+            if let Some((_, e)) = output {
+                analyze_expr(e, refs, addr);
+            }
+            if let Some(e) = input {
+                analyze_expr(e, refs, addr);
+            }
+        }
         Stmt::If(c, t, e) => {
             analyze_expr(c, refs, addr);
             analyze_stmt(t, refs, addr);

@@ -324,7 +324,8 @@ pub fn write(out: &Assembled) -> Result<Vec<u8>, String> {
         4,
         12,
     );
-    // 3: .data
+    // 3: .data (addralign 16: jcc68k opens sections 16-aligned in the blob so
+    // `aligned(N<=16)` members survive linker placement)
     sh(
         &mut f,
         n_data,
@@ -334,7 +335,7 @@ pub fn write(out: &Assembled) -> Result<Vec<u8>, String> {
         sec_size(Section::Data) as usize,
         0,
         0,
-        8,
+        16,
         0,
     );
     // 4: .rela.data
@@ -350,7 +351,7 @@ pub fn write(out: &Assembled) -> Result<Vec<u8>, String> {
         4,
         12,
     );
-    // 5: .bss (no file content)
+    // 5: .bss (no file content; addralign 16, same reason as .data)
     sh(
         &mut f,
         n_bss,
@@ -360,7 +361,7 @@ pub fn write(out: &Assembled) -> Result<Vec<u8>, String> {
         sec_size(Section::Bss) as usize,
         0,
         0,
-        8,
+        16,
         0,
     );
     // 6: .symtab

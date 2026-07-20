@@ -237,6 +237,179 @@ fn ppinclude() {
     assert_eq!(run_pp("#include \"hdr.h\"\nint main(){ return helper(8); }"), 50);
 }
 
+// ── runtime-helper ABI ───────────────────────────────────────────────────────
+
+#[test]
+fn runtime_calls_use_libgcc_stack_abi() {
+    // jcc68k emits calls to libgcc-NAMED helpers, so a project may satisfy
+    // them with libgcc itself or a drop-in (OpenLara's divmod68k.S). Those
+    // read operands from the STACK. Link compiled code against a foreign
+    // stack-ABI __mulsi3 (NOT our runtime) — if codegen passed args in
+    // registers this returns garbage, which is exactly the gpu.c/jerry.c
+    // black-screen miscompile from the adoption report round 2.
+    let user = crate::compile("int mul(int a, int b) { return a * b; }").unwrap();
+    let foreign_mulsi3 = "\
+	.68000\n\
+	.text\n\
+	.globl __mulsi3\n\
+__mulsi3:\n\
+	move.w	4(a7),d0\n\
+	mulu.w	10(a7),d0\n\
+	move.w	6(a7),d1\n\
+	mulu.w	8(a7),d1\n\
+	add.w	d1,d0\n\
+	swap	d0\n\
+	clr.w	d0\n\
+	move.w	6(a7),d1\n\
+	mulu.w	10(a7),d1\n\
+	add.l	d1,d0\n\
+	rts\n";
+    let asm = format!(
+        "{}\n{}\n{}",
+        "\t.68000\n\t.text\n\t.globl _start\n_start:\n\tmovea.l #$001F0000,a7\n\
+         \tmove.l #7,-(a7)\n\tmove.l #-6,-(a7)\n\tjsr mul\n\taddq.l #8,a7\n\
+         \tmove.l d0,$100\nhalt:\n\tbra.w halt\n",
+        user, foreign_mulsi3
+    );
+    let opts = jas::Options { org: 0x4000, start_m68k: true, check_hazards: false, ..Default::default() };
+    let res = jas::assemble(&asm, &opts);
+    assert_eq!(res.errors(), 0, "asm errors:\n{:#?}\n{asm}", res.diags);
+    let mut jag = Jaguar::new();
+    for (i, b) in res.bytes.iter().enumerate() {
+        jag.bus.write8(0x4000 + i as u32, *b);
+    }
+    jag.cpu.set_pc(res.symbols.get("_start").copied().unwrap_or(0x4000));
+    let mut prev = u32::MAX;
+    for _ in 0..100_000 {
+        if jag.cpu.pc == prev {
+            break;
+        }
+        prev = jag.cpu.pc;
+        jag.step_instruction();
+    }
+    assert_eq!(jag.bus.read32(0x100) as i32, -42, "-6 * 7 through the foreign helper");
+}
+
+// ── inline asm (adoption report round 2, item 1) ─────────────────────────────
+
+#[test]
+fn basic_asm_passes_through() {
+    // A basic asm statement must reach the output (GNU % prefixes normalized)
+    // — it was silently dropped, deleting an interrupt-enable from a port.
+    let asm = crate::compile("int f(void) { __asm__ volatile (\"moveq #77,%d0\"); }").unwrap();
+    assert!(asm.contains("moveq #77,d0"), "asm text missing/unnormalized:\n{asm}");
+    // and it executes: d0 is the return register, so f() == 77
+    assert_eq!(run("int f(void){ asm(\"moveq #77,%d0\"); }\nint main(){ return f(); }"), 77);
+}
+
+#[test]
+fn extended_asm_muls_idiom_works() {
+    // The corpus hot-path idiom: hardware 16x16 multiply via "+d"/"d"
+    // operands (OpenLara main.c mul16 — the pose loop's dominant cost).
+    let src = "\
+static int mul16(int a, int b) {\n\
+    __asm__(\"muls.w %1,%0\" : \"+d\"(a) : \"d\"(b));\n\
+    return a;\n\
+}\n\
+int main() { return mul16(-320, 100); }\n";
+    assert_eq!(run(src) as i32, -32000);
+}
+
+#[test]
+fn unsupported_extended_asm_is_a_hard_error() {
+    // More operands than the supported %0/%1 subset must error, not drop.
+    let err = crate::compile(
+        "int f(int x,int y,int z){ asm(\"add %2,%0\" : \"+d\"(x) : \"d\"(y), \"d\"(z)); return x; }",
+    )
+    .unwrap_err();
+    assert!(err.contains("at most one output"), "got: {err}");
+    // memory-constraint outputs are not supported — error, not drop
+    let err2 = crate::compile("int f(int x){ asm(\"clr.l %0\" : \"=m\"(x)); return x; }")
+        .unwrap_err();
+    assert!(err2.contains("constraint"), "got: {err2}");
+}
+
+#[test]
+fn asm_label_still_renames() {
+    // The declarator form is a symbol rename, not a statement — must keep working.
+    let asm = crate::compile(
+        "extern int counter __asm__(\"hw_counter\");\nint get(void){ return counter; }",
+    )
+    .unwrap();
+    assert!(asm.contains("hw_counter"), "asm label lost:\n{asm}");
+}
+
+// ── volatile locals (register promotion must not cache them) ─────────────────
+
+#[test]
+fn volatile_local_stays_in_memory() {
+    // A volatile delay-loop counter promoted to a data register collapses the
+    // delay the code was written for — it must live in the frame.
+    let asm = crate::compile(
+        "void delay(void){ volatile int d; for (d = 0; d < 40; d++) ; }",
+    )
+    .unwrap();
+    assert!(asm.contains("(a6)"), "volatile local was register-promoted:\n{asm}");
+}
+
+// ── globals: .bss vs .data (round 2, item 3) ─────────────────────────────────
+
+#[test]
+fn zero_globals_land_in_bss() {
+    let asm = crate::compile(
+        "int hot = 5;\nstatic int cold_zero = 0;\nint cold_uninit[64];\n\
+         int use(void){ return hot + cold_zero + cold_uninit[0]; }",
+    )
+    .unwrap();
+    let bss = asm.split("\t.bss").nth(1).expect("no .bss section");
+    assert!(bss.contains("cold_zero"), "zero-initialized static not in .bss:\n{asm}");
+    assert!(bss.contains("cold_uninit"), "uninitialized global not in .bss:\n{asm}");
+    assert!(!bss.contains("hot:"), "initialized global leaked into .bss:\n{asm}");
+    let data = asm.split("\t.data").nth(1).expect("no .data section");
+    assert!(data.contains("hot:"), "nonzero global missing from .data:\n{asm}");
+    // zero-init values still read as 0 end to end
+    assert_eq!(
+        run("static int z = 0; int u[4]; int main(){ return z + u[2] + 9; }"),
+        9
+    );
+}
+
+#[test]
+fn unreferenced_statics_are_eliminated() {
+    // gcc -O2 discards unreferenced statics; main.c carries ~570KB of static
+    // buffers for compiled-out render paths, which must not reach the image.
+    let asm = crate::compile(
+        "static int dead_buf[1000];\n\
+         static int dead_fn(void){ return dead_buf[0]; }\n\
+         static int live_buf[4];\n\
+         int use(void){ return live_buf[1]; }\n",
+    )
+    .unwrap();
+    assert!(!asm.contains("dead_buf"), "dead static buffer emitted:\n{asm}");
+    assert!(!asm.contains("dead_fn"), "dead static function emitted:\n{asm}");
+    assert!(asm.contains("live_buf"), "live static buffer missing:\n{asm}");
+    // transitively-live statics survive (fn -> fn -> buffer)
+    let asm2 = crate::compile(
+        "static int buf[8];\n\
+         static int inner(void){ return buf[0]; }\n\
+         static int outer(void){ return inner(); }\n\
+         int root(void){ return outer(); }\n",
+    )
+    .unwrap();
+    assert!(asm2.contains("buf") && asm2.contains("inner"), "live chain dropped:\n{asm2}");
+}
+
+#[test]
+fn aligned_attribute_is_honored() {
+    let asm = crate::compile(
+        "static volatile unsigned int mailbox[4] __attribute__((aligned(16)));\n\
+         unsigned int read(void){ return mailbox[0]; }",
+    )
+    .unwrap();
+    let bss = asm.split("\t.bss").nth(1).expect("mailbox should be bss");
+    assert!(bss.contains(".align 16"), "aligned(16) dropped:\n{asm}");
+}
+
 // ── diagnostic line attribution ──────────────────────────────────────────────
 // The preprocessor removes/inserts lines (#include splicing, dead #if blocks,
 // gathered macro calls). Errors must still name the ORIGINAL source line —

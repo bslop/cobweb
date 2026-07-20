@@ -563,6 +563,12 @@ pub(crate) fn encode(mnem: &str, args: &str, here: u32, asm: &Assembler) -> Resu
         return Ok(with_src(opbase | s.field(), &s));
     }
 
+    // ── stop (privileged: load SR, halt until interrupt) ─────────────────────
+    if low == "stop" {
+        let v = asm.eval_pub(args.trim().trim_start_matches('#')).map_err(msg)?;
+        return Ok(M68kEnc { words: vec![0x4E72, v as u16], reloc: None });
+    }
+
     // ── link / unlk ───────────────────────────────────────────────────────────
     if base == "link" {
         let (an_s, disp) = split2(args)?;

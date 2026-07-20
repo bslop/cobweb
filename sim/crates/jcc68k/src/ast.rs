@@ -172,6 +172,19 @@ pub enum UnOp {
 pub enum Stmt {
     Expr(Expr),
     Return(Option<Expr>),
+    /// Basic inline asm: the string is emitted into the output verbatim (GNU
+    /// `%` register prefixes normalized). Never silently dropped.
+    Asm(String),
+    /// Minimal extended asm: at most one data-register output (`"+d"`/`"=d"`,
+    /// `read_write` = the `+` form) and one data-register input, substituted
+    /// as `%0`/`%1` (output first, GCC numbering). Covers the corpus idiom
+    /// `__asm__("muls.w %1,%0" : "+d"(a) : "d"(b))`; anything richer is a
+    /// parse error, never a silent drop.
+    AsmExt {
+        template: String,
+        output: Option<(bool, Expr)>, // (read_write, lvalue)
+        input: Option<Expr>,
+    },
     If(Expr, Box<Stmt>, Option<Box<Stmt>>),
     While(Expr, Box<Stmt>),
     DoWhile(Box<Stmt>, Expr),
@@ -221,6 +234,10 @@ pub struct Local {
     pub name: String,
     pub ty: Type,
     pub offset: i32, // relative to the frame pointer A6 (negative = locals)
+    /// Declared `volatile`: every access must hit memory, so the local is
+    /// excluded from register promotion (a volatile delay-loop counter kept in
+    /// a register would collapse the delay).
+    pub is_volatile: bool,
 }
 
 /// One emitted piece of a global (file-scope) initializer. A global's image is
@@ -241,6 +258,10 @@ pub struct Global {
     pub init: Option<Vec<InitByte>>,
     pub is_static: bool,
     pub is_extern: bool,
+    /// Byte alignment from `__attribute__((aligned(N)))`; 0 = default (.even).
+    /// GPU/DSP-shared buffers depend on this (RISC stores force-align to 4,
+    /// phrase ops to 8) — dropping it means placement-by-luck.
+    pub align: u32,
 }
 
 pub struct Program {

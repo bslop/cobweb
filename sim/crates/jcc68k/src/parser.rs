@@ -10,13 +10,15 @@ use std::rc::Rc;
 
 pub struct Parser {
     toks: Vec<Token>,
+    /// `__attribute__((aligned(N)))` per source declarator name.
+    aligns: HashMap<String, u32>,
     pos: usize,
     // scope stack: source name -> resolved (unique_name_or_global, type, is_global)
     scopes: Vec<HashMap<String, VarRef>>,
     typedefs: Vec<HashMap<String, Type>>,
     structs: HashMap<String, Type>,
     // current function's locals (unique names)
-    cur_locals: Vec<(String, Type)>,
+    cur_locals: Vec<(String, Type, bool)>, // (unique name, type, is_volatile)
     uid: usize,
     globals: Vec<Global>,
     functions: Vec<Function>,
@@ -46,9 +48,13 @@ struct VarRef {
 type PResult<T> = Result<T, String>;
 
 /// Normalize GNU C extensions the parser doesn't model but must not choke on:
-/// drop `__attribute__((…))`, `__asm__(…)`, `__extension__`, and `__restrict`;
-/// fold `__inline__`/`__const__`/`__volatile__`/`__signed__` to their keywords.
-fn strip_gnu(toks: Vec<Token>) -> Vec<Token> {
+/// drop `__attribute__((…))` (capturing `aligned(N)` per declarator),
+/// `__extension__`, and `__restrict`; fold `__inline__`/`__const__`/
+/// `__volatile__`/`__signed__` to their keywords. Inline-asm *statements* are
+/// passed through for the parser to handle — dropping them silently deleted
+/// interrupt enables and STOP sleeps (adoption report round 2, item 1); only
+/// the asm-*label* form (`TYPE name __asm__("link")`) is consumed here.
+fn strip_gnu(toks: Vec<Token>) -> (Vec<Token>, HashMap<String, u32>) {
     use std::collections::HashMap;
     let mut out: Vec<Token> = Vec::with_capacity(toks.len());
     let mut i = 0;
@@ -58,6 +64,8 @@ fn strip_gnu(toks: Vec<Token>) -> Vec<Token> {
     // GCC asm labels: `TYPE name __asm__("linkname")` renames `name`'s linkage
     // symbol to `linkname`. Collected here, applied to every use in a second pass.
     let mut renames: HashMap<String, String> = HashMap::new();
+    // `__attribute__((aligned(N)))` per declarator name (postfix position).
+    let mut aligns: HashMap<String, u32> = HashMap::new();
     while i < toks.len() {
         if let Tok::Ident(s) = &toks[i].tok {
             match s.as_str() {
@@ -80,18 +88,10 @@ fn strip_gnu(toks: Vec<Token>) -> Vec<Token> {
                     i += 4; // skip `asm ( "str" )`
                     continue;
                 }
-                "__attribute__" | "__attribute" | "__asm__" | "__asm" | "asm" => {
+                "__attribute__" | "__attribute" => {
                     i += 1;
-                    // `asm`/`__asm__` may carry a qualifier before the `(`:
-                    // `__asm__ volatile ("…")`, `asm goto (…)`.
-                    while matches!(toks.get(i).map(|t| &t.tok),
-                        Some(Tok::Keyword(k)) if k == "volatile" || k == "const" || k == "inline" || k == "goto")
-                        || matches!(toks.get(i).map(|t| &t.tok),
-                        Some(Tok::Ident(id)) if id == "__volatile__")
-                    {
-                        i += 1;
-                    }
                     if matches!(toks.get(i).map(|t| &t.tok), Some(Tok::Punct(p)) if p == "(") {
+                        let start = i;
                         let mut depth = 0i32;
                         while i < toks.len() {
                             match &toks[i].tok {
@@ -107,6 +107,24 @@ fn strip_gnu(toks: Vec<Token>) -> Vec<Token> {
                                 _ => {}
                             }
                             i += 1;
+                        }
+                        // Capture `aligned(N)` for the declarator this attribute
+                        // trails (GPU-shared buffers depend on it).
+                        let mut j = start;
+                        while j < i {
+                            if matches!(&toks[j].tok, Tok::Ident(a) if a == "aligned" || a == "__aligned__") {
+                                if let (Some(Tok::Punct(o)), Some(Tok::Num(n))) = (
+                                    toks.get(j + 1).map(|t| &t.tok),
+                                    toks.get(j + 2).map(|t| &t.tok),
+                                ) {
+                                    if o == "(" && *n > 0 {
+                                        if let Some(name) = declarator_name(&out) {
+                                            aligns.insert(name, *n as u32);
+                                        }
+                                    }
+                                }
+                            }
+                            j += 1;
                         }
                     }
                     continue;
@@ -152,7 +170,7 @@ fn strip_gnu(toks: Vec<Token>) -> Vec<Token> {
             }
         }
     }
-    out
+    (out, aligns)
 }
 
 /// The declarator name preceding a trailing asm label: skip any balanced
@@ -186,9 +204,10 @@ fn declarator_name(out: &[Token]) -> Option<String> {
 }
 
 pub fn parse(toks: Vec<Token>) -> PResult<Program> {
-    let toks = strip_gnu(toks);
+    let (toks, aligns) = strip_gnu(toks);
     let mut p = Parser {
         toks,
+        aligns,
         pos: 0,
         scopes: vec![HashMap::new()],
         typedefs: vec![HashMap::new()],
@@ -271,10 +290,10 @@ impl Parser {
         self.scopes.pop();
         self.typedefs.pop();
     }
-    fn new_local(&mut self, name: &str, ty: Type) -> String {
+    fn new_local(&mut self, name: &str, ty: Type, is_volatile: bool) -> String {
         self.uid += 1;
         let uniq = format!("{name}${}", self.uid);
-        self.cur_locals.push((uniq.clone(), ty.clone()));
+        self.cur_locals.push((uniq.clone(), ty.clone(), is_volatile));
         self.scopes
             .last_mut()
             .unwrap()
@@ -375,12 +394,14 @@ impl Parser {
         if self.eat_punct("=") {
             init = Some(self.global_initializer(&ty)?);
         }
+        let align = self.aligns.get(&name).copied().unwrap_or(0);
         self.globals.push(Global {
             name,
             ty,
             init,
             is_static: sc.is_static,
             is_extern: sc.is_extern,
+            align,
         });
         Ok(())
     }
@@ -532,7 +553,7 @@ impl Parser {
         let param_names = std::mem::take(&mut self.pending_params);
         let mut param_locals = Vec::new();
         for (pname, pty) in param_names.iter().zip(params.iter()) {
-            let uniq = self.new_local(pname, pty.clone());
+            let uniq = self.new_local(pname, pty.clone(), false);
             param_locals.push((uniq, pty.clone()));
         }
         self.expect("{")?;
@@ -546,7 +567,7 @@ impl Parser {
             body,
             locals: locals
                 .into_iter()
-                .map(|(n, t)| Local { name: n, ty: t, offset: 0 })
+                .map(|(n, t, v)| Local { name: n, ty: t, offset: 0, is_volatile: v })
                 .collect(),
             stack_size: 0,
             is_static: sc.is_static,
@@ -580,6 +601,9 @@ impl Parser {
                     "const" | "volatile" | "register" | "inline" | "signed" => {
                         if k == "signed" {
                             signed = Some(true);
+                        }
+                        if k == "volatile" {
+                            sc.is_volatile = true;
                         }
                         self.pos += 1;
                     }
@@ -632,6 +656,17 @@ impl Parser {
                 }
                 _ => break,
             }
+        }
+        // `long long` would be a 64-bit integer — silently sizing it at 32
+        // bits made OpenLara's frustum cull overflow and discard every room
+        // (a wrong-render, not even a crash). No 64-bit support on the 68000
+        // yet, so this must be a hard error, never a silent wrap.
+        if longs >= 2 {
+            return Err(format!(
+                "{}: `long long` (64-bit) is not supported on the 68000 target — \
+                 restructure with 32-bit math (e.g. pre-shift operands) or 16.16 fix helpers",
+                self.loc()
+            ));
         }
         let final_ty = if let Some(t) = ty {
             t
@@ -865,6 +900,7 @@ impl Parser {
                         init: None,
                         is_static: false,
                         is_extern: true,
+                        align: 0,
                     });
                 }
                 // An extern declaration can't have an initializer; move on.
@@ -886,19 +922,21 @@ impl Parser {
                 if self.eat_punct("=") {
                     init = Some(self.global_initializer(&ty)?);
                 }
+                let align = self.aligns.get(&name).copied().unwrap_or(0);
                 self.globals.push(Global {
                     name: uniq,
                     ty,
                     init,
                     is_static: true,
                     is_extern: false,
+                    align,
                 });
                 if !self.eat_punct(",") {
                     break;
                 }
                 continue;
             }
-            let uniq = self.new_local(&name, ty.clone());
+            let uniq = self.new_local(&name, ty.clone(), sc.is_volatile);
             let init = if self.eat_punct("=") {
                 Some(self.initializer()?)
             } else {
@@ -929,6 +967,101 @@ impl Parser {
         }
     }
 
+    /// `asm [volatile|goto] ( "text" [: outputs [: inputs [: clobbers]]] );`
+    /// Basic asm passes through to the output. Extended asm supports the
+    /// minimal subset the corpus uses — ≤1 data-register output, ≤2 operands
+    /// total (`%0`/`%1`), clobbers accepted and ignored (this codegen holds
+    /// nothing live in d0/d1/flags across statements). Anything richer is a
+    /// hard error — silently dropping asm deleted a `move #$2000,sr`
+    /// interrupt enable from a shipped port (adoption report round 2, item 1).
+    fn asm_stmt(&mut self) -> PResult<Stmt> {
+        let loc = self.loc();
+        self.pos += 1; // asm / __asm__ / __asm
+        while self.eat_kw("volatile") || self.eat_kw("goto") || self.eat_kw("inline") {}
+        self.expect("(")?;
+        let mut text = Vec::new();
+        while let Tok::Str(bytes) = self.peek().clone() {
+            self.pos += 1;
+            text.extend(bytes.iter().take_while(|&&b| b != 0).copied());
+        }
+        let template = String::from_utf8_lossy(&text).into_owned();
+        if self.eat_punct(")") {
+            self.expect(";")?;
+            return Ok(Stmt::Asm(template));
+        }
+        if !self.eat_punct(":") {
+            return Err(format!(
+                "{loc}: expected string literal or ':' in asm(...), found {:?}",
+                self.peek()
+            ));
+        }
+        let outputs = self.asm_operands()?;
+        let inputs = if self.eat_punct(":") { self.asm_operands()? } else { Vec::new() };
+        if self.eat_punct(":") {
+            // clobber list: strings, accepted and ignored
+            while matches!(self.peek(), Tok::Str(_)) {
+                self.pos += 1;
+                if !self.eat_punct(",") {
+                    break;
+                }
+            }
+        }
+        self.expect(")")?;
+        self.expect(";")?;
+
+        if outputs.len() > 1 || inputs.len() > 1 || outputs.len() + inputs.len() > 2 {
+            return Err(format!(
+                "{loc}: extended inline asm supports at most one output and one input \
+                 (%0/%1) — hoist richer asm to a .S file"
+            ));
+        }
+        let output = match outputs.into_iter().next() {
+            Some((cons, e)) => {
+                let ok = (cons.starts_with('=') || cons.starts_with('+'))
+                    && cons[1..].chars().all(|c| matches!(c, 'd' | 'r' | 'g'));
+                if !ok {
+                    return Err(format!(
+                        "{loc}: unsupported asm output constraint \"{cons}\" — only \
+                         \"=d\"/\"+d\" (data register) is supported"
+                    ));
+                }
+                Some((cons.starts_with('+'), e))
+            }
+            None => None,
+        };
+        let input = match inputs.into_iter().next() {
+            Some((cons, e)) => {
+                if !cons.chars().all(|c| matches!(c, 'd' | 'r' | 'g' | 'i')) {
+                    return Err(format!(
+                        "{loc}: unsupported asm input constraint \"{cons}\" — only \
+                         \"d\"/\"r\"/\"g\" (data register) is supported"
+                    ));
+                }
+                Some(e)
+            }
+            None => None,
+        };
+        Ok(Stmt::AsmExt { template, output, input })
+    }
+
+    /// One `"constraint" (expr)` list section of an extended asm statement.
+    fn asm_operands(&mut self) -> PResult<Vec<(String, Expr)>> {
+        let mut out = Vec::new();
+        while let Tok::Str(bytes) = self.peek().clone() {
+            self.pos += 1;
+            let cons: String =
+                bytes.iter().take_while(|&&b| b != 0).map(|&b| b as char).collect();
+            self.expect("(")?;
+            let e = self.assign()?;
+            self.expect(")")?;
+            out.push((cons, e));
+            if !self.eat_punct(",") {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     fn stmt(&mut self) -> PResult<Stmt> {
         // labeled statement:  IDENT ':' stmt   (goto target)
         if let Tok::Ident(name) = self.peek().clone() {
@@ -936,6 +1069,10 @@ impl Parser {
                 self.pos += 2;
                 let s = self.stmt()?;
                 return Ok(Stmt::Label(name, Box::new(s)));
+            }
+            // inline asm statement: `asm [volatile] ("text");`
+            if matches!(name.as_str(), "asm" | "__asm__" | "__asm") {
+                return self.asm_stmt();
             }
         }
         if self.eat_kw("switch") {
@@ -1553,4 +1690,5 @@ struct Storage {
     typedef: bool,
     is_static: bool,
     is_extern: bool,
+    is_volatile: bool,
 }
