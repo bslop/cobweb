@@ -390,7 +390,7 @@ pub(crate) fn encode(mnem: &str, args: &str, here: u32, asm: &Assembler) -> Resu
             if let Some((sym, addend)) = asm.reloc_symbol_pub(target) {
                 return Ok(M68kEnc {
                     words: vec![opbase, addend as u16],
-                    reloc: Some((1, RelKind::Word, sym, addend)),
+                    reloc: Some((1, RelKind::Pc16, sym, addend)),
                 });
             }
         }
@@ -746,12 +746,23 @@ fn imm_words(sz: Sz) -> usize {
     }
 }
 
+/// Relocation kind for an EA's symbol reference: abs.w (mode 7/0, one ext
+/// word) patches 16 bits; everything else is a full longword. Mislabeling the
+/// word form as Long would clobber the 2 bytes after it at link time.
+fn ea_rel_kind(ea: &Ea) -> RelKind {
+    if ea.mode == 7 && ea.reg == 0 {
+        RelKind::Word
+    } else {
+        RelKind::Long
+    }
+}
+
 /// If the EA carries a reloc, shift its word offset by `base_words` (the words
 /// emitted before the EA extension).
 fn shift_reloc(ea: &Ea, base_words: usize) -> Option<(u32, RelKind, String, i64)> {
     ea.reloc
         .as_ref()
-        .map(|(s, a)| ((base_words + ea.reloc_ext_off) as u32, RelKind::Long, s.clone(), *a))
+        .map(|(s, a)| ((base_words + ea.reloc_ext_off) as u32, ea_rel_kind(ea), s.clone(), *a))
 }
 
 fn one(w: u16) -> M68kEnc {
@@ -772,11 +783,11 @@ fn assemble_words(op: u16, s: &Ea, d: &Ea) -> M68kEnc {
     let reloc = s
         .reloc
         .as_ref()
-        .map(|(sym, a)| (1u32, RelKind::Long, sym.clone(), *a))
+        .map(|(sym, a)| (1u32, ea_rel_kind(s), sym.clone(), *a))
         .or_else(|| {
             d.reloc
                 .as_ref()
-                .map(|(sym, a)| ((1 + s.ext.len()) as u32, RelKind::Long, sym.clone(), *a))
+                .map(|(sym, a)| ((1 + s.ext.len()) as u32, ea_rel_kind(d), sym.clone(), *a))
         });
     words.extend_from_slice(&d.ext);
     M68kEnc { words, reloc }

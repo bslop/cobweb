@@ -201,6 +201,12 @@ pub fn link_with(objects: &[Object], layout: &Layout) -> Result<Image, LinkError
                     put_be16(&mut obj.bytes, off + 2, (val & 0xFFFF) as u16)?;
                 }
                 RelKind::Word => put_be16(&mut obj.bytes, off, (val & 0xFFFF) as u16)?,
+                // 68k word-branch displacement: base is the displacement word's
+                // own final address (branch opcode + 2 = this reloc's site).
+                RelKind::Pc16 => {
+                    let site = placed[oi] as i64 + r.offset as i64;
+                    put_be16(&mut obj.bytes, off, (val as i64 - site) as u16)?;
+                }
             }
         }
     }
@@ -316,6 +322,52 @@ mod tests {
         gpu.run(&mut bus, 5000);
         assert_eq!(bus.read32(0x0010_0000 + 14 * 4), 0xCAFE, "store landed at r15+56");
         assert_eq!(bus.read32(0x0010_0000 + 32 * 4), 0, "nothing at the buggy r15+128");
+    }
+
+    #[test]
+    fn cross_object_word_branch_is_pc_relative() {
+        // A `bsr.w extern` records a Pc16 relocation: the patched word must be
+        // a DISPLACEMENT (target − site), not the absolute address the old
+        // Word patch wrote — that bug sent every cross-object 68k call into
+        // the weeds. Run the linked image to prove the call lands.
+        let opts = |org| jas::Options {
+            org,
+            start_m68k: true,
+            object_mode: true,
+            check_hazards: false,
+            ..Default::default()
+        };
+        let a_src = "\t.68000\n\t.extern far_func\n\t.globl start68\nstart68:\n\tbsr.w far_func\nhalt:\n\tbra.w halt\n";
+        let b_src = "\t.68000\n\t.globl far_func\nfar_func:\n\tmove.l #$0000CAFE,$100\n\trts\n";
+        let a = {
+            let out = jas::assemble(a_src, &opts(0x4000));
+            assert_eq!(out.errors(), 0, "{:#?}", out.diags);
+            out.object(0x4000)
+        };
+        let b = {
+            let out = jas::assemble(b_src, &opts(0x4800));
+            assert_eq!(out.errors(), 0, "{:#?}", out.diags);
+            out.object(0x4800)
+        };
+        let img = link(&[a, b]).expect("links");
+        // displacement word at 0x4002 must be far_func − 0x4002 = 0x7FE
+        let disp = u16::from_be_bytes([img.bytes[2], img.bytes[3]]);
+        assert_eq!(disp, 0x07FE, "PC-relative displacement, not an absolute address");
+
+        let mut jag = jag_core::Jaguar::new();
+        for (i, byte) in img.bytes.iter().enumerate() {
+            jag.bus.write8(img.base + i as u32, *byte);
+        }
+        jag.cpu.set_pc(0x4000);
+        let mut prev = u32::MAX;
+        for _ in 0..1000 {
+            if jag.cpu.pc == prev {
+                break;
+            }
+            prev = jag.cpu.pc;
+            jag.step_instruction();
+        }
+        assert_eq!(jag.bus.read32(0x100), 0xCAFE, "the cross-object call executed");
     }
 
     #[test]

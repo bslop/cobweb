@@ -15,6 +15,7 @@
 //! assembler and the emulator can never silently disagree about an opcode.
 
 mod encode;
+pub mod elf;
 pub mod gas;
 pub mod hazard;
 pub mod m68k;
@@ -41,6 +42,26 @@ pub enum Target {
 pub enum Level {
     Error,
     Warning,
+}
+
+/// Section identity, tracked so object writers (ELF) can carve the assembled
+/// blob into real `.text`/`.data`/`.bss` sections. In flat-binary and `.jo`
+/// modes the switch directives stay advisory, exactly as before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Section {
+    Text,
+    Data,
+    Bss,
+}
+
+impl Section {
+    pub fn name(self) -> &'static str {
+        match self {
+            Section::Text => ".text",
+            Section::Data => ".data",
+            Section::Bss => ".bss",
+        }
+    }
 }
 
 /// A diagnostic tied to a source line, with an optional fix-it hint — the thing
@@ -105,6 +126,12 @@ pub struct Assembled {
     /// source lines carrying a `;jas:allow` pragma (hazards there are waived)
     pub suppressed: Vec<usize>,
     pub diags: Vec<Diag>,
+    /// Section marks: (section, byte offset where it starts). Consecutive marks
+    /// of the same section are merged; always begins with (Text, 0).
+    pub sections: Vec<(Section, u32)>,
+    /// Names bound by *labels* (addresses in a section) as opposed to `equ`
+    /// constants — object writers need the distinction (ELF `SHN_ABS`).
+    pub label_syms: HashSet<String>,
 }
 
 impl Assembled {
@@ -261,6 +288,10 @@ struct Assembler<'a> {
     m68k_mode: bool,
     /// source lines with a `;jas:allow` pragma (hazard diagnostics waived)
     suppressed: std::collections::HashSet<usize>,
+    /// section switch points (pass 2): (section, byte offset)
+    sec_marks: Vec<(Section, u32)>,
+    /// symbols defined as labels (vs `equ` constants)
+    label_syms: HashSet<String>,
     pass: u8,
 }
 
@@ -285,6 +316,8 @@ impl<'a> Assembler<'a> {
             scope: String::new(),
             m68k_mode: opts.start_m68k,
             suppressed: HashSet::new(),
+            sec_marks: vec![(Section::Text, 0)],
+            label_syms: HashSet::new(),
             pass: 0,
         }
     }
@@ -307,6 +340,7 @@ impl<'a> Assembler<'a> {
             if pass == 2 {
                 self.emitted.clear();
                 self.bytes.clear();
+                self.sec_marks = vec![(Section::Text, 0)];
             }
             for (i, raw) in source.lines().enumerate() {
                 let n = src_line(i);
@@ -321,6 +355,26 @@ impl<'a> Assembler<'a> {
     }
 
     fn finish(self) -> Assembled {
+        // merge consecutive same-section marks and drop empty spans
+        let mut sections: Vec<(Section, u32)> = Vec::new();
+        for (sec, off) in self.sec_marks {
+            if let Some(last) = sections.last_mut() {
+                if last.0 == sec {
+                    continue; // still in the same section
+                }
+                if last.1 == off {
+                    *last = (sec, off); // previous span was empty: replace it
+                    // replacing may rejoin the span before it (.data/.text with
+                    // nothing between switches back): merge those too
+                    let n = sections.len();
+                    if n >= 2 && sections[n - 2].0 == sec {
+                        sections.pop();
+                    }
+                    continue;
+                }
+            }
+            sections.push((sec, off));
+        }
         Assembled {
             org: self.org,
             bytes: self.bytes,
@@ -331,6 +385,8 @@ impl<'a> Assembler<'a> {
             relocs: self.relocs,
             suppressed: self.suppressed.into_iter().collect(),
             diags: self.diags,
+            sections,
+            label_syms: self.label_syms,
         }
     }
 
@@ -398,6 +454,7 @@ impl<'a> Assembler<'a> {
 
     fn define_label(&mut self, label: &str, n: usize) {
         let name = self.qualify(label);
+        self.label_syms.insert(name.clone());
         if self.pass == 1 {
             if self.symbols.contains_key(&name) {
                 // redefinition caught in pass 1
@@ -511,9 +568,20 @@ impl<'a> Assembler<'a> {
                     }
                 }
             }
-            // GAS `.section NAME [,flags]` — advisory in single-file mode, like the
-            // bare `.text`/`.data`/`.bss` switches below.
-            ".section" => {}
+            // GAS `.section NAME [,flags]` — mapped onto the three base sections
+            // when the name is (or starts with) one of them; other names fold
+            // into `.data`.
+            ".section" => {
+                let name = line.args.split(',').next().unwrap_or("").trim().trim_matches('"');
+                let sec = if name.starts_with(".text") {
+                    Section::Text
+                } else if name.starts_with(".bss") {
+                    Section::Bss
+                } else {
+                    Section::Data
+                };
+                self.switch_section(sec);
+            }
             // `.incbin "file"[,skip[,count]]` — splice a binary blob into the image.
             ".incbin" => self.emit_incbin(line),
             ".ascii" | ".asciz" | ".string" => self.emit_ascii(line, op != ".ascii"),
@@ -578,7 +646,10 @@ impl<'a> Assembler<'a> {
             ".phrase" => self.align_to(8, line),
             ".dphrase" => self.align_to(16, line),
             ".qphrase" => self.align_to(32, line),
-            ".text" | ".data" | ".bss" | ".abs" => { /* section: advisory in single-file mode */ }
+            ".text" => self.switch_section(Section::Text),
+            ".data" => self.switch_section(Section::Data),
+            ".bss" => self.switch_section(Section::Bss),
+            ".abs" => { /* absolute section: advisory in single-file mode */ }
             ".print" => { /* assembler-time message: ignored in batch */ }
             ".farskip" | ".wait" => {
                 self.err_fix(line.n,
@@ -586,6 +657,14 @@ impl<'a> Assembler<'a> {
                     "define it with .macro, or jas will expand it once macro support lands");
             }
             _ => self.err(line.n, format!("unknown directive `{op}`")),
+        }
+    }
+
+    /// Record a section switch (pass 2; earlier passes only need sizes, which
+    /// section identity does not affect — the blob layout is unchanged).
+    fn switch_section(&mut self, sec: Section) {
+        if self.pass == 2 {
+            self.sec_marks.push((sec, self.bytes.len() as u32));
         }
     }
 

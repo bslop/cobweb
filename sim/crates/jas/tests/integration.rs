@@ -502,6 +502,93 @@ fn equ_and_expressions() {
     assert_eq!(&out.bytes[2..6], &[0x30, 0x40, 0x00, 0xF0]);
 }
 
+// ── ELF object output (--elf-obj) ────────────────────────────────────────────
+
+/// Minimal ELF32-BE reader for validating our own output structurally.
+struct Elf<'a> {
+    b: &'a [u8],
+}
+impl<'a> Elf<'a> {
+    fn u16(&self, o: usize) -> u16 {
+        u16::from_be_bytes(self.b[o..o + 2].try_into().unwrap())
+    }
+    fn u32(&self, o: usize) -> u32 {
+        u32::from_be_bytes(self.b[o..o + 4].try_into().unwrap())
+    }
+    /// (type, flags, offset, size) of section header `i`.
+    fn sh(&self, i: usize) -> (u32, u32, usize, usize) {
+        let off = self.u32(32) as usize + i * 40;
+        (
+            self.u32(off + 4),
+            self.u32(off + 8),
+            self.u32(off + 16) as usize,
+            self.u32(off + 20) as usize,
+        )
+    }
+}
+
+#[test]
+fn elf_obj_is_wellformed_m68k_rel() {
+    let src = "\t.68000\n\
+        \t.text\n\
+        \t.globl entry\n\
+        \t.extern outside\n\
+        entry:\n\
+        \tmove.l counter,d0\n\
+        \tbsr.w outside\n\
+        \trts\n\
+        \t.data\n\
+        counter:\n\
+        \tdc.l 42\n";
+    let opts = Options { org: 0x4000, start_m68k: true, object_mode: true, relocatable: true, check_hazards: false, ..Default::default() };
+    let out = assemble(src, &opts);
+    assert_eq!(out.errors(), 0, "{:#?}", out.diags);
+    let bytes = jas::elf::write(&out).expect("elf");
+    let e = Elf { b: &bytes };
+    assert_eq!(&bytes[..4], b"\x7fELF");
+    assert_eq!(bytes[4], 1, "ELFCLASS32");
+    assert_eq!(bytes[5], 2, "big-endian");
+    assert_eq!(e.u16(16), 1, "ET_REL");
+    assert_eq!(e.u16(18), 4, "EM_68K");
+    assert_eq!(e.u16(48), 9, "section count");
+    // .text: PROGBITS, alloc+exec, 12 bytes (move.l abs.l 6 + bsr.w 4 + rts 2)
+    let (ty, fl, _, sz) = e.sh(1);
+    assert_eq!((ty, fl & 6, sz), (1, 6, 12), ".text header");
+    // .data: PROGBITS, alloc+write, the dc.l
+    let (ty, fl, doff, sz) = e.sh(3);
+    assert_eq!((ty, fl & 3, sz), (1, 3, 4), ".data header");
+    assert_eq!(&bytes[doff..doff + 4], &[0, 0, 0, 42]);
+    // .rela.text: two RELA entries (counter abs32 + outside pc16)
+    let (ty, _, roff, rsz) = e.sh(2);
+    assert_eq!((ty, rsz), (4, 24), ".rela.text");
+    let r_info = |i: usize| e.u32(roff + i * 12 + 4);
+    let types: Vec<u8> = (0..2).map(|i| (r_info(i) & 0xFF) as u8).collect();
+    assert!(types.contains(&1), "R_68K_32 present: {types:?}");
+    assert!(types.contains(&5), "R_68K_PC16 present: {types:?}");
+}
+
+#[test]
+fn elf_obj_rejects_jrisc_movei_reloc() {
+    // A JRISC MOVEI of an extern has no ELF relocation type — must be a clear
+    // error, not silent corruption.
+    let src = "\t.gpu\n\t.extern target\n\tmovei #target,r1\n\tnop\n";
+    let opts = Options { object_mode: true, relocatable: true, ..Default::default() };
+    let out = assemble(src, &opts);
+    assert_eq!(out.errors(), 0, "{:#?}", out.diags);
+    let err = jas::elf::write(&out).unwrap_err();
+    assert!(err.contains("MOVEI"), "got: {err}");
+}
+
+#[test]
+fn elf_obj_rejects_interleaved_sections() {
+    let src = "\t.68000\n\t.text\n\tnop\n\t.data\n\tdc.w 1\n\t.text\n\tnop\n";
+    let opts = Options { org: 0x4000, start_m68k: true, object_mode: true, relocatable: true, check_hazards: false, ..Default::default() };
+    let out = assemble(src, &opts);
+    assert_eq!(out.errors(), 0, "{:#?}", out.diags);
+    let err = jas::elf::write(&out).unwrap_err();
+    assert!(err.contains("re-entered"), "got: {err}");
+}
+
 // ── 68000 mode (validated in jag-core's interpreter) ─────────────────────────
 
 use jag_core::{Debugger, M68k};

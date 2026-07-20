@@ -21,6 +21,7 @@ fn main() -> ExitCode {
     let mut output = None;
     let mut opts = Options::default();
     let mut org_set = false;
+    let mut elf_obj = false;
 
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -57,6 +58,13 @@ fn main() -> ExitCode {
             "--gas" => opts.gas = Some(true),   // force the GNU-as frontend
             "--no-gas" => opts.gas = Some(false),
             "-r" | "--relocatable" => {
+                opts.relocatable = true;
+                opts.object_mode = true;
+            }
+            // GNU-linkable ELF object (implies -r: every absolute reference to
+            // a defined symbol relocates, so GNU ld can place the sections).
+            "--elf-obj" => {
+                elf_obj = true;
                 opts.relocatable = true;
                 opts.object_mode = true;
             }
@@ -124,7 +132,15 @@ fn main() -> ExitCode {
     }
 
     if let Some(out) = output {
-        let data = if opts.object_mode {
+        let data = if elf_obj {
+            match jas::elf::write(&result) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("jas: --elf-obj: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        } else if opts.object_mode {
             result.object(result.org).serialize()
         } else {
             result.bytes.clone()
@@ -137,7 +153,13 @@ fn main() -> ExitCode {
             "jas: wrote {} ({} {} at 0x{:06X}, {} relocs), {warns} warning(s)",
             out,
             if opts.object_mode { data.len() } else { result.bytes.len() },
-            if opts.object_mode { "object bytes" } else { "bytes" },
+            if elf_obj {
+                "ELF bytes"
+            } else if opts.object_mode {
+                "object bytes"
+            } else {
+                "bytes"
+            },
             result.org,
             result.relocs.len(),
         );
@@ -171,6 +193,7 @@ fn usage() {
          \n\
          OPTIONS:\n\
          \x20 -o <file>            write flat binary output\n\
+         \x20 --elf-obj           write a GNU-linkable ELF32 m68k object (implies -r)\n\
          \x20 --gpu | --dsp       target core (default gpu; sets default org)\n\
          \x20 --68000            start in 68000 mode (pure-68k files w/o a .68000 directive)\n\
          \x20 --org <0xADDR>      origin address (default GPU $F03000 / DSP $F1B000)\n\

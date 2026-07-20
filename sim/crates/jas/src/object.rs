@@ -12,10 +12,13 @@ pub enum RelKind {
     /// MOVEI immediate: two 16-bit half-words, low-word-first, at `offset+2`
     /// (offset points at the opcode word).
     Movei,
-    /// 32-bit big-endian longword at `offset`.
+    /// 32-bit big-endian longword at `offset` (absolute address).
     Long,
-    /// 16-bit big-endian word at `offset`.
+    /// 16-bit big-endian word at `offset` (absolute address, e.g. abs.w).
     Word,
+    /// 16-bit big-endian word at `offset` holding a PC-relative displacement
+    /// whose base is `offset` itself (a 68k word branch: disp = target − site).
+    Pc16,
 }
 
 impl RelKind {
@@ -24,6 +27,7 @@ impl RelKind {
             RelKind::Movei => 0,
             RelKind::Long => 1,
             RelKind::Word => 2,
+            RelKind::Pc16 => 3,
         }
     }
     fn from_tag(t: u8) -> Option<Self> {
@@ -31,6 +35,7 @@ impl RelKind {
             0 => RelKind::Movei,
             1 => RelKind::Long,
             2 => RelKind::Word,
+            3 => RelKind::Pc16,
             _ => return None,
         })
     }
