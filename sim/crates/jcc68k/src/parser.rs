@@ -52,7 +52,9 @@ fn strip_gnu(toks: Vec<Token>) -> Vec<Token> {
     use std::collections::HashMap;
     let mut out: Vec<Token> = Vec::with_capacity(toks.len());
     let mut i = 0;
-    let kw = |s: &str, t: &Token| Token { tok: Tok::Keyword(s.into()), line: t.line, col: t.col };
+    let kw = |s: &str, t: &Token| {
+        Token { tok: Tok::Keyword(s.into()), line: t.line, col: t.col, file: t.file.clone() }
+    };
     // GCC asm labels: `TYPE name __asm__("linkname")` renames `name`'s linkage
     // symbol to `linkname`. Collected here, applied to every use in a second pass.
     let mut renames: HashMap<String, String> = HashMap::new();
@@ -212,6 +214,16 @@ impl Parser {
     fn line(&self) -> usize {
         self.toks[self.pos].line
     }
+    /// Source position for diagnostics: `file:line` when the preprocessor's
+    /// line markers named the file, bare `line` otherwise.
+    fn loc(&self) -> String {
+        let t = &self.toks[self.pos];
+        if t.file.is_empty() {
+            t.line.to_string()
+        } else {
+            format!("{}:{}", t.file, t.line)
+        }
+    }
     fn at_punct(&self, s: &str) -> bool {
         matches!(self.peek(), Tok::Punct(p) if p == s)
     }
@@ -238,7 +250,7 @@ impl Parser {
         if self.eat_punct(s) {
             Ok(())
         } else {
-            Err(format!("{}: expected '{}', found {:?}", self.line(), s, self.peek()))
+            Err(format!("{}: expected '{}', found {:?}", self.loc(), s, self.peek()))
         }
     }
     fn ident(&mut self) -> PResult<String> {
@@ -247,7 +259,7 @@ impl Parser {
                 self.pos += 1;
                 Ok(s)
             }
-            other => Err(format!("{}: expected identifier, found {:?}", self.line(), other)),
+            other => Err(format!("{}: expected identifier, found {:?}", self.loc(), other)),
         }
     }
 
@@ -423,7 +435,7 @@ impl Parser {
                     let mut mi = 0usize;
                     while !self.at_punct("}") {
                         if mi >= members.len() {
-                            return Err(format!("{}: too many struct initializers", self.line()));
+                            return Err(format!("{}: too many struct initializers", self.loc()));
                         }
                         // pad to this member's offset
                         let target = start + members[mi].offset as usize;
@@ -459,9 +471,9 @@ impl Parser {
                 return Ok(());
             }
         }
-        let line = self.line();
+        let loc = self.loc();
         let e = self.assign()?;
-        let v = const_eval(&e).map_err(|m| format!("{line}: {m} in initializer"))?;
+        let v = const_eval(&e).map_err(|m| format!("{loc}: {m} in initializer"))?;
         for i in (0..sz).rev() {
             out.push(InitByte::Byte(((v >> (i * 8)) & 0xFF) as u8));
         }
@@ -992,7 +1004,7 @@ impl Parser {
         if self.eat_kw("do") {
             let body = Box::new(self.stmt()?);
             if !self.eat_kw("while") {
-                return Err(format!("{}: expected 'while' after do-body", self.line()));
+                return Err(format!("{}: expected 'while' after do-body", self.loc()));
             }
             self.expect("(")?;
             let c = self.expr()?;

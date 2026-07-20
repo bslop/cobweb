@@ -259,7 +259,7 @@ pub fn check(emitted: &[Emitted]) -> Vec<Diag> {
                              — the DATA register is not scoreboarded (TRM errata), the STALE value is stored",
                             p.line
                         ),
-                    ).with_fix(format!("touch the register first, e.g. `or r{data},r{data}`, so the scoreboard settles it")));
+                    ).with_fix(format!("touch the register first, e.g. `or r{data},r{data}` (a `move r{data},r{data}` also counts), so the scoreboard settles it")));
                 }
             }
         }
@@ -284,7 +284,7 @@ pub fn check(emitted: &[Emitted]) -> Vec<Diag> {
                                  (TRM bug 13: writes are not scoreboarded — the slow value lands LAST)",
                                 p.line
                             ),
-                        ).with_fix(format!("read r{w} first (e.g. `or r{w},r{w}`) or reorder so the slow result is consumed before overwrite")));
+                        ).with_fix(format!("read r{w} first (`or r{w},r{w}` or `move r{w},r{w}` — any read settles it) or reorder so the slow result is consumed before overwrite")));
                     }
                 }
             }

@@ -430,7 +430,7 @@ impl<'a> Assembler<'a> {
         // size-suffixed data directives: .dc.X / .dcb.X / .ds.X
         if let Some(rest) = opl.strip_prefix(".dc.").or_else(|| opl.strip_prefix("dc.")) {
             let sz = suffix_size(rest);
-            return self.emit_data(line, sz, rest == "i");
+            return self.emit_data_checked(line, sz, rest == "i", &opl);
         }
         if let Some(rest) = opl.strip_prefix(".dcb") {
             if rest.is_empty() || rest.starts_with('.') {
@@ -478,10 +478,21 @@ impl<'a> Assembler<'a> {
                     }
                 }
             }
-            ".long" | "dc.l" | ".dc.l" => self.emit_data(line, 4, false),
-            ".word" | "dc.w" | ".dc.w" => self.emit_data(line, 2, false),
+            // rmac's `.long` with NO operands is an *alignment* directive (align
+            // to a longword boundary); with operands it is GAS-style longword
+            // data. Silently emitting nothing for the bare form cost a real
+            // debug cycle (a 2-misaligned GPU data table read garbage on
+            // silicon), so both meanings are honored by operand count.
+            ".long" | "dc.l" | ".dc.l" => {
+                if line.args.trim().is_empty() && opl == ".long" {
+                    self.align_to(4, line);
+                } else {
+                    self.emit_data_checked(line, 4, false, &opl);
+                }
+            }
+            ".word" | "dc.w" | ".dc.w" => self.emit_data_checked(line, 2, false, &opl),
             "dc.i" | ".dc.i" => self.emit_data(line, 4, true), // JRISC swapped-long
-            ".byte" | "dc.b" | ".dc.b" => self.emit_data(line, 1, false),
+            ".byte" | "dc.b" | ".dc.b" => self.emit_data_checked(line, 1, false, &opl),
             ".align" => {
                 if let Some(v) = self.eval_or_err(line.args, line.n) {
                     let a = v.max(1);
@@ -563,9 +574,10 @@ impl<'a> Assembler<'a> {
                     self.ccaliases.remove(name.trim());
                 }
             }
-            ".dc" => self.emit_data(line, 2, false),
+            ".dc" => self.emit_data_checked(line, 2, false, &opl),
             ".phrase" => self.align_to(8, line),
             ".dphrase" => self.align_to(16, line),
+            ".qphrase" => self.align_to(32, line),
             ".text" | ".data" | ".bss" | ".abs" => { /* section: advisory in single-file mode */ }
             ".print" => { /* assembler-time message: ignored in batch */ }
             ".farskip" | ".wait" => {
@@ -665,6 +677,20 @@ impl<'a> Assembler<'a> {
                 self.put_byte(0, line);
             }
         }
+    }
+
+    /// [`emit_data`] plus an empty-operand check: a data directive with no
+    /// operands emits nothing, which is never what the author meant (rmac's
+    /// bare `.long` is the alignment directive; a bare `dc.w` is a typo).
+    fn emit_data_checked(&mut self, line: &Line, size: u32, swapped: bool, opl: &str) {
+        if line.args.trim().is_empty() {
+            self.warn(
+                line.n,
+                format!("`{opl}` with no operands emits nothing — if you meant rmac's alignment directive, use `.align {size}`"),
+            );
+            return;
+        }
+        self.emit_data(line, size, swapped);
     }
 
     fn emit_data(&mut self, line: &Line, size: u32, swapped: bool) {

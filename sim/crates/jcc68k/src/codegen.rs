@@ -208,27 +208,60 @@ impl Gen {
 
         let name = mangle(&f.name);
         self.ret_label = format!(".Lret_{}", self.l());
+
+        // Generate the body into a side buffer first, then wrap it in the
+        // smallest correct prologue/epilogue: LINK/UNLK only when the frame is
+        // actually used, and save/restore only the callee-saved registers the
+        // body touches. A leaf like `blit_wait()` (a 3-instruction spin) gets
+        // no prologue at all instead of a full link + movem of ten registers.
+        let outer = std::mem::take(&mut self.out);
+        for s in &f.body {
+            self.gen_stmt(s)?;
+        }
+        let body = std::mem::replace(&mut self.out, outer);
+
+        let used = used_callee_saved(&body);
+        let need_frame = frame_size > 0 || body.contains("(a6)");
+        let save_bytes = used.len() as i32 * 4;
+
         if !f.is_static {
             self.line(&format!(".globl {name}"));
         }
         self.lbl(&name);
-        self.line(&format!("link a6,#-{frame_size}"));
-        self.line("movem.l d2-d7/a2-a5,-(a7)");
+        if need_frame {
+            self.line(&format!("link a6,#-{frame_size}"));
+        }
+        match used.as_slice() {
+            [] => {}
+            [r] => self.line(&format!("move.l {r},-(a7)")),
+            _ => self.line(&format!("movem.l {},-(a7)", used.join("/"))),
+        }
         // Copy register-allocated parameters out of their incoming stack slots.
+        // Without a frame pointer the slots are A7-relative: past the saved
+        // registers and the return address (the copies run before any body
+        // push, so A7 is still at its post-save position).
         for (pn, _) in &f.params {
             if let Some(reg) = self.reg_of.get(pn).cloned() {
                 let off = self.frame[pn];
-                self.line(&format!("move.l {off}(a6),{reg}"));
+                if need_frame {
+                    self.line(&format!("move.l {off}(a6),{reg}"));
+                } else {
+                    self.line(&format!("move.l {}(a7),{reg}", off - 8 + 4 + save_bytes));
+                }
             }
         }
-        for s in &f.body {
-            self.gen_stmt(s)?;
-        }
+        self.out.push_str(&body);
         // fall-through return (returns garbage in D0, like C without a return)
         let rl = self.ret_label.clone();
         self.lbl(&rl);
-        self.line("movem.l (a7)+,d2-d7/a2-a5");
-        self.line("unlk a6");
+        match used.as_slice() {
+            [] => {}
+            [r] => self.line(&format!("move.l (a7)+,{r}")),
+            _ => self.line(&format!("movem.l (a7)+,{}", used.join("/"))),
+        }
+        if need_frame {
+            self.line("unlk a6");
+        }
         self.line("rts");
         self.out.push('\n');
         Ok(())
@@ -1027,6 +1060,26 @@ fn peephole(asm: &str) -> String {
         i += 1;
     }
     out
+}
+
+/// Which callee-saved registers a generated function body actually names, in
+/// save order. Token-boundary matching so a symbol like `fixed2int` doesn't
+/// count as a `d2` use (a false positive would only cost an extra save, but
+/// the whole point here is not paying for registers a leaf never touches).
+fn used_callee_saved(body: &str) -> Vec<&'static str> {
+    const REGS: &[&str] = &["d2", "d3", "d4", "d5", "d6", "d7", "a2", "a3", "a4", "a5"];
+    let b = body.as_bytes();
+    let boundary = |c: u8| !(c.is_ascii_alphanumeric() || c == b'_');
+    REGS.iter()
+        .copied()
+        .filter(|r| {
+            body.match_indices(r).any(|(i, _)| {
+                let before = i == 0 || boundary(b[i - 1]);
+                let after = i + r.len() >= b.len() || boundary(b[i + r.len()]);
+                before && after
+            })
+        })
+        .collect()
 }
 
 /// A scalar type that occupies a full 4-byte longword (int, long, pointer,

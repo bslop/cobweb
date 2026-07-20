@@ -237,6 +237,55 @@ fn ppinclude() {
     assert_eq!(run_pp("#include \"hdr.h\"\nint main(){ return helper(8); }"), 50);
 }
 
+// ── diagnostic line attribution ──────────────────────────────────────────────
+// The preprocessor removes/inserts lines (#include splicing, dead #if blocks,
+// gathered macro calls). Errors must still name the ORIGINAL source line —
+// COBWEB_REQ_jcc68k_adoption item 4 was a "non-constant expression in
+// initializer" pointing at an unrelated line 1200 lines away.
+
+#[test]
+fn error_line_survives_dead_conditional() {
+    // 5 lines vanish inside `#if 0`; the bad initializer sits on source
+    // line 9 and must be reported there, not at the post-collapse position.
+    let src = "\
+int ok;\n\
+#if 0\n\
+int a;\n\
+int b;\n\
+int c;\n\
+int d;\n\
+#endif\n\
+int f(void);\n\
+int bad = f();\n";
+    let dir = std::env::temp_dir().join(format!("jcc_line_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let main_c = dir.join("main.c");
+    std::fs::write(&main_c, src).unwrap();
+    let err = crate::compile_file(src, &main_c, &[]).unwrap_err();
+    assert!(
+        err.contains(":9:") || err.starts_with("9:"),
+        "error must point at source line 9, got: {err}"
+    );
+    assert!(err.contains("initializer"), "unexpected error: {err}");
+}
+
+#[test]
+fn error_line_survives_include() {
+    // An #include splices ~3 lines into the stream; the error after it must
+    // still carry the including file's own line number (line 3) and its name.
+    let dir = std::env::temp_dir().join(format!("jcc_line2_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("three.h"), "int h1;\nint h2;\nint h3;\n").unwrap();
+    let src = "#include \"three.h\"\nint f(void);\nint bad = f();\n";
+    let main_c = dir.join("main.c");
+    std::fs::write(&main_c, src).unwrap();
+    let err = crate::compile_file(src, &main_c, &[]).unwrap_err();
+    assert!(
+        err.contains("main.c:3:"),
+        "error must point at main.c:3, got: {err}"
+    );
+}
+
 #[test]
 fn pp_nested_macro() {
     let src = "#define A 2\n#define B (A+3)\n#define C (B*B)\nint main(){ return C; }";

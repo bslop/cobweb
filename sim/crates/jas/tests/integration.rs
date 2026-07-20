@@ -352,6 +352,37 @@ fn accepts_waw_guarded_by_read() {
 }
 
 #[test]
+fn accepts_waw_guarded_by_move_touch() {
+    // `move r2,r2` reads its source, so it settles the scoreboard exactly like
+    // `or r2,r2` — both spellings must be credited (COBWEB_REQ_jcc68k_adoption
+    // item 5 asked for parity between the two).
+    let out = assemble(
+        "        .gpu\n\
+         \x20       movei #$100000,r3\n\
+         \x20       load (r3),r2\n\
+         \x20       move r2,r2\n\
+         \x20       moveq #3,r2\n",
+        &Options::default(),
+    );
+    assert_eq!(out.errors(), 0, "{:#?}", out.diags);
+}
+
+#[test]
+fn accepts_indexed_store_guarded_by_move_touch() {
+    let out = assemble(
+        "        .gpu\n\
+         \x20       movei #$100000,r14\n\
+         \x20       moveq #20,r2\n\
+         \x20       moveq #3,r1\n\
+         \x20       div r1,r2\n\
+         \x20       move r2,r2\n\
+         \x20       store r2,(r14+1)\n",
+        &Options::default(),
+    );
+    assert_eq!(out.errors(), 0, "{:#?}", out.diags);
+}
+
+#[test]
 fn hazard_line_survives_conditional_removal() {
     // A `.if 0` block (removed by the preprocessor) before a hazard must NOT
     // shift the reported line: the diagnostic must name the real source line
@@ -425,6 +456,37 @@ fn dsp_target_encodes_dsp_only_ops() {
     let opts = Options { target: Target::Dsp, org: 0xF1_B000, ..Options::default() };
     let out = assemble("        .dsp\n        subqmod #4,r2\n        mirror r3\n", &opts);
     assert_eq!(out.errors(), 0, "{:#?}", out.diags);
+}
+
+#[test]
+fn bare_dot_long_is_rmac_alignment() {
+    // rmac's `.long` with no operands aligns to a longword boundary; jas used
+    // to silently emit nothing, leaving the following table 2-misaligned (GPU
+    // loads force-align on silicon, so it read garbage).
+    let out = assemble(
+        "        .gpu\n\
+         \x20       dc.w 1\n\
+         \x20       .long\n\
+         tab:    dc.l $DEADBEEF\n",
+        &Options::default(),
+    );
+    assert_eq!(out.errors(), 0, "{:#?}", out.diags);
+    assert_eq!(out.symbols["tab"] % 4, 0, "table not long-aligned");
+    assert_eq!(out.bytes.len(), 8); // 2 data + 2 pad + 4 data
+    assert_eq!(&out.bytes[4..8], &[0xDE, 0xAD, 0xBE, 0xEF]);
+}
+
+#[test]
+fn empty_data_directive_warns() {
+    // `dc.w` with no operands emits nothing — that is never intended, so it
+    // must at least warn instead of passing silently.
+    let out = assemble("        .gpu\n        dc.w\n", &Options::default());
+    assert_eq!(out.errors(), 0, "{:#?}", out.diags);
+    assert!(
+        out.diags.iter().any(|d| d.msg.contains("no operands")),
+        "expected empty-operand warning, got: {:#?}",
+        out.diags
+    );
 }
 
 #[test]

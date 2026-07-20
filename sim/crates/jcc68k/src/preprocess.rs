@@ -37,6 +37,13 @@ pub struct Pp {
     out: String,
     included: HashSet<PathBuf>,
     depth: usize,
+    /// Line-marker sync: the (file, line) the next emitted output line will be
+    /// attributed to if nothing is emitted first. When an emit doesn't match
+    /// (a directive/inactive block/include shifted things), a `# N "file"`
+    /// marker — or a short run of blank lines — resynchronizes, so the lexer
+    /// can attribute every token to its true source position.
+    sync_file: String,
+    sync_line: usize,
 }
 
 #[derive(Clone)]
@@ -76,6 +83,8 @@ pub fn preprocess_with(
         out: String::new(),
         included: HashSet::new(),
         depth: 0,
+        sync_file: String::new(),
+        sync_line: 0,
     };
     pp.run(src, path)?;
     Ok(pp.out)
@@ -127,11 +136,11 @@ impl Pp {
     }
 
     fn run(&mut self, src: &str, path: &Path) -> Result<(), String> {
-        let joined = splice_lines(src);
-        let lines = logical_lines(&joined);
+        let file = path.display().to_string();
+        let lines = logical_lines_numbered(src);
         let mut i = 0;
         while i < lines.len() {
-            let raw = &lines[i];
+            let (raw, num) = (&lines[i].0, lines[i].1);
             let trimmed = raw.trim_start();
             if trimmed.starts_with('#') {
                 self.directive(&trimmed[1..], path)?;
@@ -142,16 +151,37 @@ impl Pp {
                 while needs_more_lines(&text) && i + 1 < lines.len() {
                     i += 1;
                     text.push('\n');
-                    text.push_str(&lines[i]);
+                    text.push_str(&lines[i].0);
                 }
                 let toks = lex_pp(&text);
                 let expanded = self.expand(toks, &mut HashSet::new());
-                self.out.push_str(&render(&expanded));
-                self.out.push('\n');
+                self.emit_line(&render(&expanded), &file, num);
             }
             i += 1;
         }
         Ok(())
+    }
+
+    /// Emit one expanded output line attributed to `file:num`, resynchronizing
+    /// with a line marker (or a short run of blank lines) when the output has
+    /// drifted from the source position.
+    fn emit_line(&mut self, text: &str, file: &str, num: usize) {
+        if self.sync_file != file || self.sync_line != num {
+            if self.sync_file == file && num > self.sync_line && num - self.sync_line <= 7 {
+                for _ in self.sync_line..num {
+                    self.out.push('\n');
+                }
+            } else {
+                use std::fmt::Write;
+                let _ = writeln!(self.out, "# {num} \"{file}\"");
+                if self.sync_file != file {
+                    self.sync_file = file.to_string();
+                }
+            }
+        }
+        self.out.push_str(text);
+        self.out.push('\n');
+        self.sync_line = num + 1;
     }
 
     fn directive(&mut self, d: &str, path: &Path) -> Result<(), String> {
@@ -554,11 +584,30 @@ fn needs_more_lines(text: &str) -> bool {
 
 // ── small helpers ────────────────────────────────────────────────────────────
 
-fn splice_lines(src: &str) -> String {
-    // Join backslash-newline; strip comments (block + line) so directives and
-    // macro bodies don't get confused by them.
+/// Split into logical lines (comments stripped, backslash-continuations
+/// joined), each paired with the 1-based physical line it starts on — the
+/// number `emit_line` uses for line-marker sync.
+fn logical_lines_numbered(src: &str) -> Vec<(String, usize)> {
     let no_comments = strip_comments(src);
-    no_comments.replace("\\\n", "")
+    let mut out = Vec::new();
+    let mut acc = String::new();
+    let mut start = 1;
+    for (idx, line) in no_comments.split('\n').enumerate() {
+        if acc.is_empty() {
+            start = idx + 1;
+        }
+        match line.strip_suffix('\\') {
+            Some(pre) => acc.push_str(pre),
+            None => {
+                acc.push_str(line);
+                out.push((std::mem::take(&mut acc), start));
+            }
+        }
+    }
+    if !acc.is_empty() {
+        out.push((acc, start));
+    }
+    out
 }
 
 fn strip_comments(src: &str) -> String {
@@ -629,10 +678,6 @@ fn strip_comments(src: &str) -> String {
         i += 1;
     }
     out
-}
-
-fn logical_lines(src: &str) -> Vec<String> {
-    src.split('\n').map(|s| s.to_string()).collect()
 }
 
 fn split_word(s: &str) -> (&str, &str) {

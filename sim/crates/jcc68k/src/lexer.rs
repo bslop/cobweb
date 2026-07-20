@@ -22,6 +22,9 @@ pub struct Token {
     pub tok: Tok,
     pub line: usize,
     pub col: usize,
+    /// Source file this token came from (set by the preprocessor's `# N "file"`
+    /// line markers; empty when the input carried none).
+    pub file: std::rc::Rc<str>,
 }
 
 const KEYWORDS: &[&str] = &[
@@ -44,6 +47,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
     let mut i = 0usize;
     let mut line = 1usize;
     let mut col = 1usize;
+    let mut file: std::rc::Rc<str> = std::rc::Rc::from("");
     let mut out = Vec::new();
     let mut bump = |i: &mut usize, line: &mut usize, col: &mut usize, n: usize| {
         for _ in 0..n {
@@ -79,10 +83,23 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             bump(&mut i, &mut line, &mut col, 2);
             continue;
         }
-        // preprocessor line directive (`# 12 "file"`) or a stray `#...` — skip to EOL.
-        // (Real macros are handled by the preprocessor before us; a `#` here is a
-        // line marker from the preprocessor.)
+        // Preprocessor line marker (`# 12 "file"`): resync our line counter and
+        // current file so every diagnostic names the true source position, not
+        // a position in the expanded text. Any other `#...` line is skipped.
         if c == b'#' && (col == 1 || out.last().map(|t: &Token| matches!(&t.tok, Tok::Eof)).unwrap_or(true)) {
+            let eol = b[i..].iter().position(|&x| x == b'\n').map(|n| i + n).unwrap_or(b.len());
+            let rest = std::str::from_utf8(&b[i + 1..eol]).unwrap_or("").trim();
+            if let Some((num, fname)) = parse_line_marker(rest) {
+                i = (eol + 1).min(b.len()); // past the newline
+                line = num; // the NEXT line is `num`
+                col = 1;
+                if let Some(f) = fname {
+                    if &*file != f {
+                        file = std::rc::Rc::from(f);
+                    }
+                }
+                continue;
+            }
             while i < b.len() && b[i] != b'\n' {
                 bump(&mut i, &mut line, &mut col, 1);
             }
@@ -93,21 +110,21 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
         if c.is_ascii_digit() || (c == b'.' && b.get(i + 1).is_some_and(|d| d.is_ascii_digit())) {
             let (tok, n) = scan_number(&b[i..])?;
             bump(&mut i, &mut line, &mut col, n);
-            out.push(Token { tok, line: sl, col: sc });
+            out.push(Token { tok, line: sl, col: sc, file: file.clone() });
             continue;
         }
         // char literal
         if c == b'\'' {
             let (val, n) = lex_char(&b[i..])?;
             bump(&mut i, &mut line, &mut col, n);
-            out.push(Token { tok: Tok::Char(val), line: sl, col: sc });
+            out.push(Token { tok: Tok::Char(val), line: sl, col: sc, file: file.clone() });
             continue;
         }
         // string literal
         if c == b'"' {
             let (bytes, n) = lex_string(&b[i..])?;
             bump(&mut i, &mut line, &mut col, n);
-            out.push(Token { tok: Tok::Str(bytes), line: sl, col: sc });
+            out.push(Token { tok: Tok::Str(bytes), line: sl, col: sc, file: file.clone() });
             continue;
         }
         // identifier / keyword
@@ -122,7 +139,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             } else {
                 Tok::Ident(s)
             };
-            out.push(Token { tok, line: sl, col: sc });
+            out.push(Token { tok, line: sl, col: sc, file: file.clone() });
             continue;
         }
         // punctuator (greedy longest match)
@@ -136,13 +153,32 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
         match matched {
             Some(p) => {
                 bump(&mut i, &mut line, &mut col, p.len());
-                out.push(Token { tok: Tok::Punct(p.to_string()), line: sl, col: sc });
+                out.push(Token { tok: Tok::Punct(p.to_string()), line: sl, col: sc, file: file.clone() });
             }
             None => return Err(format!("{sl}:{sc}: stray '{}' in program", c as char)),
         }
     }
-    out.push(Token { tok: Tok::Eof, line, col });
+    out.push(Token { tok: Tok::Eof, line, col, file });
     Ok(out)
+}
+
+/// Parse the body of a line marker (everything after the `#`): `12 "file"` or
+/// bare `12` (also accepts cpp's `line 12 "file"` spelling). Returns the line
+/// number and the file name if present. Trailing flags (cpp's `1`/`2`…) are
+/// ignored.
+fn parse_line_marker(rest: &str) -> Option<(usize, Option<&str>)> {
+    let rest = rest.strip_prefix("line").map(str::trim_start).unwrap_or(rest);
+    let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+    if end == 0 {
+        return None;
+    }
+    let num: usize = rest[..end].parse().ok()?;
+    let after = rest[end..].trim_start();
+    let fname = after
+        .strip_prefix('"')
+        .and_then(|a| a.split_once('"'))
+        .map(|(name, _flags)| name);
+    Some((num, fname))
 }
 
 /// Scan a numeric literal, distinguishing integers from floats (`.`/exponent).
