@@ -386,6 +386,37 @@ fn boot_profiled(
         100.0 * p.main_cycles as f64 / awake.max(1) as f64,
         p.main_instrs
     );
+    // Wall-clock accounting (COBWEB_REQ_wall_clock_accounting.md): per-core
+    // *cycles* cannot express "who was holding wall-clock time". These are
+    // fractions of the SAME elapsed wall clock, so they legitimately sum past
+    // 100% — the masters run concurrently, and that overlap is the point.
+    let hz = 26_590_906.0_f64;
+    let wall = frames as f64 / 59.94;
+    let wall_cyc = wall * hz;
+    let gpu_c = jag.gpu.cycles as f64;
+    let dsp_c = jag.dsp.cycles as f64;
+    let blit_c = jag.gpu.pipe.stats.blit as f64;
+    let m68k_hz = 13_295_453.0_f64;
+    let awake_wall = awake as f64 / m68k_hz;
+    eprintln!("\n=== wall-clock accounting ({wall:.2} s simulated) ===");
+    eprintln!(
+        "  68000 awake     {:>8.3} s  {:5.1}%",
+        awake_wall,
+        100.0 * awake_wall / wall
+    );
+    eprintln!(
+        "  Tom GPU busy    {:>8.3} s  {:5.1}%   (of which Blitter {:.3} s, {:.1}%)",
+        gpu_c / hz,
+        100.0 * gpu_c / wall_cyc,
+        blit_c / hz,
+        100.0 * blit_c / wall_cyc
+    );
+    eprintln!(
+        "  Jerry DSP busy  {:>8.3} s  {:5.1}%",
+        dsp_c / hz,
+        100.0 * dsp_c / wall_cyc
+    );
+
     let rows = if gran > 0 { p.top_buckets(gran, top) } else { p.top(top) };
     eprintln!(
         "\n  {:<10} {:>12} {:>7} {:>12}  {}",
