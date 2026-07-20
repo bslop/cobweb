@@ -53,6 +53,19 @@ rulebook, timing facts, and their [HW]-provenance) is being vendored into
 live in `calib/` (bench logs) and `sim/crates/jag-core/src/risc/timing.rs`
 (constants with provenance comments).
 
+## Positioning
+
+jsim is a **development instrument**, not a games emulator — a logic analyzer,
+not a television. If you want to *play* the Jaguar library, use
+[BigPEmu](https://www.richwhitehouse.com/jaguar/); it is the compatibility and
+playability reference, we treat it as the functional oracle (`jagemu
+oracle-diff` diffs machine state *against* it, and on functional conflicts
+BigPEmu wins), and nothing here competes with it. jsim's lane is the one
+BigPEmu was never built for: deterministic, headless, machine-readable
+measurement of *your own code* — cycle attribution, hardware-calibrated
+timing with disclosed error bars, and optimizer certificates — on the narrow
+set of paths a toolchain needs.
+
 ## Components
 
 | Tool | What | Status |
