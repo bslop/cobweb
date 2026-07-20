@@ -108,6 +108,46 @@ fn positional(args: &[String]) -> Option<&str> {
     args.iter().find(|a| !a.starts_with('-')).map(|s| s.as_str())
 }
 
+/// Parse `0xLO..0xHI` (inclusive range) or a single address.
+fn parse_range(s: &str) -> Result<(u32, u32), String> {
+    match s.split_once("..") {
+        Some((a, b)) => Ok((parse_u32(a)?, parse_u32(b.trim_start_matches('='))?)),
+        None => {
+            let a = parse_u32(s)?;
+            Ok((a, a))
+        }
+    }
+}
+
+/// JSON for the watch state: range, totals, and the logged hits.
+fn watch_json(jag: &Jaguar, lo: u32, hi: u32) -> String {
+    let hits: Vec<String> = jag
+        .bus
+        .watch_log
+        .iter()
+        .take(64)
+        .map(|h| {
+            format!(
+                "{{\"addr\":\"0x{:06X}\",\"value\":\"0x{:X}\",\"size\":{},\"master\":\"{}\",\"pc\":\"0x{:06X}\",\"frame\":{}}}",
+                h.addr,
+                h.value,
+                h.size,
+                h.master.name(),
+                h.pc,
+                h.frame
+            )
+        })
+        .collect();
+    format!(
+        "{{\"range\":\"0x{:06X}..0x{:06X}\",\"total\":{},\"logged\":{},\"hits\":[{}]}}",
+        lo,
+        hi,
+        jag.bus.watch_total,
+        jag.bus.watch_log.len(),
+        hits.join(",")
+    )
+}
+
 fn parse_u32(s: &str) -> Result<u32, String> {
     let s = s.trim();
     let v = if let Some(h) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
@@ -318,6 +358,39 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
             "{{\"ok\":true,\"path\":{},\"frames\":{},\"state\":{}}}",
             jstr(&path),
             frames,
+            state_json(&jag)
+        );
+        return Ok(());
+    }
+    // --watch 0xLO..0xHI (or a single address): log every write from any
+    // master — 68k, GPU, DSP, Blitter — landing in the range. "Who wrote this
+    // byte" is the first question when silicon and emulator disagree.
+    let watch = flag_val(args, "--watch").map(parse_range).transpose()?;
+    if let Some((lo, hi)) = watch {
+        let mut jag = Jaguar::new();
+        jag.load(&data).map_err(|e| e.to_string())?;
+        attach_sd(&mut jag);
+        let fid = fidelity_arg(args)?;
+        jag.gpu.fidelity = fid;
+        jag.dsp.fidelity = fid;
+        jag.bus.add_watch(lo, hi);
+        if btn != 0 && after < frames {
+            jag.run_frames(after);
+            jag.set_pad(0, btn);
+            jag.run_frames(frames - after);
+        } else {
+            jag.run_frames(frames);
+        }
+        eprintln!(
+            "jagemu: watch 0x{lo:06X}..0x{hi:06X}: {} write(s), first {} logged",
+            jag.bus.watch_total,
+            jag.bus.watch_log.len()
+        );
+        println!(
+            "{{\"ok\":true,\"path\":{},\"frames\":{},\"watch\":{},\"state\":{}}}",
+            jstr(&path),
+            frames,
+            watch_json(&jag, lo, hi),
             state_json(&jag)
         );
         return Ok(());
@@ -1210,6 +1283,11 @@ fn cmd_serve(args: &[String]) -> Result<(), String> {
     let mut jag = Jaguar::new();
     let cart = jag.load(&data).map_err(|e| e.to_string())?;
     attach_sd(&mut jag);
+    // serve honors --fidelity like every one-shot command (it was silently
+    // functional-only — COBWEB_REQ_rectshade_and_calibration §2).
+    let fid = fidelity_arg(args)?;
+    jag.gpu.fidelity = fid;
+    jag.dsp.fidelity = fid;
     let entry = cart.entry;
 
     println!(
@@ -1380,6 +1458,36 @@ fn daemon_dispatch(jag: &mut Jaguar, entry: u32, args: &[String]) -> String {
         "release" => {
             jag.set_pad(0, 0);
             Ok("{\"ok\":true,\"pad\":0}".to_string())
+        }
+        // watch 0xLO..0xHI  (or: watch 0xLO 0xHI / watch 0xADDR)
+        "watch" => {
+            let (lo, hi) = match (nth_pos(args, 1), nth_pos(args, 2)) {
+                (Some(a), Some(b)) => (parse_u32(a)?, parse_u32(b)?),
+                (Some(a), None) => parse_range(a)?,
+                _ => return Err("watch needs <addr> or <lo>..<hi>".into()),
+            };
+            jag.bus.add_watch(lo, hi);
+            Ok(format!("{{\"ok\":true,\"watch\":\"0x{lo:06X}..0x{hi:06X}\"}}"))
+        }
+        "unwatch" => {
+            jag.bus.clear_watches();
+            Ok("{\"ok\":true,\"watches\":0}".to_string())
+        }
+        // watchlog [--keep]: report hits; clears the log (not the watches)
+        // unless --keep, so successive runs read cleanly.
+        "watchlog" => {
+            let (lo, hi) = jag
+                .bus
+                .watches
+                .first()
+                .copied()
+                .unwrap_or((0, 0));
+            let out = watch_json(jag, lo, hi);
+            if !args.iter().any(|a| a == "--keep") {
+                jag.bus.watch_log.clear();
+                jag.bus.watch_total = 0;
+            }
+            Ok(out)
         }
         "break" => {
             let at = parse_u32(nth_pos(args, 1).ok_or("break needs <addr>")?)?;

@@ -212,6 +212,68 @@ pub struct Bus {
     pub audio_capture: bool,
     /// Sample rate of the captured audio (Hz), for the WAV header.
     pub audio_rate: u32,
+    /// Write-watchpoint ranges `[lo, hi]` (inclusive). When non-empty, every
+    /// write from ANY master — 68k, GPU, DSP, or the Blitter — that lands in
+    /// a range is logged with who wrote it and from where. "Who wrote this
+    /// byte" is the first question whenever silicon and emulator disagree
+    /// (COBWEB_REQ_rectshade_and_calibration §5.1).
+    pub watches: Vec<(u32, u32)>,
+    /// First [`WATCH_LOG_CAP`] hits (the total keeps counting past the cap).
+    pub watch_log: Vec<WatchHit>,
+    /// Total watched writes seen (including beyond the log cap).
+    pub watch_total: u64,
+    /// Which master is currently driving bus writes (engines set this).
+    pub cur_master: Master,
+    /// The driving master's PC at the current write (best-effort; engines
+    /// refresh it per instruction while watches are armed).
+    pub cur_master_pc: u32,
+    /// Nonzero while inside a composed write (write32→write16→write8), so a
+    /// single logical store logs once, at its true width.
+    watch_suppress: u8,
+    /// Scheduler-maintained frame counter mirror (for watch-hit context).
+    pub frame_mirror: u64,
+}
+
+/// Cap on retained watch hits — enough to see the pattern, bounded so a
+/// watched framebuffer clear can't eat memory.
+pub const WATCH_LOG_CAP: usize = 256;
+
+/// A bus master, for watchpoint attribution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Master {
+    Cpu,
+    Gpu,
+    Dsp,
+    Blitter,
+    /// Host-side pokes (ROM load, debugger) — not machine activity.
+    Host,
+}
+
+impl Master {
+    pub fn name(self) -> &'static str {
+        match self {
+            Master::Cpu => "68k",
+            Master::Gpu => "gpu",
+            Master::Dsp => "dsp",
+            Master::Blitter => "blitter",
+            Master::Host => "host",
+        }
+    }
+}
+
+/// One logged watched write.
+#[derive(Debug, Clone, Copy)]
+pub struct WatchHit {
+    pub addr: u32,
+    pub value: u32,
+    /// Access width in bits (8/16/32).
+    pub size: u8,
+    pub master: Master,
+    /// PC of the writing master (0 for the Blitter — it has no PC; the log
+    /// entry's master tells you to look at the launching B_CMD instead).
+    pub pc: u32,
+    /// Frame counter mirror at the time of the write (scheduler-maintained).
+    pub frame: u64,
 }
 
 impl Default for Bus {
@@ -235,6 +297,48 @@ impl Bus {
             audio: Vec::new(),
             audio_capture: false,
             audio_rate: 44_100,
+            watches: Vec::new(),
+            watch_log: Vec::new(),
+            watch_total: 0,
+            cur_master: Master::Host,
+            cur_master_pc: 0,
+            watch_suppress: 0,
+            frame_mirror: 0,
+        }
+    }
+
+    /// Arm a write-watch on the inclusive range `[lo, hi]`.
+    pub fn add_watch(&mut self, lo: u32, hi: u32) {
+        self.watches.push((lo.min(hi), lo.max(hi)));
+    }
+
+    /// Disarm all watches and clear the log.
+    pub fn clear_watches(&mut self) {
+        self.watches.clear();
+        self.watch_log.clear();
+        self.watch_total = 0;
+    }
+
+    /// Log `addr` if it falls in a watched range (called by every write path;
+    /// the empty-vec check keeps the unwatched hot path to one branch).
+    #[inline]
+    fn watch_note(&mut self, addr: u32, size: u8, value: u32) {
+        if self.watches.is_empty() || self.watch_suppress > 0 {
+            return;
+        }
+        let hi_byte = addr + (size as u32 / 8) - 1;
+        if self.watches.iter().any(|&(lo, hi)| hi_byte >= lo && addr <= hi) {
+            self.watch_total += 1;
+            if self.watch_log.len() < WATCH_LOG_CAP {
+                self.watch_log.push(WatchHit {
+                    addr,
+                    value,
+                    size,
+                    master: self.cur_master,
+                    pc: self.cur_master_pc,
+                    frame: self.frame_mirror,
+                });
+            }
         }
     }
 
@@ -273,6 +377,7 @@ impl Bus {
         self.m68k_bus_cycles += 1;
         self.access_count += 1;
         let a = addr & ADDR_MASK;
+        self.watch_note(a, 8, v as u32);
         if mem::is_dram(a) {
             self.dram[a as usize] = v;
         } else if mem::is_tom(a) {
@@ -312,6 +417,7 @@ impl Bus {
     #[inline]
     pub fn write16(&mut self, addr: u32, v: u16) {
         let a = addr & ADDR_MASK;
+        self.watch_note(a, 16, v as u32);
         if mem::is_dram(a) && a + 1 < mem::DRAM_END {
             self.m68k_bus_cycles += 1;
             let i = a as usize;
@@ -322,8 +428,10 @@ impl Bus {
             self.m68k_bus_cycles += 1;
             self.tom_write16(a, v);
         } else {
+            self.watch_suppress += 1;
             self.write8(a, (v >> 8) as u8);
             self.write8(a.wrapping_add(1), v as u8);
+            self.watch_suppress -= 1;
             self.m68k_bus_cycles -= 1; // one bus cycle per word, as in read16
         }
     }
@@ -379,6 +487,7 @@ impl Bus {
     #[inline]
     pub fn write32(&mut self, addr: u32, v: u32) {
         let a = addr & ADDR_MASK;
+        self.watch_note(a, 32, v);
         if mem::is_dram(a) && a + 3 < mem::DRAM_END {
             self.m68k_bus_cycles += 2;
             let i = a as usize;
@@ -388,8 +497,10 @@ impl Bus {
             self.m68k_bus_cycles += 2;
             self.tom_write32(a, v);
         } else {
+            self.watch_suppress += 1;
             self.write16(a, (v >> 16) as u16);
             self.write16(a.wrapping_add(2), v as u16);
+            self.watch_suppress -= 1;
         }
     }
 
@@ -409,7 +520,16 @@ impl Bus {
     fn tom_write32(&mut self, a: u32, v: u32) {
         self.tom.win.w32(a, v);
         if a == mem::B_CMD {
-            crate::tom::blit::run(self, v);
+            {
+                // Blitter writes are attributed to the Blitter, not to the
+                // master that stored B_CMD (watch hits say who really wrote).
+                let (m, pc) = (self.cur_master, self.cur_master_pc);
+                self.cur_master = Master::Blitter;
+                self.cur_master_pc = 0;
+                crate::tom::blit::run(self, v);
+                self.cur_master = m;
+                self.cur_master_pc = pc;
+            }
         }
     }
 

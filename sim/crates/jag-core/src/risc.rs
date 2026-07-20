@@ -395,11 +395,19 @@ impl Risc {
         // this, expensive instructions (DIV, external fetch) run faster than
         // wall clock and timing measurements skew with slice granularity.
         self.granted += budget as u64;
+        // watchpoint attribution: this core drives the bus for the slice
+        bus.cur_master = match self.kind {
+            RiscKind::Gpu => crate::bus::Master::Gpu,
+            RiscKind::Dsp => crate::bus::Master::Dsp,
+        };
         let mut spent: u32 = self.budget_debt.min(budget);
         self.budget_debt -= spent;
         while spent < budget {
             if !self.running {
                 break;
+            }
+            if !bus.watches.is_empty() {
+                bus.cur_master_pc = self.pc;
             }
             // Service a pending interrupt between instructions (never in a
             // jump's delay slot, which must run before the transfer). Done before

@@ -442,7 +442,17 @@ pub fn run(bus: &mut Bus, cmd: u32) {
     let per_line = |g: &AddrGen| -> u64 { (inner as u64).div_ceil(ppp(g)) };
     let dst_phrases = outer as u64 * per_line(&gens[dst]);
     let src_phrases = if srcen { outer as u64 * per_line(&gens[src]) } else { 0 };
-    let ticks = BLIT_LAUNCH_TICKS + (dst_phrases + src_phrases) * BLIT_ACCESS_TICKS_X10 / 10;
+    // DSTEN is a read-modify-write: every dest phrase is READ before the
+    // logic op and the write-back, so it pays twice. This was uncharged —
+    // invisible in the Caves/NOFILL anchors (no DSTEN in those paths) but a
+    // systematic under-charge on OpenLara's shade pass, whose per-span
+    // DSTEN|LFU(S|D) blits DOUBLE the launch count
+    // (COBWEB_REQ_rectshade_and_calibration §2: jsim +30% optimistic on the
+    // SHADED build only). Physics, not tuning: the constant is unchanged,
+    // the access count now includes the reads the hardware performs.
+    let dst_reads = if dsten { dst_phrases } else { 0 };
+    let ticks =
+        BLIT_LAUNCH_TICKS + (dst_phrases + dst_reads + src_phrases) * BLIT_ACCESS_TICKS_X10 / 10;
     bus.tom.last_blit_ticks = ticks;
     bus.tom.blit_busy += ticks; // asynchronous: drains as wall time passes
 }
@@ -509,6 +519,34 @@ mod tests {
         }
         // Pixel just before the span is untouched.
         assert_eq!(bus.read16(fb + (2 * 320 + 4) * 2), 0x0000);
+    }
+
+    #[test]
+    fn watchpoint_attributes_blitter_writes() {
+        // Write-watch on the fill target: hits must be attributed to the
+        // BLITTER, not to the master that stored B_CMD ("who wrote this
+        // byte" — COBWEB_REQ_rectshade_and_calibration §5.1).
+        let mut bus = Bus::new();
+        let fb = 0x10_0000u32;
+        bus.add_watch(fb, fb + 0x1000);
+        setup_fill_regs(&mut bus, fb, 5, 2, 10, 1, 0xF800, false);
+        bus.write32(mem::B_CMD, mem::LFU_REPLACE);
+        assert!(bus.watch_total >= 10, "fill writes logged: {}", bus.watch_total);
+        assert!(
+            bus.watch_log.iter().all(|h| h.master == crate::bus::Master::Blitter),
+            "all hits blitter-attributed: {:?}",
+            bus.watch_log.first()
+        );
+        // ...and a direct CPU-side store attributes to the current master.
+        bus.cur_master = crate::bus::Master::Cpu;
+        bus.cur_master_pc = 0x4242;
+        let before = bus.watch_total;
+        bus.write16(fb + 0x800, 0xBEEF);
+        assert_eq!(bus.watch_total, before + 1);
+        let last = *bus.watch_log.last().unwrap();
+        assert_eq!(last.master, crate::bus::Master::Cpu);
+        assert_eq!(last.pc, 0x4242);
+        assert_eq!(last.size, 16);
     }
 
     #[test]

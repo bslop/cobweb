@@ -10,6 +10,39 @@ Headline: the simulator now renders OpenLara's textured 3D room, the optimizer
 proves its wins against real rendered output, and a one-character assembler bug
 that had been silently dropping conditional blocks is fixed.
 
+### 2026-07-20 — the rect-shade report: watchpoints, framecheck, and a DSTEN charge
+
+Same-day response to `COBWEB_REQ_rectshade_and_calibration.md`:
+
+- **Write-watchpoints** — `jagemu run --watch 0xLO..0xHI` + serve/ctl
+  `watch`/`unwatch`/`watchlog`. Every write from ANY master logs
+  `{addr, value, size, master: 68k|gpu|dsp|blitter, pc, frame}`;
+  Blitter writes attribute to the Blitter, not to whoever stored B_CMD
+  (unit-tested). "Who wrote this byte" is now one run.
+- **Blit cost: DSTEN dest-reads were uncharged** — a DSTEN blit is a
+  read-modify-write; every dest phrase pays twice on silicon. Charged as
+  access counting (constants untouched): OpenLara's SHADED build gains
+  19.2% Blitter busy time in jsim (the +30%-optimism outlier's first
+  mechanistic piece), while the calib bench table and the Caves/NOFILL
+  anchors are byte-identical (no DSTEN in those paths). Measured on
+  their probe: ~3,700 launches/game-frame; the residual gap has two
+  named suspects (free fire-into-busy B_CMD stores, launch-density bus
+  interference) gated on the density-sweep probes.
+- **`sim/tools/framecheck.py`** — scored emulator-vs-hardware frame diff
+  (auto-crop/rescale/luma-normalize; pct_bad + streak_score tuned to the
+  reported vertical-streak signature; exit code for gating). Self-tested
+  both directions.
+- **jas lint**: GPU code/data claiming $F03FF8-$F03FFF (top phrase of
+  GPU SRAM, unproven on silicon) warns until the sentinel probe passes.
+- **`calib/p_topphrase_upda.s`** — one rig probe, two verdicts: the
+  top-phrase sentinel and the DSTA2/UPDA outer-step question. Dogfooded
+  in jsim (jsim binds UPDA1→A1 set, UPDA2→A2 set, independent of the
+  role swap; writing the probe caught the A2_MASK layout trap).
+- `jagemu serve` honors `--fidelity` (was silently functional-only).
+- Live-rig evidence for their quarantined fault: the capture tap holds a
+  clean 11:50 frame and a streaked 15:23 frame of the SAME session —
+  consistent with in-place console degradation, not any flashed build.
+
 ### 2026-07-20 — audio gets its instruments
 
 - **`jagemu audiocheck <wav|rom> [--against <wav|rom>]`** — the audio

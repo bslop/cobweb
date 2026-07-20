@@ -115,6 +115,7 @@ impl Scheduler {
                 // calibration bench measured max VC = 523, modulus 524).
                 self.half_line = 0;
                 self.frame += 1;
+                bus.frame_mirror = self.frame;
                 self.vi_fired_this_frame = false;
                 // The field just completed: snapshot the fully composited canvas
                 // as the presented frame BEFORE the next field clears `fb`. This

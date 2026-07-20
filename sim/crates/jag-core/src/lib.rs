@@ -96,6 +96,8 @@ impl Jaguar {
     /// alongside it). Returns the 68k cycles consumed.
     #[inline]
     pub fn step_instruction(&mut self) -> u32 {
+        self.bus.cur_master = bus::Master::Cpu;
+        self.bus.cur_master_pc = self.cpu.pc;
         let cycles = self.cpu.step(&mut self.bus, &mut self.dbg);
         self.sched.advance(cycles, &mut self.cpu, &mut self.gpu, &mut self.dsp, &mut self.bus);
         cycles
