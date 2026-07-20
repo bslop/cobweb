@@ -27,10 +27,16 @@
 //! preconditions that are *sound* (never permit an unsafe move) even if
 //! conservative:
 //!
-//!   * **Dominance** — a donor may sink into J's slot only if every path that
-//!     reaches J executed the donor first: J is not a branch target, and no
-//!     label sits between the donor and J. (A label there is an entry that
-//!     reaches J — and now its slot — without running the donor.)
+//!   * **Equal execution frequency** — a donor may sink into J's slot only if it
+//!     runs the same number of times in both positions: J is not a branch
+//!     target, and NO LABEL of any kind sits between the donor and J. Dominance
+//!     alone is not enough and is the trap: a loop's initialiser sitting just
+//!     above the loop-entry label *does* dominate the back-edge jump, yet
+//!     sinking it past that label re-runs it every iteration. The scan is over
+//!     source LINES, because a label on its own line emits no instruction and is
+//!     invisible to a walk over the instruction stream — the hole that shipped
+//!     56 semantics-breaking transforms
+//!     (COBWEB_BUG_jopt_sinks_donor_across_branch_target).
 //!   * **Data independence** — the donor is reordered past every instruction
 //!     between it and J, so none of them may read what it writes, write what it
 //!     reads, or write what it writes; and J itself must not read what it writes.
@@ -39,7 +45,9 @@
 //!     the jump/target observe are unchanged.
 //!
 //! Only a donor that clears all three is handed to the jsim equivalence
-//! certificate as the second line of defence. Treat `accepted` as "passed both
+//! certificate as the second line of defence — and that certificate is refused
+//! outright when the fixture's capture region is never written, since then every
+//! candidate compares equal for the wrong reason. Treat `accepted` as "passed both
 //! guards", and re-gate real output with a render/shadow diff.
 //!
 //! jopt reasons over the *assembled* instruction stream (`jas::Assembled`), not
@@ -459,6 +467,31 @@ pub fn optimize_fixture(
     let mut lines: Vec<String> = src.lines().map(|s| s.to_string()).collect();
     let mut transforms = Vec::new();
 
+    // A capture the run never touches certifies NOTHING: every candidate
+    // compares equal because both wrote nothing, so jopt would report full
+    // confidence on transforms it never actually exercised. Fail closed — this
+    // silently passed 56 semantics-breaking transforms once
+    // (COBWEB_BUG_jopt_sinks_donor_across_branch_target).
+    if let (Some(init), Some(fp)) = (capture_initial(fixture), base_fp.as_ref()) {
+        if fp.captured == init {
+            return OptResult {
+                source: src.to_string(),
+                bytes_before,
+                bytes_after: bytes_before,
+                transforms: vec![Transform {
+                    kind: "precheck".into(),
+                    at_line: 0,
+                    accepted: false,
+                    reason: "fixture never wrote the capture region — the certificate \
+                             would be vacuous (every candidate trivially 'equal'). Point \
+                             `capture` at output the kernel actually produces, or widen \
+                             the budget so it reaches the render."
+                        .into(),
+                }],
+            };
+        }
+    }
+
     // Report (once) any wasted slot that lives in an inactive `.if` block: it is
     // never assembled, so filling it would be a phantom "win". This is the fix
     // for the confusing "accepted / 0 saved" on gpu_geotex's profiling code.
@@ -492,13 +525,30 @@ pub fn optimize_fixture(
                 continue;
             }
 
+            // How far back the block extends. A donor must not cross ANY label
+            // at or before the jump: a label is a branch target, so a donor
+            // above it executes a different number of times than the slot below
+            // it. Scanning source LINES (not just instruction lines) is
+            // load-bearing — a label on its own line emits no instruction, so it
+            // is absent from `model` and a walk over instructions alone sails
+            // straight past it. That hole sank a loop's `e = 0` initialiser into
+            // the loop body, re-running it every iteration and destroying
+            // `floor(log2 w)` (COBWEB_BUG_jopt_sinks_donor_across_branch_target).
+            //
+            // Note dominance is NOT the right test and was satisfied there: the
+            // requirement is equal execution *frequency*, i.e. same loop nest.
+            let block_start = (1..=j.src_line)
+                .rev()
+                .find(|&l| classify_has_label(&lines, l))
+                .map(|l| l + 1) // donors must sit strictly below the label
+                .unwrap_or(1);
+
             // Walk the straight-line block backwards for the nearest legal donor.
             let mut betweens: Vec<&Insn> = Vec::new();
             for dp in (0..jp).rev() {
                 let d = &model[dp];
-                // A label or another jump ends the block: donors at or before it
-                // are not guaranteed to run before J.
-                if classify_has_label(&lines, d.src_line) || d.is_jump {
+                // Another jump also ends the block.
+                if d.src_line < block_start || d.is_jump {
                     break;
                 }
                 if editable(&lines, &counts, d.src_line)
@@ -554,6 +604,24 @@ pub fn optimize_fixture(
         .map(|(b, _)| b.len())
         .unwrap_or(bytes_before);
     OptResult { source: new_src, bytes_before, bytes_after, transforms }
+}
+
+
+/// What the capture region holds *before* the run: zeros, overwritten by any
+/// fixture preset that overlaps it.
+fn capture_initial(fx: Option<&Fixture>) -> Option<Vec<u8>> {
+    let f = fx?;
+    let (addr, len) = f.capture;
+    let mut init = vec![0u8; len as usize];
+    for (a, blob) in &f.pre {
+        for (i, b) in blob.iter().enumerate() {
+            let at = a.wrapping_add(i as u32);
+            if at >= addr && at < addr.wrapping_add(len) {
+                init[(at - addr) as usize] = *b;
+            }
+        }
+    }
+    Some(init)
 }
 
 /// Note wasted slots (`jump`/`jr` then `nop`) that fall in inactive `.if`
@@ -803,6 +871,76 @@ mod tests {
         let (bytes, org) = assemble(&res.source, RiscKind::Gpu, false).unwrap();
         let r = run(&Spec { bytes, target: RiscKind::Gpu, org, budget: 50_000, capture: (0x0010_0000, 4), fidelity: Fidelity::Silicon });
         assert_eq!(word_at(&r.captured, 0), 12);
+    }
+
+    #[test]
+    fn refuses_to_sink_a_donor_across_a_branch_target_label() {
+        // COBWEB_BUG_jopt_sinks_donor_across_branch_target: a loop's `e = 0`
+        // initialiser sat directly above the loop-entry label. Sinking it into a
+        // delay slot BELOW that label re-ran it every iteration and destroyed
+        // floor(log2 w). The donor dominates the jump, is data-independent and
+        // flag-neutral — all three old guards pass — so only an execution-count
+        // (same-loop-nest) check catches it.
+        //
+        // The label is on its OWN line, which is the crux: it emits no
+        // instruction, so a backward walk over instructions alone never sees it.
+        let src = "        .gpu\n\
+             \x20       movei #$00000010,r0\n\
+             \x20       moveq #1,r3\n\
+             \x20       move r0,r1\n\
+             \x20       moveq #0,r2\n\
+             wid_e:\n\
+             \x20       cmp r3,r1\n\
+             \x20       movei #wid_done,r22\n\
+             \x20       jump EQ,(r22)\n\
+             \x20       nop\n\
+             \x20       shrq #1,r1\n\
+             \x20       addq #1,r2\n\
+             \x20       movei #wid_e,r23\n\
+             \x20       jump T,(r23)\n\
+             \x20       nop\n\
+             wid_done: movei #$00100000,r4\n\
+             \x20       store r2,(r4)\n"
+            .to_string()
+            + STOP;
+
+        let res = optimize(&src, RiscKind::Gpu);
+        // The initialiser must still precede the loop label.
+        let out = &res.source;
+        let init = out.find("moveq #0,r2").expect("initialiser vanished");
+        let label = out.find("wid_e:").expect("loop label vanished");
+        assert!(init < label, "jopt sank a loop initialiser across its branch-target label");
+
+        // And the kernel still computes floor(log2 16) = 4.
+        let (bytes, org) = assemble(out, RiscKind::Gpu, false).unwrap();
+        let r = run(&Spec { bytes, target: RiscKind::Gpu, org, budget: 100_000, capture: (0x0010_0000, 4), fidelity: Fidelity::Silicon });
+        assert_eq!(word_at(&r.captured, 0), 4, "floor(log2 16) destroyed");
+    }
+
+    #[test]
+    fn refuses_a_fixture_whose_capture_is_never_written() {
+        // A capture the run never touches certifies nothing: both variants
+        // "match" because neither wrote anything. jopt must fail closed rather
+        // than report confidence it does not have.
+        let src = format!(
+            "        .gpu\n\
+             \x20       moveq #5,r1\n\
+             \x20       moveq #7,r2\n\
+             \x20       movei #tgt,r22\n\
+             \x20       add r1,r2\n\
+             \x20       jump T,(r22)\n\
+             \x20       nop\n\
+             tgt:    nop\n{STOP}"
+        );
+        // Capture a region the kernel never writes.
+        let fx = Fixture { pre: vec![], budget: 50_000, capture: (0x0018_0000, 64) };
+        let res = optimize_fixture(&src, RiscKind::Gpu, false, Some(&fx));
+        assert_eq!(res.accepted(), 0, "accepted a transform against a vacuous capture");
+        assert!(
+            res.transforms.iter().any(|t| t.reason.contains("never wrote the capture region")),
+            "expected a loud vacuous-fixture diagnostic, got {:?}",
+            res.transforms
+        );
     }
 
     #[test]
