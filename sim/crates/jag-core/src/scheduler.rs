@@ -212,14 +212,17 @@ impl Scheduler {
             let pre = bus.jerry.win.r16(mem::JPIT1) as i64;
             let div = bus.jerry.win.r16(mem::JPIT2) as i64;
             if pre != 0 || div != 0 {
+                // Decrement once per TIMER PERIOD, not per prescaler tick. The
+                // pump mixes one sample per observed *change*, so the read-back
+                // must tick at the timer's output rate — 26.59MHz/((pre+1)*(div+1))
+                // = 11024 Hz for OpenLara's 3/602. Ticking it at the prescaler
+                // rate (6.65 MHz) made the pump mix ~600x too fast: audible as a
+                // loud screech, while peak/RMS still looked like plausible music.
+                let period = (pre + 1) * (div + 1);
                 self.jpit_presc += ticks;
-                let step = pre + 1;
-                while self.jpit_presc >= step {
-                    self.jpit_presc -= step;
-                    self.jpit_div -= 1;
-                    if self.jpit_div < 0 {
-                        self.jpit_div = div;
-                    }
+                while self.jpit_presc >= period {
+                    self.jpit_presc -= period;
+                    self.jpit_div = (self.jpit_div - 1) & 0xFFFF;
                 }
                 bus.jerry.win.w16(mem::JPIT_READBACK, self.jpit_div as u16);
             }
