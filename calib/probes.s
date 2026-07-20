@@ -407,6 +407,91 @@ _p_blitbg_s:
 	.data
 _p_blitbg_e:
 
+; ── p_blittex1 / p_blittexq: TEXTURED (XADDINC) span cost ───────────────────
+; The cost model was calibrated from a LINEAR XADDPIX copy (p_blitsm/p_blitbg)
+; and the per-access constant extrapolated to the textured case. OpenLara's real
+; span uses A1 in XADDINC mode — a 16.16 fractional sampler — where consecutive
+; destination pixels can land in the SAME source phrase. If hardware reuses a
+; latched phrase, the model's "one source access per pixel" over-charges, which
+; is the 2.4x fill over-charge reported against 8ca3fc0.
+;   blittex1 : du = 1.0   (a fresh texel per pixel, minimal reuse)
+;   blittexq : du = 0.25  (4 pixels per texel, heavy reuse)
+; Same 256-px span, same everything else — the delta isolates source coalescing.
+BT_A1FPIX	equ	$F02218
+BT_A1INC	equ	$F0221C
+BT_A1FINC	equ	$F02220
+BT_TEXFLAGS	equ	$00034018	; PIXEL8|XADDINC|WID256 (OpenLara A1_FIXED|WID)
+
+	.macro	BLITTEX
+	movei	#BB_A1BASE,r0
+	movei	#BLITSRC,r1
+	store	r1,(r0)
+	movei	#BB_A1FLAGS,r0
+	movei	#BT_TEXFLAGS,r1
+	store	r1,(r0)
+	movei	#BB_A1PIX,r0
+	moveq	#0,r1
+	store	r1,(r0)
+	movei	#BT_A1FPIX,r0
+	moveq	#0,r1
+	store	r1,(r0)
+	movei	#BT_A1INC,r0
+	movei	#\1,r1
+	store	r1,(r0)
+	movei	#BT_A1FINC,r0
+	movei	#\2,r1
+	store	r1,(r0)
+	movei	#BB_A2BASE,r0
+	movei	#BLITDST,r1
+	store	r1,(r0)
+	movei	#BB_A2FLAGS,r0
+	movei	#BB_FLAGS8,r1
+	store	r1,(r0)
+	movei	#BB_A2PIX,r0
+	moveq	#0,r1
+	store	r1,(r0)
+	movei	#BB_BCOUNT,r0
+	movei	#$00010100,r1		; 1 row x 256 px
+	store	r1,(r0)
+	movei	#BB_BCMD,r2
+	movei	#BB_CMDTEX,r1
+	store	r1,(r2)			; launch
+	.endm
+
+	.even
+	.globl	_p_blittex1_s
+	.globl	_p_blittex1_e
+_p_blittex1_s:
+	.gpu
+	PROBE_PRO
+	BLITTEX	1, 0			; du = 1.0
+.bwt1:
+	load	(r2),r1
+	btst	#0,r1
+	jr	eq,.bwt1
+	nop
+	PROBE_EPI
+	.68000
+	.data
+_p_blittex1_e:
+
+	.even
+	.globl	_p_blittexq_s
+	.globl	_p_blittexq_e
+_p_blittexq_s:
+	.gpu
+	PROBE_PRO
+	BLITTEX	0, $4000		; du = 0.25 -> 4 px per source texel
+.bwtq:
+	load	(r2),r1
+	btst	#0,r1
+	jr	eq,.bwtq
+	nop
+	PROBE_EPI
+	.68000
+	.data
+_p_blittexq_e:
+
 ; ── p_dsphammer: resident DSP DRAM read-hammer (concurrent bus-noise source) ─
 ; main.c starts this on Jerry (DSP) before a Tom probe and stops it after, so
 ; the timed Tom stream runs against real Jerry↔Tom DRAM contention on the one
