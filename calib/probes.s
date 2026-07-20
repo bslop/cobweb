@@ -407,6 +407,76 @@ _p_blitbg_s:
 	.data
 _p_blitbg_e:
 
+; ── p_blit1 / p_blit2 / p_blit4: SHORT spans — the launch-overhead region ───
+; The cost model was calibrated at 8 and 256 px and matches silicon within 1%
+; there (blitbg exact, blitsm +7%) — but real geometry spends most of its spans
+; far below 8 px, where the fixed launch cost dominates, and the whole-frame
+; fill charge disagrees with hardware's NOFILL delta (jsim 24% vs hw ~10% of
+; frame) while the per-blit probes agree. If that discrepancy is real per-blit
+; cost, it must live here, in the region the calibration extrapolated through.
+; Same config as blitsm (SRCEN|LFU_REPLACE|DSTA2, 8bpp, XADDPIX), only npix
+; varies: 1/2/4 px complete the 1-2-4-8-256 curve.
+	.macro	BLITN
+	BLITSETUP
+	movei	#BB_BCOUNT,r0
+	movei	#\1,r1			; 1 row x N pixels
+	store	r1,(r0)
+	movei	#BB_BCMD,r2
+	movei	#BB_CMDTEX,r1
+	store	r1,(r2)			; launch
+	.endm
+
+	.even
+	.globl	_p_blit1_s
+	.globl	_p_blit1_e
+_p_blit1_s:
+	.gpu
+	PROBE_PRO
+	BLITN	$00010001
+.bw1:
+	load	(r2),r1
+	btst	#0,r1
+	jr	eq,.bw1
+	nop
+	PROBE_EPI
+	.68000
+	.data
+_p_blit1_e:
+
+	.even
+	.globl	_p_blit2_s
+	.globl	_p_blit2_e
+_p_blit2_s:
+	.gpu
+	PROBE_PRO
+	BLITN	$00010002
+.bw2:
+	load	(r2),r1
+	btst	#0,r1
+	jr	eq,.bw2
+	nop
+	PROBE_EPI
+	.68000
+	.data
+_p_blit2_e:
+
+	.even
+	.globl	_p_blit4_s
+	.globl	_p_blit4_e
+_p_blit4_s:
+	.gpu
+	PROBE_PRO
+	BLITN	$00010004
+.bw4:
+	load	(r2),r1
+	btst	#0,r1
+	jr	eq,.bw4
+	nop
+	PROBE_EPI
+	.68000
+	.data
+_p_blit4_e:
+
 ; ── p_blittex1 / p_blittexq: TEXTURED (XADDINC) span cost ───────────────────
 ; The cost model was calibrated from a LINEAR XADDPIX copy (p_blitsm/p_blitbg)
 ; and the per-access constant extrapolated to the textured case. OpenLara's real

@@ -65,6 +65,9 @@ extern char p_ldstride_s[], p_ldstride_e[];
 extern char p_stdram_s[], p_stdram_e[];
 extern char p_blitsm_s[], p_blitsm_e[];
 extern char p_blitbg_s[], p_blitbg_e[];
+extern char p_blit1_s[], p_blit1_e[];
+extern char p_blit2_s[], p_blit2_e[];
+extern char p_blit4_s[], p_blit4_e[];
 extern char p_blittex1_s[], p_blittex1_e[];
 extern char p_blittexq_s[], p_blittexq_e[];
 extern char p_dsphammer_s[], p_dsphammer_e[];
@@ -153,6 +156,9 @@ static const struct probe probes[] = {
     /* mode B ONLY: a saturating OP starves the 68k's mode-A DRAM busy-poll
      * and the suite hangs (observed on hardware). Mode B sleeps on the VI, so
      * it cannot be starved — and it is the cleaner measurement regardless. */
+    { "blit1   ", p_blit1_s, p_blit1_e, 0, 0, 128, DRAM_BUF },
+    { "blit2   ", p_blit2_s, p_blit2_e, 0, 0, 128, DRAM_BUF },
+    { "blit4   ", p_blit4_s, p_blit4_e, 0, 0, 128, DRAM_BUF },
     { "blittex1", p_blittex1_s, p_blittex1_e, 0, 0, 128, DRAM_BUF },
     { "blittexq", p_blittexq_s, p_blittexq_e, 0, 0, 128, DRAM_BUF },
     { "lddramop", p_lddram_s, p_lddram_e, 0, 0, 512, DRAM_BUF, 0, 0, 1, 1 },
