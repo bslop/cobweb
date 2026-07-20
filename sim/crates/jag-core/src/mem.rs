@@ -239,6 +239,12 @@ pub const JPIT2: u32 = TOM_BASE + 0x10002; // Timer 1 divider
 pub const JPIT3: u32 = TOM_BASE + 0x10004; // Timer 2 prescaler
 pub const JPIT4: u32 = TOM_BASE + 0x10006; // Timer 2 divider
 pub const J_INT: u32 = TOM_BASE + 0x10020; // Jerry interrupt control (16-bit)
+/// Jerry PIT divider **read-back**: the live down-counter, at a different
+/// address from the write side (like SSTAT/SCLK). Software uses it as a polled
+/// timebase — OpenLara's DSP AUDIO_PUMP samples it and mixes on each change,
+/// with interrupts deliberately masked ("POLLED AUDIO v2"), so a frozen
+/// read-back means the mixer never runs and the DAC stays silent.
+pub const JPIT_READBACK: u32 = TOM_BASE + 0x1003C;
 
 pub const JOYSTICK: u32 = TOM_BASE + 0x14000; // joypad rows + mute (16-bit)
 pub const JOYBUTS: u32 = TOM_BASE + 0x14002; // joypad buttons / CONFIG (16-bit)

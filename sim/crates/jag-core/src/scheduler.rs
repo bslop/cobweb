@@ -33,6 +33,10 @@ pub struct Scheduler {
     jtimer2_counter: i64,
     /// Audio sample down-counter (RISC-clock ticks until the next sample).
     audio_counter: i64,
+    /// Jerry PIT prescaler accumulator and live divider count (read-back at
+    /// `JPIT_READBACK`), so a polled timebase actually advances.
+    jpit_presc: i64,
+    jpit_div: i64,
 }
 
 impl Scheduler {
@@ -50,6 +54,8 @@ impl Scheduler {
             jtimer1_counter: 0,
             jtimer2_counter: 0,
             audio_counter: 0,
+            jpit_presc: 0,
+            jpit_div: 0,
         }
     }
 
@@ -63,6 +69,8 @@ impl Scheduler {
             cpu_cycles_per_half_line: 426,
             half_lines_per_frame: 624,
             vi_fired_this_frame: false,
+            jpit_presc: 0,
+            jpit_div: 0,
             pit_counter: 0,
             jtimer1_counter: 0,
             jtimer2_counter: 0,
@@ -79,6 +87,8 @@ impl Scheduler {
         self.jtimer1_counter = 0;
         self.jtimer2_counter = 0;
         self.audio_counter = 0;
+        self.jpit_presc = 0;
+        self.jpit_div = 0;
     }
 
     /// Approximate scanline the OP/display would currently be on.
@@ -197,6 +207,23 @@ impl Scheduler {
             }
         }
 
+        // Publish the PIT divider read-back so a POLLED timebase advances.
+        {
+            let pre = bus.jerry.win.r16(mem::JPIT1) as i64;
+            let div = bus.jerry.win.r16(mem::JPIT2) as i64;
+            if pre != 0 || div != 0 {
+                self.jpit_presc += ticks;
+                let step = pre + 1;
+                while self.jpit_presc >= step {
+                    self.jpit_presc -= step;
+                    self.jpit_div -= 1;
+                    if self.jpit_div < 0 {
+                        self.jpit_div = div;
+                    }
+                }
+                bus.jerry.win.w16(mem::JPIT_READBACK, self.jpit_div as u16);
+            }
+        }
         // Jerry timers 1 (JPIT1/JPIT2) and 2 (JPIT3/JPIT4) → INT1 bit 4 (Jerry).
         Self::tick_jerry(
             &mut self.jtimer1_counter,
@@ -234,8 +261,18 @@ impl Scheduler {
             // Tick the DSP's per-sample I2S interrupt.
             dsp.raise_int(mem::DSP_INT_I2S);
             // Capture the current stereo sample.
-            let mut l = bus.jerry.win.r16(mem::L_I2S) as i16;
-            let mut r = bus.jerry.win.r16(mem::R_I2S) as i16;
+            // The DSP writes the DACs with a 32-bit JRISC `store`, and the
+            // sample lands in the LOW half; reading the register as 16 bits
+            // picked up the high half (~0) and made real music look like a
+            // 1-LSB toggle. Prefer the low half, falling back to the high one
+            // for a 16-bit writer.
+            let lw = bus.jerry.win.r32(mem::L_I2S);
+            let rw = bus.jerry.win.r32(mem::R_I2S);
+            let pick = |w: u32| -> i16 {
+                let lo = (w & 0xFFFF) as i16;
+                if lo != 0 { lo } else { (w >> 16) as i16 }
+            };
+            let (mut l, mut r) = (pick(lw), pick(rw));
             if l == 0 && r == 0 {
                 l = bus.jerry.win.r16(mem::DAC1) as i16;
                 r = bus.jerry.win.r16(mem::DAC2) as i16;

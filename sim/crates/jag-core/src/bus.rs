@@ -376,6 +376,10 @@ impl Bus {
     }
 
     fn jerry_write8(&mut self, a: u32, v: u8) {
+        if std::env::var_os("JAGEMU_AUDIO_DEBUG").is_some()
+            && (mem::L_I2S..mem::L_I2S + 8).contains(&a) && v != 0 {
+            eprintln!("I2SW {a:#08X} <- {v:#04X}");
+        }
         if self.gamedrive.is_some() && (crate::gamedrive::SPI_STATUS..=crate::gamedrive::SPI_DATAB).contains(&a) {
             // byte-wide access into the SPI window: compose onto the word path
             let gd = self.gamedrive.as_mut().unwrap();
