@@ -53,20 +53,24 @@ rulebook, timing facts, and their [HW]-provenance) is being vendored into
 live in `calib/` (bench logs) and `sim/crates/jag-core/src/risc/timing.rs`
 (constants with provenance comments).
 
-## Positioning
+## Which tool do you want?
 
-jsim is a **development instrument**, not a games emulator — a logic analyzer,
-not a television. If you want to *play* the Jaguar library, use
-[BigPEmu](https://www.richwhitehouse.com/jaguar/); it is the compatibility and
-playability reference, we treat it as the functional oracle (`jagemu
-oracle-diff` diffs machine state *against* it, and on functional conflicts
-BigPEmu wins), and nothing here competes with it. jsim's lane is the one
-BigPEmu was never built for: deterministic, headless, machine-readable
-measurement of *your own code* — cycle attribution, hardware-calibrated
-timing with disclosed error bars, and optimizer certificates — on the narrow
-set of paths a toolchain needs.
+If you want to **play or test Jaguar software**, you want
+[BigPEmu](https://www.richwhitehouse.com/jaguar/) — Rich Whitehouse's
+emulator runs the whole library, in real time, with excellent fidelity, and
+it has a scripting API. It is also what Cobweb itself trusts for functional
+behavior: `jagemu oracle-diff` compares machine state against BigPEmu, and
+when the two disagree on what a program *computes*, jsim treats itself as the
+one that's probably wrong.
 
-## Components
+jsim is a different kind of tool: a **measurement instrument for code you are
+writing** — deterministic, headless, machine-readable output, exact cycle
+attribution, and timing calibrated against real hardware (Skunkboard probes)
+with its error bars written down. It covers the narrow set of paths a
+toolchain needs and runs well below real time. Think logic analyzer, not
+television — most days a Jaguar developer wants both on the bench.
+
+## Components## Components
 
 | Tool | What | Status |
 |---|---|---|
