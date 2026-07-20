@@ -10,6 +10,45 @@ Headline: the simulator now renders OpenLara's textured 3D room, the optimizer
 proves its wins against real rendered output, and a one-character assembler bug
 that had been silently dropping conditional blocks is fixed.
 
+### 2026-07-20 — the jcc68k adoption report, worked through
+
+OpenLara filed `COBWEB_REQ_jcc68k_adoption.md` after switching its six
+kernels to jas: what blocked jcc68k as their code generator, most impactful
+first. All five items:
+
+- **jas `--elf-obj` (item 1, "the single unlock")** — writes an ELF32
+  big-endian m68k relocatable object GNU `ld` accepts, so a jaguar.ld
+  project migrates to jcc68k/jas one translation unit at a time. Real
+  `.text`/`.data`/`.bss` sections, RELA relocations (`R_68K_32` /
+  `R_68K_16` / `R_68K_PC16`), locals + globals + externs in the symtab.
+  Verified against `m68k-linux-gnu-ld` with a MEMORY-region script:
+  cross-object `jsr`/`lea`/`bsr.w` and `.data` symbols resolve
+  byte-exactly; OpenLara's `video.c` links and `ld -r`-merges clean.
+  Flow doc: `docs/gnu-interop.md`. Found on the way and fixed: jln
+  patched word-branch relocations with the *absolute* address instead of
+  a displacement (every cross-object 68k `bsr.w` landed in the weeds),
+  and abs.w relocations were typed as 4-byte patches in a 2-byte slot.
+- **jcc68k leaf/prologue codegen (item 2)** — `link`/`unlk` only when the
+  frame is actually used; save/restore only the callee-saved registers
+  the body names (one register → `move.l`, not `movem`). The report's
+  `blit_wait()` drops from link + 10-register movem round trip to the
+  bare 3-instruction spin + rts.
+- **runtime lib (item 3)** — already shipped as `jcc68k --runtime`; with
+  `--elf-obj` it now assembles to a `jrt68k.o` for `-nostdlib` GNU links
+  (soft mul/div/mod + the 16.16 fix helpers, libgcc not required).
+- **diagnostic line attribution (item 4)** — the preprocessor emits
+  `# N "file"` line markers and the lexer consumes them, so errors name
+  the true source file:line instead of a position in the expanded text.
+  The report's needle ("non-constant expression in initializer" at a
+  bogus line 1573) resolves instantly now — and all 8 OpenLara jaguar C
+  translation units compile clean with the MULTIROOM flag set.
+- **dialect notes (item 5)** — bare `.long` is rmac's long-align (was a
+  silent no-op that left a GPU table 2-misaligned on silicon); data
+  directives with no operands warn instead of emitting nothing;
+  `.qphrase` added; hazard fix-its now say `move rX,rX` settles the
+  scoreboard exactly like `or rX,rX` (both were already credited —
+  regression tests pin it).
+
 ### 2026-07-20 — the 68000 pays for its bus
 
 - **jsim: 68k external-bus wait charge, split fetch/data** — the cacheless
