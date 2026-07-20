@@ -12,6 +12,11 @@
 use crate::bus::Bus;
 use crate::debug::Debugger;
 
+/// Extra 68k cycles per instruction-FETCH bus cycle, tenths (calibrated).
+const M68K_FETCH_WAIT_X10: u32 = 3;
+/// Extra 68k cycles per DATA bus cycle, tenths (calibrated).
+const M68K_DATA_WAIT_X10: u32 = 5;
+
 // Condition-code register bits (in the low byte of SR).
 const FLAG_C: u16 = 1 << 0;
 const FLAG_V: u16 = 1 << 1;
@@ -80,6 +85,11 @@ pub struct M68k {
     /// `STOP` halted the CPU until an interrupt arrives.
     pub stopped: bool,
     pub cycles: u64,
+    /// Bus cycles spent on instruction FETCH by the current instruction —
+    /// subtracted from the bus's total to split fetch from data.
+    fetch_ba: u32,
+    /// Sub-cycle remainder of the external-bus wait charge (tenths).
+    bus_debt: u32,
     /// Nesting depth of interrupt handlers (for ISR-vs-main attribution).
     pub isr_depth: u32,
     pub instret: u64,
@@ -109,6 +119,8 @@ impl M68k {
             pending_level: 0,
             stopped: false,
             cycles: 0,
+            fetch_ba: 0,
+            bus_debt: 0,
             isr_depth: 0,
             instret: 0,
             last_illegal: None,
@@ -188,6 +200,7 @@ impl M68k {
     // ── instruction-stream fetch ─────────────────────────────────────────────
     #[inline]
     fn fetch16(&mut self, bus: &mut Bus) -> u16 {
+        self.fetch_ba += 1;
         let w = bus.read16(self.pc);
         self.pc = self.pc.wrapping_add(2);
         w
@@ -229,15 +242,34 @@ impl M68k {
     /// *issued* the instruction (not the PC after it), and can tell a sleeping
     /// 68000 apart from a spinning one.
     pub fn step(&mut self, bus: &mut Bus, dbg: &mut Debugger) -> u32 {
-        if dbg.prof.is_none() {
-            return self.step_inner(bus, dbg);
-        }
+        bus.m68k_bus_cycles = 0;
+        self.fetch_ba = 0;
         let pc0 = self.pc;
         let was_stopped = self.stopped;
-        let c = self.step_inner(bus, dbg);
-        let in_isr = self.isr_depth > 0;
-        if let Some(p) = dbg.prof.as_mut() {
-            p.record(pc0, c, in_isr, was_stopped);
+        let c0 = self.step_inner(bus, dbg);
+
+        // External-bus wait charge (HARDWARE-CALIBRATED, see the constants):
+        // textbook 68000 timings assume a 4-cycle bus the Jaguar does not give
+        // it — every fetch and operand goes off-chip through Tom's memory
+        // controller. Fetch and data are charged separately: three probes of
+        // different mixes (m68kreg fetch-only, m68kbus long reads, m68kcpy the
+        // byte-copy loop) pin two knobs, and the third mix validates the fit.
+        // A flat blended constant matched whichever probe calibrated it and
+        // was 45% wrong on real programs (wip/m68k-bus-wait, superseded).
+        let total = std::mem::take(&mut bus.m68k_bus_cycles);
+        let fetch = self.fetch_ba.min(total);
+        let data = total - fetch;
+        self.bus_debt += fetch * M68K_FETCH_WAIT_X10 + data * M68K_DATA_WAIT_X10;
+        let extra = self.bus_debt / 10;
+        self.bus_debt -= extra * 10;
+        self.cycles += extra as u64;
+        let c = c0 + extra;
+
+        if dbg.prof.is_some() {
+            let in_isr = self.isr_depth > 0;
+            if let Some(p) = dbg.prof.as_mut() {
+                p.record(pc0, c, in_isr, was_stopped);
+            }
         }
         c
     }
