@@ -601,6 +601,55 @@ _p_blitrmw_s:
 	.data
 _p_blitrmw_e:
 
+; ── p_bcmdidle / p_bcmdbusy: what does a bwait POLL actually cost? ──────────
+; The +30% geometry-build optimism suspect (bench 2026-07-21): a bwait spin
+; is a stream of B_CMD reads — a Tom REGISTER read from the GPU, a shape no
+; probe ever priced. Idle variant = the register-read baseline; busy variant
+; = the same polls while a 2048-px blit owns the bus. The shaded builds add
+; thousands of these spins per frame; jsim prices the shade pass ~free while
+; silicon pays 23%.
+
+	.even
+	.globl	_p_bcmdidle_s
+	.globl	_p_bcmdidle_e
+_p_bcmdidle_s:
+	.gpu
+	PROBE_PRO
+	movei	#BB_BCMD,r0
+	.rept	256
+	load	(r0),r1
+	.endr
+	PROBE_EPI
+	.68000
+	.data
+_p_bcmdidle_e:
+
+	.even
+	.globl	_p_bcmdbusy_s
+	.globl	_p_bcmdbusy_e
+_p_bcmdbusy_s:
+	.gpu
+	PROBE_PRO
+	BLITSETUP
+	movei	#BB_BCOUNT,r0
+	movei	#$00010800,r1		; 1 row x 2048 px — long bus-holder
+	store	r1,(r0)
+	movei	#BB_BCMD,r2
+	movei	#BB_CMDTEX,r1
+	store	r1,(r2)			; launch, then poll THROUGH the blit
+	.rept	256
+	load	(r2),r1
+	.endr
+.bwbc:
+	load	(r2),r1			; drain so the next rep starts clean
+	btst	#0,r1
+	jr	eq,.bwbc
+	nop
+	PROBE_EPI
+	.68000
+	.data
+_p_bcmdbusy_e:
+
 ; ── p_ldunderb: 256 DRAM loads WHILE a long blit holds the bus ───────────────
 ; The staging-under-blit contention term: jsim currently lets GPU external
 ; loads proceed as if the Blitter weren't on the DRAM bus (contention ~0.1%
