@@ -490,30 +490,6 @@ fn empty_data_directive_warns() {
 }
 
 #[test]
-fn warns_on_gpu_sram_top_phrase() {
-    // $F03FF8-$F03FFF is unproven on silicon — claiming it must warn.
-    let out = assemble(
-        "\t.gpu\n\t.org $F03FF0\n\tdc.l 1,2,3,4\n",
-        &Options::default(),
-    );
-    assert!(
-        out.diags.iter().any(|d| d.msg.contains("UNPROVEN")),
-        "expected top-phrase warning: {:#?}",
-        out.diags
-    );
-    // ...and staying below $F03FF8 must NOT warn.
-    let out = assemble(
-        "\t.gpu\n\t.org $F03FF0\n\tdc.l 1,2\n",
-        &Options::default(),
-    );
-    assert!(
-        !out.diags.iter().any(|d| d.msg.contains("UNPROVEN")),
-        "no warning expected: {:#?}",
-        out.diags
-    );
-}
-
-#[test]
 fn equ_and_expressions() {
     let out = assemble(
         "        .gpu\n\

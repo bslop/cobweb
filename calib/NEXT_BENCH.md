@@ -77,10 +77,17 @@ REGISTER read from the GPU, possibly priced differently under a busy
 Blitter; the shaded build adds thousands of poll spins per frame, and jsim
 thinks shade is ~free while silicon pays 23%).
 
+## hwq verdicts (same day, post power-cycle — calib/hwq_20260721.log)
+
+- **TOPPHR GOOD**: $F03FF8-FFF writable and stable on silicon. The jas
+  top-phrase lint is retired with this log as provenance; the last 8
+  bytes of GPU SRAM are usable.
+- **UPDA2 GOOD**: under DSTA2, UPDA2 steps the swapped destination with
+  per-row re-home — jagemu's model confirmed on silicon; UPDA2-only
+  blits were never a corruption risk.
+- XJUMP/CTRL re-confirmed GOOD on this rig.
+
 ## Remaining for the next session
-1. Power-cycle (board wedged red after a mid-upload disconnect — known
-   state, physical switch only).
-2. Flash `build/hwq_skunk.cof` → HWQ TOPPHR + UPDA2 verdicts (30 s).
-3. NEW probe to write: `p_bwaitcost` — B_CMD poll loop timed idle vs under
+1. NEW probe to write: `p_bwaitcost` — B_CMD poll loop timed idle vs under
    a long blit, vs an SRAM poll control. The +30% suspect.
-4. The density-sweep family for the mode-A DRAM regime model.
+2. The density-sweep family for the mode-A DRAM regime model.

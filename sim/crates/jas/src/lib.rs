@@ -235,27 +235,9 @@ pub fn assemble(source: &str, opts: &Options) -> Assembled {
     let mut asm = Assembler::new(opts);
     asm.run(&expanded, &line_map);
     let mut out = asm.finish();
-    // GPU-SRAM top-phrase lint: nothing in the project corpus has ever proven
-    // $F03FF8-$F03FFF writable and stable on silicon (the historical dispatch
-    // list stopped at $F03FF7). Warn when GPU-side code/data claims it, until
-    // a sentinel probe on the rig settles the question
-    // (COBWEB_REQ_rectshade_and_calibration §5.2).
-    {
-        let claims_top = out.emitted.iter().any(|e| {
-            e.target == Target::Gpu && {
-                let len = (e.words.len().max(1) * 2) as u32;
-                e.addr < 0xF0_4000 && e.addr + len > 0xF0_3FF8
-            }
-        });
-        if claims_top {
-            out.diags.push(Diag::warn(
-                0,
-                "GPU code/data claims $F03FF8-$F03FFF — the top phrase of GPU SRAM is \
-                 UNPROVEN on silicon; keep below $F03FF8 until the sentinel probe passes"
-                    .to_string(),
-            ));
-        }
-    }
+    // (The GPU-SRAM top-phrase lint that lived here was RETIRED 2026-07-21:
+    // the hwq TOPPHR sentinel probe proved $F03FF8-$F03FFF writable and
+    // stable on silicon — calib/hwq_20260721.log. The top phrase is usable.)
     if opts.check_hazards {
         let suppressed: std::collections::HashSet<usize> = out.suppressed.iter().copied().collect();
         let mut hz = hazard::check(&out.emitted);
