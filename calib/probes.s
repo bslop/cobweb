@@ -562,6 +562,80 @@ _p_blittexq_s:
 	.data
 _p_blittexq_e:
 
+; ── p_blitrmw: 256-px DSTEN read-modify-write OR fill — prices the dest READ ─
+; The rect-shade pass is DSTEN|LFU(S|D): every dest phrase is read before the
+; OR and the write-back. jsim charges that read at one access per pixel (the
+; conservative reading of the blitbg calibration); if silicon coalesces or
+; pipelines the RMW read, this probe reads BELOW blitbg+its-delta and the
+; charge comes down. Delta vs p_blitbg isolates exactly the read term:
+; blitbg = srcread+dstwrite per px; blitrmw = dstread+dstwrite per px.
+; (COBWEB_BUG_blitter_overcharged round 2, suspect #1.)
+BB_CMDRMW	equ	$01C00808	; DSTEN|LFU(S|D)|DSTA2, no SRCEN
+BB_SRCD		equ	$F02240		; 64-bit source-data pair ($F02240/44)
+
+	.even
+	.globl	_p_blitrmw_s
+	.globl	_p_blitrmw_e
+_p_blitrmw_s:
+	.gpu
+	PROBE_PRO
+	BLITSETUP
+	movei	#BB_SRCD,r0		; OR pattern k, both phrase halves
+	movei	#$5A5A5A5A,r1
+	store	r1,(r0)
+	movei	#BB_SRCD+4,r0
+	store	r1,(r0)
+	movei	#BB_BCOUNT,r0
+	movei	#$00010100,r1		; 1 row x 256 pixels (same as blitbg)
+	store	r1,(r0)
+	movei	#BB_BCMD,r2
+	movei	#BB_CMDRMW,r1
+	store	r1,(r2)			; launch
+.bwrmw:
+	load	(r2),r1
+	btst	#0,r1
+	jr	eq,.bwrmw
+	nop
+	PROBE_EPI
+	.68000
+	.data
+_p_blitrmw_e:
+
+; ── p_ldunderb: 256 DRAM loads WHILE a long blit holds the bus ───────────────
+; The staging-under-blit contention term: jsim currently lets GPU external
+; loads proceed as if the Blitter weren't on the DRAM bus (contention ~0.1%
+; on the rect-shade run). Silicon-minus-(p_lddram + long-blit-alone) is the
+; coefficient, measured directly. Launch first, do NOT bwait, load through
+; the blit, then drain. (COBWEB_BUG_blitter_overcharged round 2, the
+; under-charge side.)
+	.even
+	.globl	_p_ldunderb_s
+	.globl	_p_ldunderb_e
+_p_ldunderb_s:
+	.gpu
+	PROBE_PRO
+	BLITSETUP
+	movei	#BB_BCOUNT,r0
+	movei	#$00010800,r1		; 1 row x 2048 px — a long bus-holder
+	store	r1,(r0)
+	movei	#BB_BCMD,r2
+	movei	#BB_CMDTEX,r1
+	store	r1,(r2)			; launch, no bwait — loads fight the blit
+	move	r19,r0			; DRAM buffer base (PRMAUX)
+	.rept	256
+	load	(r0),r1
+	addqt	#8,r0			; phrase stride, page-friendly like lddram
+	.endr
+.bwub:
+	load	(r2),r1			; drain so the next rep starts clean
+	btst	#0,r1
+	jr	eq,.bwub
+	nop
+	PROBE_EPI
+	.68000
+	.data
+_p_ldunderb_e:
+
 ; ── p_dsphammer: resident DSP DRAM read-hammer (concurrent bus-noise source) ─
 ; main.c starts this on Jerry (DSP) before a Tom probe and stops it after, so
 ; the timed Tom stream runs against real Jerry↔Tom DRAM contention on the one

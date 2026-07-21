@@ -10,6 +10,24 @@ Headline: the simulator now renders OpenLara's textured 3D room, the optimizer
 proves its wins against real rendered output, and a one-character assembler bug
 that had been silently dropping conditional blocks is fixed.
 
+### 2026-07-21 — the floor decomposed, and the bench pack is loaded
+
+- **ALLCULL rebuilt and run in jsim: 9.57 fps vs 9.55 silicon (+0.2%).**
+  The empty-frame floor is modeled essentially perfectly — all remaining
+  rect-shade optimism lives in the geometry path. The floor itself is the
+  CULL WALK, not Lara: ~40% of wall of GPU time survives with every face
+  culled (staged + transformed + cull-tested per face). Jerry runs ~93.5%
+  of wall in both builds while jsim charges his bus traffic ~nothing —
+  the Tom↔Jerry contention GAP is now the prime suspect, with numbers.
+- **Two new calibration probes, dogfooded** (`calib/probes.s` + parser):
+  `blitrmw` (DSTEN dest-READ price; jsim 453 vs blitbg 451 — silicon
+  below parity means RMW reads coalesce and the DSTEN charge comes down)
+  and `ldunderb` (DRAM loads under a 2048-px blit; jsim 3487 ≈ zero
+  contention — silicon minus that IS the staging-under-blit coefficient).
+- **`calib/NEXT_BENCH.md`** — the one-flash-cycle checklist: rig health
+  gate, calib suite, the top-phrase/UPDA probe, and the OpenLara arms,
+  each with its decision rule written down before the measurement.
+
 ### 2026-07-21 — frameview: telemetry gets a face
 
 - **`sim/tools/frameview.py`** — renders one or two `jagemu run` JSONs as
