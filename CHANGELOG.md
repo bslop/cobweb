@@ -34,10 +34,12 @@ bar decode vs 3.75 cert), full calib suite on Jaguar B
   per frame (jsim prices shade ~free; silicon pays 23%). Next probes:
   `p_bwaitcost` + the density sweep. No constants touched beyond the
   bench-anchored DSTEN correction.
-- hwq harness gained TOPPHR + UPDA2 questions (dogfooded in jsim, both
-  GOOD); flash pending one power-cycle (board wedged red after a
-  mid-upload disconnect — the documented hard-wedge, physical switch
-  only).
+- hwq TOPPHR + UPDA2 flashed after a power-cycle
+  (`calib/hwq_20260721.log`): **both GOOD on silicon** — the top phrase
+  of GPU SRAM is stable (jas lint retired; OpenLara gets its last 8
+  bytes back) and UPDA2 steps the DSTA2-swapped destination exactly as
+  jagemu models (UPDA2-only blits were never a corruption risk).
+  XJUMP/CTRL scoreboard verdicts re-confirmed on this rig.
 
 ### 2026-07-21 — the floor decomposed, and the bench pack is loaded
 

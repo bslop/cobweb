@@ -1,0 +1,20 @@
+Script started on 2026-07-21 10:06:43-06:00 [COMMAND="/home/jvilla/jaguar-tools/bin/jcp -c build/hwq_skunk.cof" <not executed on terminal>]
+jcp v02.04.02 built on Jul  6 2026
+
+COFF File:  Skip 168 bytes, base addr is $4000, length is 3008 bytes
+Sending... 
+|/-Jag accepted start request at $00004000.
+ 
+Finished in 521 millis, 5KB/second.
+ 
+Starting console...
+Cobweb hardware-question probes v1
+HWQ XJUMP  val=600D600D  [GOOD: scoreboard held]
+HWQ CTRL   val=600D600D  [GOOD: scoreboard held]
+HWQ VCFULL max=000008B0 (modulus = max+1)
+HWQ TOPPHR val=C0DEF00D5A5AA5A5  [GOOD: top phrase stable]
+HWQ UPDA2  r0/r1/lin=007777EE  [GOOD: UPDA2 steps swapped dest = jsim]
+HWQ DONE
+Console terminating.
+
+Script done on 2026-07-21 10:06:49-06:00 [COMMAND_EXIT_CODE="0"]
