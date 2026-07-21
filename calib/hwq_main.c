@@ -136,6 +136,75 @@ void cal_main(void)
         say(line);
     }
 
+    /* Q3: is the top phrase of GPU SRAM ($F03FF8-FFF) writable and stable?
+     * (COBWEB_REQ_rectshade §5.2 — nothing in the corpus ever proved it;
+     * the jas lint warns on claiming it until this passes.) */
+    {
+        volatile u32 *top = (volatile u32 *)0xF03FF8UL;
+        u32 a, b;
+        int i;
+        top[0] = 0xC0DEF00Du;
+        top[1] = 0x5A5AA5A5u;
+        for (i = 0; i < 20000; i++)     /* unrelated bus traffic + settle */
+            (void)R32(0x4000UL);
+        a = top[0];
+        b = top[1];
+        {
+            char *d = line;
+            d = put(d, "HWQ TOPPHR val=");
+            d = puth(d, a);
+            d = puth(d, b);
+            d = put(d, (a == 0xC0DEF00Du && b == 0x5A5AA5A5u)
+                        ? "  [GOOD: top phrase stable]\n"
+                        : "  [BAD: top phrase NOT stable]\n");
+            *d = 0;
+            say(line);
+        }
+    }
+
+    /* Q4: under the DSTA2 role swap, does UPDA2 step the swapped DEST?
+     * 2-row 4-px 8bpp pattern fill, DSTEN-free, UPDA2 only. jsim: row 1
+     * lands re-homed one line below (UPDA2 steps the A2 register set).
+     * If silicon walks linearly instead, jagemu has a corrupting gap.
+     * (COBWEB_REQ_rectshade §3.) */
+    {
+        volatile unsigned char *dst = (volatile unsigned char *)0x110000UL;
+        int i;
+        unsigned char r0, r1, lin;
+        for (i = 0; i < 320 * 8; i++)
+            dst[i] = 0xEE;
+        R32(0xF02224UL) = 0x110000UL;       /* A2_BASE */
+        R32(0xF02228UL) = 0x00014218UL;     /* A2_FLAGS: PITCH1|PIX8|W320|XADDPIX */
+        R32(0xF02230UL) = 0;                /* A2_PIXEL (A2 has MASK at $F0222C!) */
+        R32(0xF02234UL) = 0x0001FFFCUL;     /* A2_STEP: +1 row, x -= 4 */
+        R32(0xF02200UL) = 0x110000UL + 320UL * 16; /* A1 parked away */
+        R32(0xF02204UL) = 0x00014218UL;
+        R32(0xF0220CUL) = 0;
+        R32(0xF02240UL) = 0x77777777UL;     /* B_SRCD both halves */
+        R32(0xF02244UL) = 0x77777777UL;
+        R32(0xF0223CUL) = (2UL << 16) | 4;  /* B_COUNT: 2 rows x 4 px */
+        R32(0xF02238UL) = 0x01800C00UL;     /* LFU_S | DSTA2 | UPDA2 */
+        while (!(R32(0xF02238UL) & 1))
+            ;
+        r0 = dst[0];
+        r1 = dst[320];
+        lin = dst[4];
+        {
+            char *d = line;
+            d = put(d, "HWQ UPDA2  r0/r1/lin=");
+            d = puth(d, ((u32)r0 << 16) | ((u32)r1 << 8) | lin);
+            if (r0 == 0x77 && r1 == 0x77 && lin == 0xEE)
+                d = put(d, "  [GOOD: UPDA2 steps swapped dest = jsim]");
+            else if (r0 == 0x77 && lin == 0x77)
+                d = put(d, "  [BAD: dest walks LINEARLY - jagemu gap]");
+            else
+                d = put(d, "  [ODD: neither pattern - inspect 0x110000]");
+            d = put(d, "\n");
+            *d = 0;
+            say(line);
+        }
+    }
+
     say("HWQ DONE\n");
 done:
 #ifdef USE_SKUNK_CONSOLE

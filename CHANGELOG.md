@@ -10,6 +10,35 @@ Headline: the simulator now renders OpenLara's textured 3D room, the optimizer
 proves its wins against real rendered output, and a one-character assembler bug
 that had been silently dropping conditional blocks is fixed.
 
+### 2026-07-21 — first remote-driven silicon session: both blit questions answered
+
+Bench run end-to-end from the desk (jcp flash + reset, jagtap eyes,
+capture-side fps decode): health gate passed (golden clean at ~3.5 by
+bar decode vs 3.75 cert), full calib suite on Jaguar B
+(`calib/bench_20260721.log`), and the two prepared probes answered:
+
+- **`blitrmw`: silicon 216 vs modeled 453 — a DSTEN RMW pays ONE access
+  per pixel, not two.** The dest read and write-back share the page
+  window. Their round-2 suspect #1 was right: the 2026-07-20 DSTEN
+  charge over-priced non-SRCEN RMW 2x. Recalibrated (charge kept only
+  for the unprobed SRCEN+DSTEN shape); jsim blitrmw now 235 (+8.8%).
+- **`ldunderb`: silicon 3600 vs jsim 3487 — staging-under-blit
+  contention REFUTED** (+3.2%). The under-charge is not there.
+- Post-recalibration ladder: ALLCULL floor exact (9.57/9.55); every
+  geometry build uniformly ~+30% optimistic (v4b 5.16/3.89, nofill
+  5.82/4.51, TC 4.89/3.75). With per-blit and floor silicon-exact, the
+  residual is the disclosed 68k/bus regime nonlinearity — measured
+  piece: consumed DRAM loads with the 68k active read 8.83 cyc/unit vs
+  8.00 modeled (+10%) — plus a NEW named suspect: the bwait B_CMD
+  register-read poll is unprobed and the shaded build adds thousands
+  per frame (jsim prices shade ~free; silicon pays 23%). Next probes:
+  `p_bwaitcost` + the density sweep. No constants touched beyond the
+  bench-anchored DSTEN correction.
+- hwq harness gained TOPPHR + UPDA2 questions (dogfooded in jsim, both
+  GOOD); flash pending one power-cycle (board wedged red after a
+  mid-upload disconnect — the documented hard-wedge, physical switch
+  only).
+
 ### 2026-07-21 — the floor decomposed, and the bench pack is loaded
 
 - **ALLCULL rebuilt and run in jsim: 9.57 fps vs 9.55 silicon (+0.2%).**
