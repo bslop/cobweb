@@ -10,6 +10,24 @@ Headline: the simulator now renders OpenLara's textured 3D room, the optimizer
 proves its wins against real rendered output, and a one-character assembler bug
 that had been silently dropping conditional blocks is fixed.
 
+### 2026-07-21 — frameview: telemetry gets a face
+
+- **`sim/tools/frameview.py`** — renders one or two `jagemu run` JSONs as
+  a self-contained HTML frame-anatomy card (inline SVG, light+dark,
+  hover tooltips, table view; no external requests). The GPU wall bar
+  splits Execute / Jump refill / Scoreboard stalls / External access /
+  **Blitter wait (paid)** with idle in de-emphasis gray, and draws the
+  asynchronous Blitter **busy ledger** as its own labeled row — busy
+  and paid cannot be conflated again by construction. Pair-diff mode
+  annotates per-segment deltas; `--fps LABEL=JSIM[:SILICON]` adds the
+  jsim-vs-silicon ladder. Palette validated for CVD/contrast in both
+  modes.
+- First run of the card caught a wrong claim in the round-2 blit
+  response: LAD_nofill is NOT blit-free (22.8%-of-wall busy remains —
+  44k big blits vs the full build's 1.28M launches), so the NOFILL
+  subtraction isolates per-span launches, not the Blitter. Corrected
+  in the BUG file.
+
 ### 2026-07-20 — blit counter split: busy vs paid, and the sign of the "over-charge"
 
 Round 2 of the Blitter bug (night, healthy rig, byte-exact probe pair):

@@ -20,6 +20,11 @@ the audio counterpart of the pixel-diff: silence/DC/clipping/dropout/
 spectral health, plus lag-aligned envelope+spectrum comparison against
 an oracle capture (works on hardware WAVs too — same analyzer).
 
+`sim/tools/frameview.py run.json [run2.json] -o card.html` renders the
+timing JSON as a frame-anatomy card (paid stalls vs the async Blitter
+busy ledger, pair-diff deltas, jsim-vs-silicon fps ladder) — use it
+when showing telemetry to the human; the JSON is for you.
+
 For live hardware sessions, `sim/tools/jagtap.py --device /dev/videoN`
 splits the USB capture of the real Jaguar: the human watches
 `http://localhost:8471/`, you fetch `/frame.jpg` (or Read the `--snap`
