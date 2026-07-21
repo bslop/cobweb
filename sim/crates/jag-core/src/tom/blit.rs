@@ -451,10 +451,10 @@ pub fn run(bus: &mut Bus, cmd: u32) {
     // SHADED build only). Physics, not tuning: the constant is unchanged,
     // the access count now includes the reads the hardware performs.
     let dst_reads = if dsten { dst_phrases } else { 0 };
-    let ticks =
-        BLIT_LAUNCH_TICKS + (dst_phrases + dst_reads + src_phrases) * BLIT_ACCESS_TICKS_X10 / 10;
-    bus.tom.last_blit_ticks = ticks;
-    bus.tom.blit_busy += ticks; // asynchronous: drains as wall time passes
+    let transfer = (dst_phrases + dst_reads + src_phrases) * BLIT_ACCESS_TICKS_X10 / 10;
+    bus.tom.last_blit_launch = BLIT_LAUNCH_TICKS;
+    bus.tom.last_blit_ticks = BLIT_LAUNCH_TICKS + transfer;
+    bus.tom.blit_busy += BLIT_LAUNCH_TICKS + transfer; // asynchronous: drains as wall time passes
 }
 
 #[cfg(test)]

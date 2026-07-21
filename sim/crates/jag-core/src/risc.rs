@@ -478,6 +478,7 @@ impl Risc {
         use timing::{Fidelity as F, MemClass, PendKind};
         let now = self.cycles;
         let b = self.cur_bank();
+        let bcmd_snap = bus.bcmd_busy_reads.load(std::sync::atomic::Ordering::Relaxed);
         self.pipe.settle(now, &mut self.regs, self.fidelity);
 
         // Peek the instruction word (side-effect-free: code lives in RAM).
@@ -655,7 +656,15 @@ impl Risc {
         // time", the number the wall-clock accounting reports.
         let blit_ticks = std::mem::take(&mut bus.tom.last_blit_ticks);
         if blit_ticks > 0 {
+            let launch = std::mem::take(&mut bus.tom.last_blit_launch);
             self.pipe.stats.blit += blit_ticks;
+            self.pipe.stats.blit_launch += launch;
+            self.pipe.stats.blit_transfer += blit_ticks - launch;
+        }
+        // bwait attribution: if this instruction read B_CMD and saw BUSY, its
+        // cost is spin time — book it so the split can be silicon-checked.
+        if bus.bcmd_busy_reads.load(std::sync::atomic::Ordering::Relaxed) != bcmd_snap {
+            self.pipe.stats.blit_wait += cost as u64;
         }
         cost
     }

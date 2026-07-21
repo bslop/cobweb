@@ -10,6 +10,28 @@ Headline: the simulator now renders OpenLara's textured 3D room, the optimizer
 proves its wins against real rendered output, and a one-character assembler bug
 that had been silently dropping conditional blocks is fixed.
 
+### 2026-07-20 — blit counter split: busy vs paid, and the sign of the "over-charge"
+
+Round 2 of the Blitter bug (night, healthy rig, byte-exact probe pair):
+
+- **`gpu.timing.blit` is now split** into `blit_launch` / `blit_transfer`
+  (the asynchronous BUSY ledger) and **`blit_wait`** — the measured
+  cycles the GPU spends on B_CMD reads that observe busy, i.e. what the
+  frame actually pays. On RECTSHADE_v4b: busy 54.2% of GPU cycles, paid
+  wait **7.3%** — the busy ledger overstates the paid cost 7x under
+  rect-shade's deliberate overlap, which is what read as a "3-4x
+  over-charge" in the report.
+- **The diagnosis flips**: jsim's pair-implied fill share on their
+  kernel is 7.8% vs 13.6% silicon — an UNDER-charge. A/B on their probe
+  proves the DSTEN recharge right: without it the full build outruns
+  NOFILL (negative fill share, physically impossible); with it the sign
+  is correct and 45% of the gap toward silicon closes.
+- Remaining error decomposed with their own pair: the NOFILL arm alone
+  is +10.4% optimistic (blit-independent — staging/external-load side),
+  and GPU external accesses currently pay no contention while the
+  Blitter holds DRAM (0.1% measured). Two probes specified (DSTEN RMW
+  price, staging-under-blit contention) before any constant moves.
+
 ### 2026-07-20 — the rect-shade report: watchpoints, framecheck, and a DSTEN charge
 
 Same-day response to `COBWEB_REQ_rectshade_and_calibration.md`:

@@ -136,6 +136,8 @@ pub struct Tom {
     /// RISC step charges it to the launching `B_CMD` store, so the GPU's
     /// bwait-spin costs real time — HARDWARE-CALIBRATED, see `blit::cost`).
     pub last_blit_ticks: u64,
+    /// Launch-overhead part of `last_blit_ticks` (for the counter split).
+    pub last_blit_launch: u64,
     /// Ticks until the in-flight blit completes — the Blitter is ASYNCHRONOUS.
     /// HARDWARE (calib 2026-07-19, 1/2/4/8/256-px probes + OpenLara's NOFILL
     /// delta): per-blit cost matches jsim within ~5% at every span length, yet
@@ -159,6 +161,7 @@ impl Tom {
             presented: crate::tom::Framebuffer::solid(320, 240, 0, 0, 0),
             op: crate::tom::OpState::default(),
             last_blit_ticks: 0,
+            last_blit_launch: 0,
             blit_busy: 0,
         }
     }
@@ -232,6 +235,10 @@ pub struct Bus {
     watch_suppress: u8,
     /// Scheduler-maintained frame counter mirror (for watch-hit context).
     pub frame_mirror: u64,
+    /// B_CMD reads that observed BUSY (the bwait spin, counted at the bus).
+    /// Atomic because the read path is `&self`; single-threaded ordering is
+    /// all we need (Relaxed).
+    pub bcmd_busy_reads: std::sync::atomic::AtomicU64,
 }
 
 /// Cap on retained watch hits — enough to see the pattern, bounded so a
@@ -304,6 +311,7 @@ impl Bus {
             cur_master_pc: 0,
             watch_suppress: 0,
             frame_mirror: 0,
+            bcmd_busy_reads: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -508,6 +516,10 @@ impl Bus {
         if a == mem::B_CMD {
             // Data-wise the blit completed at launch; TIME-wise it is still on
             // the bus until blit_busy drains. bit0 = idle.
+            if self.tom.blit_busy > 0 {
+                self.bcmd_busy_reads
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             return if self.tom.blit_busy > 0 {
                 crate::tom::blit::BLIT_IDLE & !1
             } else {
