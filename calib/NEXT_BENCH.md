@@ -54,3 +54,33 @@ Also re-anchors the whole existing table for free. Read results as always:
 - Jerry runs ~93.5% of wall in BOTH builds; jsim charges his DRAM traffic
   ~nothing (the known Tom↔Jerry contention GAP). `ldunderb` plus a future
   DSP-side twin is the measurement path.
+
+---
+
+## SESSION RESULTS (2026-07-21, Jaguar B, remote-driven)
+
+Health gate: PASSED — golden renders clean, bar decodes ~3.5 (capture-side
+decode tolerance vs the 3.75 cert; the fault regime read 5.29 WITH streaks).
+
+| probe | silicon | jsim before | verdict |
+|---|---|---|---|
+| blitrmw | **216** | 453 | **DSTEN RMW = ONE access/px** — the read rides the write's page window. Charge removed for non-SRCEN DSTEN (kept for the unprobed SRCEN+DSTEN shape). jsim now 235 (+8.8%). |
+| ldunderb | **3600** | 3487 | staging-under-blit contention **refuted** (+3.2% only). |
+| lddramc A | **8.83 cyc/u** | 8.00 | consumed DRAM loads with the 68k ACTIVE are +10% under-charged — one measured piece of the regime gap. |
+
+Post-recalibration anchor ladder: ALLCULL **9.57 vs 9.55** (floor exact);
+v4b 5.16 / nofill 5.82 / TC 4.89 vs silicon 3.89 / 4.51 / 3.75 — a uniform
+**+30% on every geometry build**. With per-blit and floor both silicon-exact,
+the whole residual is the disclosed 68k/bus regime nonlinearity — plus one
+NEW named suspect: **the bwait B_CMD poll itself is unprobed** (a Tom
+REGISTER read from the GPU, possibly priced differently under a busy
+Blitter; the shaded build adds thousands of poll spins per frame, and jsim
+thinks shade is ~free while silicon pays 23%).
+
+## Remaining for the next session
+1. Power-cycle (board wedged red after a mid-upload disconnect — known
+   state, physical switch only).
+2. Flash `build/hwq_skunk.cof` → HWQ TOPPHR + UPDA2 verdicts (30 s).
+3. NEW probe to write: `p_bwaitcost` — B_CMD poll loop timed idle vs under
+   a long blit, vs an SRAM poll control. The +30% suspect.
+4. The density-sweep family for the mode-A DRAM regime model.

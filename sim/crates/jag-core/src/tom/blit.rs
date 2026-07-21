@@ -442,15 +442,17 @@ pub fn run(bus: &mut Bus, cmd: u32) {
     let per_line = |g: &AddrGen| -> u64 { (inner as u64).div_ceil(ppp(g)) };
     let dst_phrases = outer as u64 * per_line(&gens[dst]);
     let src_phrases = if srcen { outer as u64 * per_line(&gens[src]) } else { 0 };
-    // DSTEN is a read-modify-write: every dest phrase is READ before the
-    // logic op and the write-back, so it pays twice. This was uncharged —
-    // invisible in the Caves/NOFILL anchors (no DSTEN in those paths) but a
-    // systematic under-charge on OpenLara's shade pass, whose per-span
-    // DSTEN|LFU(S|D) blits DOUBLE the launch count
-    // (COBWEB_REQ_rectshade_and_calibration §2: jsim +30% optimistic on the
-    // SHADED build only). Physics, not tuning: the constant is unchanged,
-    // the access count now includes the reads the hardware performs.
-    let dst_reads = if dsten { dst_phrases } else { 0 };
+    // DSTEN read-modify-write pricing — HARDWARE (p_blitrmw, bench
+    // 2026-07-21, Jaguar B): a 256-px pixel-mode DSTEN OR-fill measured
+    // 216 VC ticks vs the SRCEN copy's 450 — i.e. ~5.6 cycles/px, ONE
+    // access per pixel, NOT two. Without SRCEN the dest read and its
+    // write-back hit the same page and ride one access window, so the
+    // RMW read is free. With SRCEN the read is a third address stream
+    // (page ping-pong) and is still charged — that shape is unprobed;
+    // the charge there is the conservative reading. (This replaces the
+    // 2026-07-20 always-charge, which the same probe showed over-priced
+    // non-SRCEN RMW 2x — COBWEB_BUG_blitter_overcharged round 2.)
+    let dst_reads = if dsten && srcen { dst_phrases } else { 0 };
     let transfer = (dst_phrases + dst_reads + src_phrases) * BLIT_ACCESS_TICKS_X10 / 10;
     bus.tom.last_blit_launch = BLIT_LAUNCH_TICKS;
     bus.tom.last_blit_ticks = BLIT_LAUNCH_TICKS + transfer;
