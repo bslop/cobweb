@@ -71,6 +71,8 @@ extern char p_blit4_s[], p_blit4_e[];
 extern char p_blittex1_s[], p_blittex1_e[];
 extern char p_blittexq_s[], p_blittexq_e[];
 extern char p_blitrmw_s[], p_blitrmw_e[];
+extern char p_bcmdidle_s[], p_bcmdidle_e[];
+extern char p_bcmdbusy_s[], p_bcmdbusy_e[];
 extern char p_ldunderb_s[], p_ldunderb_e[];
 extern char p_dsphammer_s[], p_dsphammer_e[];
 extern char p_divhot_s[], p_divhot_e[];
@@ -165,6 +167,8 @@ static const struct probe probes[] = {
     { "blittexq", p_blittexq_s, p_blittexq_e, 0, 0, 128, DRAM_BUF },
     { "blitrmw ", p_blitrmw_s, p_blitrmw_e, 0, 0, 128, DRAM_BUF },
     { "ldunderb", p_ldunderb_s, p_ldunderb_e, 0, 0, 128, DRAM_BUF },
+    { "bcmdidle", p_bcmdidle_s, p_bcmdidle_e, 0, 0, 128, DRAM_BUF },
+    { "bcmdbusy", p_bcmdbusy_s, p_bcmdbusy_e, 0, 0, 128, DRAM_BUF },
     { "lddramop", p_lddram_s, p_lddram_e, 0, 0, 512, DRAM_BUF, 0, 0, 1, 1 },
     /* 68k-side: the ONLY probe that times the 68000 itself rather than Tom.
      * jsim charges the 68k textbook instruction cycles against a free bus, and

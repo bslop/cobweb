@@ -47,6 +47,8 @@ PROBES = [
     ("blittexq", 0, "TEXTURED XADDINC span, 256 px, du=0.25 (4 px per texel)"),
     ("blitrmw", 0, "DSTEN RMW OR-fill, 256 px + launch + bwait (dest-READ price)"),
     ("ldunderb", 256, "DRAM loads WHILE a 2048-px blit holds the bus (contention)"),
+    ("bcmdidle", 256, "B_CMD register-read poll stream, Blitter idle (bwait baseline)"),
+    ("bcmdbusy", 256, "B_CMD polls WHILE a 2048-px blit runs (the bwait spin, priced)"),
     ("lddramop", 512, "DRAM load stream WHILE the OP scans a full screen (Tom<->OP contention)"),
     ("m68kbus", 0, "68000 throughput, BLOCKS done in 30 fields (higher=faster): A=OP idle, B=OP scanning"),
     ("m68kreg", 0, "68000 register-only dbra loop, BLOCKS in 30 fields (fetch-only bus traffic)"),
@@ -114,7 +116,7 @@ def reps_of(name):
         "vcmod": 0x80000, "null": 8192, "nop": 1024, "move": 1024,
         "moveq": 1024, "adddep": 1024, "addind": 1024, "ldsram": 512,
         "ldidx": 512, "lddram": 512, "lddramc": 256, "ldstride": 256, "stdram": 512,
-        "blitsm": 128, "blitbg": 128, "blit1": 128, "blit2": 128, "blit4": 128, "blittex1": 128, "blittexq": 128, "blitrmw": 128, "ldunderb": 128, "m68kbus": 30, "m68kreg": 30, "m68kcpy": 30, "lddramj": 512, "lddramop": 512,
+        "blitsm": 128, "blitbg": 128, "blit1": 128, "blit2": 128, "blit4": 128, "blittex1": 128, "blittexq": 128, "blitrmw": 128, "ldunderb": 128, "bcmdidle": 128, "bcmdbusy": 128, "m68kbus": 30, "m68kreg": 30, "m68kcpy": 30, "lddramj": 512, "lddramop": 512,
         "divhot": 512, "divsh": 512, "jr": 256, "mainmov": 128,
         "mainnop": 128,
     }[name]

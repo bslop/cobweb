@@ -88,6 +88,15 @@ thinks shade is ~free while silicon pays 23%).
 - XJUMP/CTRL re-confirmed GOOD on this rig.
 
 ## Remaining for the next session
-1. NEW probe to write: `p_bwaitcost` — B_CMD poll loop timed idle vs under
-   a long blit, vs an SRAM poll control. The +30% suspect.
+1. **Flash the updated suite** — `p_bcmdidle`/`p_bcmdbusy` (the bwait
+   poll-cost probes, the +30% suspect) are WRITTEN, registered, and
+   dogfooded in jsim (idle: 1.01 cyc/poll — jsim prices B_CMD reads as
+   ~free; busy: blit-duration-bound). Blocked 2026-07-21 by a
+   physical-layer USB fault: every upload >~16KB drops at a consistent
+   offset ("can't connect"), small uploads (hwq 3KB) pass, and even
+   successful large uploads crawled at 7KB/s. Software USB reset did
+   not help. Suspects: cable/port/hub, or the same session-length
+   thermal degradation as the 07-20 streak fault (cart-edge side).
+   Swap the USB path and/or let the rig cool, then:
+   `script -qefc "jcp -c build/calib_skunk.cof" bench.log`
 2. The density-sweep family for the mode-A DRAM regime model.
