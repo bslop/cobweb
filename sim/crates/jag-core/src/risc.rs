@@ -551,7 +551,10 @@ impl Risc {
         // HARDWARE: lddram/stdram quiet-bus streams both measured ~+1/access.
         // Loads additionally carry extra result latency into the scoreboard.
         let mut ext_load_lat: u32 = 0;
-        if let Some(c @ (MemClass::Dram | MemClass::ExtOther)) = mclass {
+        // Internal-class accesses go through too: ext_access charges the
+        // Blitter-register block ($F022xx) its measured extra bus cycle and
+        // returns (0,0) for everything else internal (p_bcmdidle, 2026-07-21).
+        if let Some(c) = mclass {
             let (occ, lat) = self.pipe.ext_access(c, ea.unwrap(), contended);
             cost += occ;
             if is_load {

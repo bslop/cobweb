@@ -105,3 +105,24 @@ thinks shade is ~free while silicon pays 23%).
    sustained bulk fails — classic marginal cable. Swap the cable or
    move to a direct motherboard port, then re-run.
 2. The density-sweep family for the mode-A DRAM regime model.
+
+---
+
+## SESSION 2 RESULTS (2026-07-21 evening, second console, USB recovered by bounce)
+
+Full suite ran (`bench_20260721_s2.log`). The bwait suspect: **partially
+confirmed.** `bcmdidle` silicon 2.02 cyc/poll vs jsim 1.01 — a GPU read of
+a Blitter register costs one extra bus cycle. Charged ($F02200-7F reads,
++1 occ; bcmdidle now 2.02 exact). `bcmdbusy` 3494 vs 3487 ✓ (blit-bound).
+blitrmw/ldunderb reproduced session 1 on the second console (216/3599) —
+cross-rig stability.
+
+Anchor ladder after the charge: v4b +28.0%, nofill +27.7%, TC +28.8%,
+ALLCULL +0.2%. The poll charge closed ~2pp; the residual is UNIFORM across
+geometry builds with the floor exact — consistent with the known mode-A
+dense-stream DRAM regime (lddramc +10% is its measured edge; the disclosed
+"dense streams need more data charge" nonlinearity). The density sweep
+remains the measurement path. NOTE: the uniform bias cancels in A/B
+comparisons, so jsim correctly RANKS optimizations on these kernels today;
+only absolute fps on dense-geometry builds reads ~28% high.
+
