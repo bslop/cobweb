@@ -700,9 +700,11 @@ _p_ldcunderb_s:
 	PROBE_PRO
 	BLITSETUP
 	movei	#BB_BCOUNT,r0
-	movei	#$00010400,r1		; 1024 px: loads OUTLAST the blit, so the
-					; measurement is load-bound (2048 was
-					; blit-bound and read only the drain)
+	movei	#$00010080,r1		; 128 px (~1.4k cyc): the 384-instr consumed
+					; run (~2.4k cyc quiet) OUTLASTS it, so the
+					; probe is load-bound with the blit covering
+					; the first ~60% — the overlap under test.
+					; (2048/1024 px were blit-bound: drain only.)
 	store	r1,(r0)
 	movei	#BB_BCMD,r2
 	movei	#BB_CMDTEX,r1
