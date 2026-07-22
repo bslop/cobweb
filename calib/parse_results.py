@@ -51,7 +51,7 @@ PROBES = [
     ("dens6",  512, "DRAM load per 8 instr — mode-A regime sweep"),
     ("dens14", 1024, "DRAM load per 16 instr — mode-A regime sweep"),
     ("dens30", 1024, "DRAM load per 32 instr (game-like sparse) — mode-A regime sweep"),
-    ("ldcunder", 384, "CONSUMED DRAM loads WHILE a 2048-px blit runs (geotex staging shape)"),
+    ("ldcunder", 384, "CONSUMED DRAM loads WHILE a 128-px blit runs (geotex staging shape)"),
     ("bcmdidle", 256, "B_CMD register-read poll stream, Blitter idle (bwait baseline)"),
     ("bcmdbusy", 256, "B_CMD polls WHILE a 2048-px blit runs (the bwait spin, priced)"),
     ("lddramop", 512, "DRAM load stream WHILE the OP scans a full screen (Tom<->OP contention)"),
