@@ -162,3 +162,25 @@ Remaining suspects, now sharply framed (everything else is exact):
    pose/audio access pattern may differ. Probe: dsp running the
    actual AUDIO_PUMP loop while Tom streams.
 
+---
+
+## 2026-07-22 SESSION 2: the micro-matrix is EXHAUSTED — all cells benign
+
+`ldcunder` silicon: **A 4.96 / B 4.97** vs jsim baseline 9.18/6.51 —
+consumed loads under a running blit are CHEAPER than idle-bus lddramc
+(6.10), not costlier. (Mechanism worth a note: the streaming blit
+appears to hold the bus grant/row in Tom's favor.) With this, every
+micro-access shape is probed and none explains the +28%:
+staging-alone exact · unconsumed-under-blit +3% · consumed-idle
+modeled · consumed-under-blit CHEAPER · polls priced · launches priced
+· DSTEN priced · density regime modeled · Jerry exonerated (ALLCULL).
+
+The residual is STRUCTURAL — per-face-loop-shaped, invisible to
+straight-line probes. Next discriminator (ALL SIM-SIDE): rebuild the
+silicon flag ladder in jsim — HALFSPAN 4.13 / NODIV 3.98 / HALFRES
+4.51 / SLITDISPLAY 4.00 (+ full 3.89, NOFILL 4.51, ALLCULL 9.55) —
+and find which flag's DELTA diverges. That names the slice (span walk
+vs div vs per-line vs OP) carrying the missing 56 ms/frame of
+geometry-path time. Remaining unprobed micro-cell for completeness:
+DRAM STORES under a running blit (vtxcache writes).
+
