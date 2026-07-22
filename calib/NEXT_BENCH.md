@@ -209,3 +209,27 @@ DRAM STORES under a running blit (vtxcache writes).
 (HALFRES arm: bar decode fails at that resolution — re-derive from
 PROFILE bars next time.)
 
+---
+
+## 2026-07-22 SESSION 3: both structural suspects REFUTED — model exact again
+
+- **fib: silicon 1.86/1.84 vs jsim 1.87 — fire-into-busy is QUEUED.**
+  jsim's async Blitter model is confirmed at the launch-into-busy shape;
+  rect-shade's overlap is real on silicon. The 8ms NOFILL-slice gap is
+  NOT launch holding.
+- **divext: silicon B 4.76 vs jsim 4.69** — integer DIV × consumed
+  staging interleave matches. ldcunder reproduced (4.96/4.97, 2nd
+  session). Full log: bench_20260722_s2.log.
+
+NEW HYPOTHESIS for the NODIV 5.8ms: geotex divides run in **DIV_OFFSET
+(16.16) mode**; every div probe so far (divhot/divsh/divext) used
+integer mode, and jsim prices both at 18 cycles. → probe p_divoff:
+divext body with DIV_OFFSET set. If 16.16 division is slower on
+silicon, that is the slice.
+NOFILL 8ms: launch-hold refuted; remaining candidates are second-order
+(blitter↔GPU row interaction — though ldcunder argues against — or the
+NOFILL arm's own workaround-path costs). Lower priority than the ~42ms
+untoggled core, which is now the dominant unknown. Next discriminator
+for the core: per-face-count scaling (ROOMCAP=N ladder in jsim vs
+silicon — is the miss per-face-constant or per-pixel?).
+
