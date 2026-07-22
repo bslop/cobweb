@@ -601,6 +601,89 @@ _p_blitrmw_s:
 	.data
 _p_blitrmw_e:
 
+
+; ── p_densN: DRAM-load DENSITY SWEEP — the mode-A regime question ──────────
+; lddram (back-to-back loads) pays 2x the model under a busy 68k; whole-game
+; anchors (sparse access) fit within 1%. No flat constant fits both. One load
+; per (2+N) instructions, N filler ALU ops: the curve locates the bus-grant
+; transition so the charge can become density-aware with measured knees.
+
+	.even
+	.globl	_p_dens2_s
+	.globl	_p_dens2_e
+_p_dens2_s:
+	.gpu
+	PROBE_PRO
+	move	r19,r10
+	.rept	64
+	load	(r10),r1
+	addqt	#4,r10
+	.rept	2
+	or	r2,r2
+	.endr
+	.endr
+	PROBE_EPI
+	.68000
+	.data
+_p_dens2_e:
+
+	.even
+	.globl	_p_dens6_s
+	.globl	_p_dens6_e
+_p_dens6_s:
+	.gpu
+	PROBE_PRO
+	move	r19,r10
+	.rept	64
+	load	(r10),r1
+	addqt	#4,r10
+	.rept	6
+	or	r2,r2
+	.endr
+	.endr
+	PROBE_EPI
+	.68000
+	.data
+_p_dens6_e:
+
+	.even
+	.globl	_p_dens14_s
+	.globl	_p_dens14_e
+_p_dens14_s:
+	.gpu
+	PROBE_PRO
+	move	r19,r10
+	.rept	64
+	load	(r10),r1
+	addqt	#4,r10
+	.rept	14
+	or	r2,r2
+	.endr
+	.endr
+	PROBE_EPI
+	.68000
+	.data
+_p_dens14_e:
+
+	.even
+	.globl	_p_dens30_s
+	.globl	_p_dens30_e
+_p_dens30_s:
+	.gpu
+	PROBE_PRO
+	move	r19,r10
+	.rept	32
+	load	(r10),r1
+	addqt	#4,r10
+	.rept	30
+	or	r2,r2
+	.endr
+	.endr
+	PROBE_EPI
+	.68000
+	.data
+_p_dens30_e:
+
 ; ── p_bcmdidle / p_bcmdbusy: what does a bwait POLL actually cost? ──────────
 ; The +30% geometry-build optimism suspect (bench 2026-07-21): a bwait spin
 ; is a stream of B_CMD reads — a Tom REGISTER read from the GPU, a shape no
