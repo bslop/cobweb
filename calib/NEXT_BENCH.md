@@ -233,3 +233,28 @@ untoggled core, which is now the dominant unknown. Next discriminator
 for the core: per-face-count scaling (ROOMCAP=N ladder in jsim vs
 silicon — is the miss per-face-constant or per-pixel?).
 
+---
+
+## 2026-07-22 SESSION 4: ROOMCAP=1 on silicon — THE MISS SCALES WITH SCENE SIZE
+
+ROOMCAP=1 (one nearest room drawn): silicon **~6.4 fps** by
+tick-calibrated tap decode (same decode reads golden 7% low → true
+6.4-6.9) vs jsim **6.00** — the +28% optimism is GONE at small scenes
+(possibly inverted). Full build: silicon 3.89 vs jsim 4.98 (+28%).
+divoff also refuted this session (4.79 ≈ integer 4.76).
+
+VERDICT: the missing ~42+ms is PER-FACE/PER-ROOM-PROPORTIONAL, not
+fixed — a cost in the drawn-face path that grows with geometry volume,
+which every straight-line probe individually prices correctly. The
+whole is costing more than the sum of its measured parts.
+
+Next probe (the meso-probe): a synthetic mini-geotex in the calib
+harness — a LOOP of {staging loads, DDA-ish dependent ALU, conditional
+branches, blit launch} per fake face, N faces. If the loop reproduces
+the per-face excess, bisect it by removing one ingredient at a time —
+the first structure-level measurement after two days of exact
+micro-probes. Candidate mechanisms the micro-probes cannot see:
+branch/jump costs in loop context (jr probe was a tight spin, not a
+branchy loop body), SRAM instruction-fetch interaction with data
+accesses, pipeline refill patterns unique to mixed code.
+
