@@ -184,3 +184,28 @@ vs div vs per-line vs OP) carrying the missing 56 ms/frame of
 geometry-path time. Remaining unprobed micro-cell for completeness:
 DRAM STORES under a running blit (vtxcache writes).
 
+---
+
+## 2026-07-22 FLAG-LADDER DECOMPOSITION (jsim vs silicon, byte-exact arms)
+
+Δms saved vs full build (jsim / silicon):
+- HALFSPAN: 16.6 / 14.9 — span walk modeled ✓ (slightly over)
+- SLIT: 7.0 / 7.1 — OP scan-out tax EXACT ✓
+- NOFILL: 27.2 / 35.3 — **fill+launch coupling under-modeled ~8 ms** →
+  prime suspect: B_CMD STORE into a still-BUSY Blitter (rect-shade fires
+  the shade blit while the span blit runs; jsim queues it free, silicon
+  likely holds the writer). The one un-probed launch shape.
+  → probe p_fireintobusy: launch 128px, immediately store a second
+  launch, time to both-complete; vs sequential-with-bwait control.
+- NODIV: 0.0 / 5.8 — **jsim thinks removing DIVs saves NOTHING; silicon
+  saves 5.8 ms** → DIV cost under-modeled in the geotex shape (divhot/
+  divsh matched — the in-kernel shape differs; suspect divider-busy
+  chains or DIV×external interaction). → probe p_divext: DIV + staging
+  load interleave, the kernel's actual pattern.
+- ALLCULL: 96.3 / 152.4 — geometry adds 152 ms on silicon, 96 in jsim;
+  after fill (8) + div (6), **~42 ms remains in the untoggled core**
+  (per-face setup + staging + walk executed for DRAWN faces). Next
+  discriminator after the two probes above.
+(HALFRES arm: bar decode fails at that resolution — re-derive from
+PROFILE bars next time.)
+
