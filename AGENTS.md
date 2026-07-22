@@ -20,6 +20,12 @@ the audio counterpart of the pixel-diff: silence/DC/clipping/dropout/
 spectral health, plus lag-aligned envelope+spectrum comparison against
 an oracle capture (works on hardware WAVs too — same analyzer).
 
+`jrom game.cof -o game.j64 [--rom game.rom]` packages a build as a
+bootable cartridge (signed universal header + jas boot stub) for
+MiSTer / BigPEmu / Virtual Jaguar / flash carts — the "runs everywhere"
+export. Validate by booting the .j64 in jagemu and pixel-diffing
+against the COF run.
+
 `sim/tools/frameview.py run.json [run2.json] -o card.html` renders the
 timing JSON as a frame-anatomy card (paid stalls vs the async Blitter
 busy ledger, pair-diff deltas, jsim-vs-silicon fps ladder) — use it

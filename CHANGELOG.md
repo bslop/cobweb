@@ -10,6 +10,24 @@ Headline: the simulator now renders OpenLara's textured 3D room, the optimizer
 proves its wins against real rendered output, and a one-character assembler bug
 that had been silently dropping conditional blocks is fixed.
 
+### 2026-07-21 — jrom: every build becomes a cartridge
+
+- **New tool `jrom`**: `jrom game.cof -o game.j64 [--rom game.rom]`
+  packages any Jaguar executable (COF/ABS/JAG/raw — ingested through
+  jag-core's own loader, so there is exactly one format authority) as a
+  bootable cartridge: SubQMod's signed universal header (vendored, the
+  block every homebrew toolchain ships — passes the real boot ROM's
+  cart authentication) + a jas-assembled boot stub at $802000 that
+  restores the RAM image and jumps to the entry. `.j64` (1MB-multiple)
+  for MiSTer's Jaguar core / BigPEmu / Virtual Jaguar / flash carts;
+  `.rom` for the Alpine convention. Validated end to end in jsim's
+  cart-boot path: OpenLara's 1.5MB image as a 2MB .j64 boots to the
+  rendered game, 175/76800 px off the COF run (copy-loop phase).
+- **jas: PC-relative EAs were silently miscompiled** — `lea label(pc)`
+  encoded the label's absolute address as the 16-bit displacement
+  instead of target−(PC+2); same for d8(pc,Xn). Caught by jrom's
+  boot-stub test running in jsim; fixed for both forms.
+
 ### 2026-07-21 — session 2: the bwait poll priced, the residual cornered
 
 Second console (USB fault turned out to be the finnicky-Skunkboard kind —

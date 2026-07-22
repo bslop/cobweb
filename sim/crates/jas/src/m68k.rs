@@ -144,7 +144,7 @@ fn parse_size(mnem: &str, default: Sz) -> (String, Sz) {
 }
 
 /// Parse an effective address operand. `sz` sizes an immediate.
-fn parse_ea(op: &str, sz: Sz, asm: &Assembler) -> Result<Ea, EncodeErr> {
+fn parse_ea(op: &str, sz: Sz, here: u32, asm: &Assembler) -> Result<Ea, EncodeErr> {
     let s = op.trim();
     let none = |mode, reg| Ea { mode, reg, ext: vec![], reloc: None, reloc_ext_off: 0 };
 
@@ -246,7 +246,13 @@ fn parse_ea(op: &str, sz: Sz, asm: &Assembler) -> Result<Ea, EncodeErr> {
             };
             match parts.as_slice() {
                 [base] if base.eq_ignore_ascii_case("pc") => {
-                    return Ok(Ea { mode: 7, reg: 2, ext: vec![disp_val as u16], reloc: None, reloc_ext_off: 0 });
+                    // `label(pc)`: the operand is a TARGET ADDRESS; the encoded
+                    // extension word is target − (here+2). (This was emitted as
+                    // the raw value — an absolute address truncated to 16 bits —
+                    // which silently miscompiled every `lea label(pc)`. Caught by
+                    // jrom's boot-stub test running in jsim.)
+                    let d = disp_val - (here as i64 + 2);
+                    return Ok(Ea { mode: 7, reg: 2, ext: vec![d as u16], reloc: None, reloc_ext_off: 0 });
                 }
                 [base] => {
                     if let Some(a) = areg(base) {
@@ -257,7 +263,8 @@ fn parse_ea(op: &str, sz: Sz, asm: &Assembler) -> Result<Ea, EncodeErr> {
                     let brief = anyreg_idx(xn).ok_or_else(|| msg(format!("bad index reg `{xn}`")))?;
                     let d8 = (disp_val as i8) as u8 as u16;
                     if base.eq_ignore_ascii_case("pc") {
-                        return Ok(Ea { mode: 7, reg: 3, ext: vec![brief | d8], reloc: None, reloc_ext_off: 0 });
+                        let d = ((disp_val - (here as i64 + 2)) as i8) as u8 as u16;
+                        return Ok(Ea { mode: 7, reg: 3, ext: vec![brief | d], reloc: None, reloc_ext_off: 0 });
                     }
                     if let Some(a) = areg(base) {
                         return Ok(Ea { mode: 6, reg: a, ext: vec![brief | d8], reloc: None, reloc_ext_off: 0 });
@@ -457,17 +464,17 @@ pub(crate) fn encode(mnem: &str, args: &str, here: u32, asm: &Assembler) -> Resu
         let is_usp = |x: &str| x.eq_ignore_ascii_case("usp");
         if is_sr(dtt) {
             // MOVE <ea>,SR  (0x46C0 | ea) — word
-            let s = parse_ea(srt, Sz::W, asm)?;
+            let s = parse_ea(srt, Sz::W, here, asm)?;
             return Ok(with_src(0x46C0 | s.field(), &s));
         }
         if is_sr(srt) {
             // MOVE SR,<ea>  (0x40C0 | ea)
-            let d = parse_ea(dtt, Sz::W, asm)?;
+            let d = parse_ea(dtt, Sz::W, here, asm)?;
             return Ok(with_src(0x40C0 | d.field(), &d));
         }
         if is_ccr(dtt) {
             // MOVE <ea>,CCR (0x44C0 | ea)
-            let s = parse_ea(srt, Sz::W, asm)?;
+            let s = parse_ea(srt, Sz::W, here, asm)?;
             return Ok(with_src(0x44C0 | s.field(), &s));
         }
         if is_usp(dtt) {
@@ -480,8 +487,8 @@ pub(crate) fn encode(mnem: &str, args: &str, here: u32, asm: &Assembler) -> Resu
             let a = areg(dtt).ok_or_else(|| msg("move from USP needs an address register"))?;
             return Ok(one(0x4E68 | a));
         }
-        let s = parse_ea(srt, sz, asm)?;
-        let d = parse_ea(dtt, sz, asm)?;
+        let s = parse_ea(srt, sz, here, asm)?;
+        let d = parse_ea(dtt, sz, here, asm)?;
         let op = (sz.move_field() << 12) | (d.reg << 9) | (d.mode << 6) | s.field();
         return Ok(assemble_words(op, &s, &d));
     }
@@ -490,12 +497,12 @@ pub(crate) fn encode(mnem: &str, args: &str, here: u32, asm: &Assembler) -> Resu
     if base == "lea" {
         let (src, an_s) = split2(args)?;
         let an = areg(&an_s).ok_or_else(|| msg("lea destination must be an address register"))?;
-        let s = parse_ea(&src, Sz::L, asm)?;
+        let s = parse_ea(&src, Sz::L, here, asm)?;
         let op = 0x41C0 | (an << 9) | s.field();
         return Ok(with_src(op, &s));
     }
     if base == "pea" {
-        let s = parse_ea(args.trim(), Sz::L, asm)?;
+        let s = parse_ea(args.trim(), Sz::L, here, asm)?;
         return Ok(with_src(0x4840 | s.field(), &s));
     }
 
@@ -507,7 +514,7 @@ pub(crate) fn encode(mnem: &str, args: &str, here: u32, asm: &Assembler) -> Resu
         "not" => Some(0x4600),
         _ => None,
     } {
-        let s = parse_ea(args.trim(), sz, asm)?;
+        let s = parse_ea(args.trim(), sz, here, asm)?;
         return Ok(with_src(opbase | (sz.field() << 6) | s.field(), &s));
     }
     if base == "swap" {
@@ -530,7 +537,7 @@ pub(crate) fn encode(mnem: &str, args: &str, here: u32, asm: &Assembler) -> Resu
     } {
         let (src, dn_s) = split2(args)?;
         let dn = dreg(&dn_s).ok_or_else(|| msg("mul/div destination must be a data register"))?;
-        let s = parse_ea(&src, Sz::W, asm)?;
+        let s = parse_ea(&src, Sz::W, here, asm)?;
         return Ok(with_src(opbase | (dn << 9) | s.field(), &s));
     }
 
@@ -551,14 +558,14 @@ pub(crate) fn encode(mnem: &str, args: &str, here: u32, asm: &Assembler) -> Resu
     // suffixes, so they fall through to their own handlers below.
     if base.len() >= 2 && base.starts_with('s') {
         if let Some(cc) = cc_field(&base[1..]) {
-            let s = parse_ea(args.trim(), Sz::B, asm)?;
+            let s = parse_ea(args.trim(), Sz::B, here, asm)?;
             return Ok(with_src(0x50C0 | (cc << 8) | s.field(), &s));
         }
     }
 
     // ── jmp / jsr ─────────────────────────────────────────────────────────────
     if base == "jmp" || base == "jsr" {
-        let s = parse_ea(args.trim(), Sz::L, asm)?;
+        let s = parse_ea(args.trim(), Sz::L, here, asm)?;
         let opbase = if base == "jsr" { 0x4E80 } else { 0x4EC0 };
         return Ok(with_src(opbase | s.field(), &s));
     }
@@ -591,7 +598,7 @@ pub(crate) fn encode(mnem: &str, args: &str, here: u32, asm: &Assembler) -> Resu
         if n == 8 {
             n = 0;
         }
-        let ea = parse_ea(&ea_s, sz, asm)?;
+        let ea = parse_ea(&ea_s, sz, here, asm)?;
         let opbase = if base == "subq" { 0x5100 } else { 0x5000 };
         return Ok(with_src(opbase | ((n as u16) << 9) | (sz.field() << 6) | ea.field(), &ea));
     }
@@ -623,7 +630,7 @@ pub(crate) fn encode(mnem: &str, args: &str, here: u32, asm: &Assembler) -> Resu
     } {
         let (imm, ea_s) = split2(args)?;
         let v = asm.eval_pub(imm.trim().trim_start_matches('#')).map_err(msg)?;
-        let ea = parse_ea(&ea_s, sz, asm)?;
+        let ea = parse_ea(&ea_s, sz, here, asm)?;
         let mut words = vec![opbase | (sz.field() << 6) | ea.field()];
         match sz {
             Sz::L => {
@@ -651,7 +658,7 @@ pub(crate) fn encode(mnem: &str, args: &str, here: u32, asm: &Assembler) -> Resu
         if let Some(dn) = dreg(&b) {
             if ea_to_dn {
                 // <ea>,Dn
-                let ea = parse_ea(&a, sz, asm)?;
+                let ea = parse_ea(&a, sz, here, asm)?;
                 let op = opbase | (dn << 9) | (sz.field() << 6) | ea.field();
                 return Ok(with_src(op, &ea));
             }
@@ -659,7 +666,7 @@ pub(crate) fn encode(mnem: &str, args: &str, here: u32, asm: &Assembler) -> Resu
         if let Some(dn) = dreg(&a) {
             if dn_to_ea {
                 // Dn,<ea>
-                let ea = parse_ea(&b, sz, asm)?;
+                let ea = parse_ea(&b, sz, here, asm)?;
                 let op = opbase | (dn << 9) | (0b100 << 6) | (sz.field() << 6) | ea.field();
                 return Ok(with_src(op, &ea));
             }
@@ -668,7 +675,7 @@ pub(crate) fn encode(mnem: &str, args: &str, here: u32, asm: &Assembler) -> Resu
         // `adda`/`suba`/`cmpa` form (GAS spells them all `add`/`sub`/`cmp`).
         if let Some(an) = areg(&b) {
             if matches!(base.as_str(), "add" | "sub" | "cmp") {
-                let ea = parse_ea(&a, sz, asm)?;
+                let ea = parse_ea(&a, sz, here, asm)?;
                 let opmode = if sz == Sz::L { 0b111 } else { 0b011 };
                 return Ok(with_src(opbase | (an << 9) | (opmode << 6) | ea.field(), &ea));
             }
@@ -685,7 +692,7 @@ pub(crate) fn encode(mnem: &str, args: &str, here: u32, asm: &Assembler) -> Resu
     } {
         let (src, an_s) = split2(args)?;
         let an = areg(&an_s).ok_or_else(|| msg("`*a` destination must be an address register"))?;
-        let ea = parse_ea(&src, sz, asm)?;
+        let ea = parse_ea(&src, sz, here, asm)?;
         // opmode: word=011, long=111
         let opmode = if sz == Sz::L { 0b111 } else { 0b011 };
         return Ok(with_src(opbase | (an << 9) | (opmode << 6) | ea.field(), &ea));
@@ -709,7 +716,7 @@ pub(crate) fn encode(mnem: &str, args: &str, here: u32, asm: &Assembler) -> Resu
             let op = 0xE000 | (cr << 9) | (dir << 8) | (sz.field() << 6) | (ir << 5) | (ty << 3) | dy;
             return Ok(one(op));
         } else if parts.len() == 1 {
-            let ea = parse_ea(parts[0].trim(), Sz::W, asm)?;
+            let ea = parse_ea(parts[0].trim(), Sz::W, here, asm)?;
             let op = 0xE0C0 | (ty << 9) | (dir << 8) | ea.field();
             return Ok(with_src(op, &ea));
         }
@@ -725,7 +732,7 @@ pub(crate) fn encode(mnem: &str, args: &str, here: u32, asm: &Assembler) -> Resu
         _ => None,
     } {
         let (bit, ea_s) = split2(args)?;
-        let ea = parse_ea(&ea_s, Sz::B, asm)?;
+        let ea = parse_ea(&ea_s, Sz::B, here, asm)?;
         if let Some(imm) = bit.trim().strip_prefix('#') {
             let n = asm.eval_pub(imm.trim()).map_err(msg)? as u16;
             let mut words = vec![0x0800 | (ty << 6) | ea.field(), n];
@@ -738,7 +745,7 @@ pub(crate) fn encode(mnem: &str, args: &str, here: u32, asm: &Assembler) -> Resu
 
     // ── movem ─────────────────────────────────────────────────────────────────
     if base == "movem" {
-        return encode_movem(args, sz, asm);
+        return encode_movem(args, sz, here, asm);
     }
 
     Err(EncodeErr::Unknown)
@@ -845,13 +852,13 @@ fn reglist_mask(list: &str) -> Option<u16> {
     Some(mask)
 }
 
-fn encode_movem(args: &str, sz: Sz, asm: &Assembler) -> Result<M68kEnc, EncodeErr> {
+fn encode_movem(args: &str, sz: Sz, here: u32, asm: &Assembler) -> Result<M68kEnc, EncodeErr> {
     let (a, b) = split2(args)?;
     let long = sz == Sz::L;
     // reg->mem if first operand is a register list, mem->reg otherwise
     if let Some(mask) = reglist_mask(&a) {
         // reg -> mem
-        let ea = parse_ea(&b, if long { Sz::L } else { Sz::W }, asm)?;
+        let ea = parse_ea(&b, if long { Sz::L } else { Sz::W }, here, asm)?;
         // for -(An) predecrement the mask bit order is reversed
         let m = if ea.mode == 4 { mask.reverse_bits() } else { mask };
         let op = 0x4880 | ((long as u16) << 6) | ea.field();
@@ -861,7 +868,7 @@ fn encode_movem(args: &str, sz: Sz, asm: &Assembler) -> Result<M68kEnc, EncodeEr
     }
     if let Some(mask) = reglist_mask(&b) {
         // mem -> reg
-        let ea = parse_ea(&a, if long { Sz::L } else { Sz::W }, asm)?;
+        let ea = parse_ea(&a, if long { Sz::L } else { Sz::W }, here, asm)?;
         let op = 0x4C80 | ((long as u16) << 6) | ea.field();
         let mut words = vec![op, mask];
         words.extend_from_slice(&ea.ext);
