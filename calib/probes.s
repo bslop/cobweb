@@ -792,6 +792,41 @@ _p_divext_s:
 	.data
 _p_divext_e:
 
+
+; ── p_divoff: divext with DIV_OFFSET (16.16) — the NODIV-slice hypothesis ───
+; geotex's perspective divides run in 16.16 mode; every prior div probe was
+; integer mode and jsim prices both at 18 cycles. If 16.16 is slower on
+; silicon, this reads above divext's 4.76 and the 5.8ms slice is named.
+	.even
+	.globl	_p_divoff_s
+	.globl	_p_divoff_e
+_p_divoff_s:
+	.gpu
+	PROBE_PRO
+	movei	#$F0211C,r7		; G_DIVCTRL: DIV_OFFSET=1 (16.16 mode)
+	moveq	#1,r8
+	store	r8,(r7)
+	move	r19,r10
+	movei	#$10001,r5
+	movei	#3,r6
+	.rept	64
+	div	r6,r5
+	load	(r10),r1
+	or	r1,r1
+	addqt	#8,r10
+	load	(r10),r2
+	or	r2,r2
+	addqt	#8,r10
+	or	r5,r5
+	movei	#$10001,r5
+	.endr
+	moveq	#0,r8			; restore integer mode for later probes
+	store	r8,(r7)
+	PROBE_EPI
+	.68000
+	.data
+_p_divoff_e:
+
 ; ── p_bcmdidle / p_bcmdbusy: what does a bwait POLL actually cost? ──────────
 ; The +30% geometry-build optimism suspect (bench 2026-07-21): a bwait spin
 ; is a stream of B_CMD reads — a Tom REGISTER read from the GPU, a shape no
