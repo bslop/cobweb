@@ -1,0 +1,20 @@
+[package]
+name = "jrom"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "jrom — package a Jaguar executable as a cartridge image (.j64 for MiSTer/BigPEmu/flash carts, .rom for Alpine)"
+
+[[bin]]
+name = "jrom"
+path = "src/main.rs"
+
+[lib]
+name = "jrom"
+path = "src/lib.rs"
+
+[dependencies]
+jas = { path = "../jas" }
+jag-core = { path = "../jag-core" }
