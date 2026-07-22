@@ -99,4 +99,9 @@ thinks shade is ~free while silicon pays 23%).
    thermal degradation as the 07-20 streak fault (cart-edge side).
    Swap the USB path and/or let the rig cool, then:
    `script -qefc "jcp -c build/calib_skunk.cof" bench.log`
+   **2026-07-21 update: console swapped — SAME drop at the same ~16KB
+   offset on the second Jaguar/Skunkboard. The fault is the USB path
+   (cable/port/hub), not either console.** Small transfers (3KB) pass;
+   sustained bulk fails — classic marginal cable. Swap the cable or
+   move to a direct motherboard port, then re-run.
 2. The density-sweep family for the mode-A DRAM regime model.
