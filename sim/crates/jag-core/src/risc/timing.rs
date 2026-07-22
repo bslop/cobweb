@@ -239,6 +239,13 @@ pub struct Pipeline {
     /// cross-master page thrash (OP/Blitter/68k); calibration will decide
     /// whether a shared row + contention model is needed.
     last_dram_row: Option<u32>,
+    /// Cycle of the most recent DRAM data access (density-regime model).
+    last_dram_cycle: u64,
+    /// Regime ticks charged at that access — subtracted from the next gap so
+    /// the model keys on ISSUE density, not post-stall spacing (silicon
+    /// charges a 1-per-4-instr stream steadily; measuring the gap after our
+    /// own added wait made the model oscillate charge/no-charge).
+    last_dram_extra: u64,
     pub stats: TimingStats,
 }
 
@@ -249,6 +256,8 @@ impl Pipeline {
         self.div_busy_until = 0;
         self.op_tax_debt = 0;
         self.last_dram_row = None;
+        self.last_dram_cycle = 0;
+        self.last_dram_extra = 0;
         self.stats = TimingStats::default();
     }
 
@@ -397,7 +406,7 @@ impl Pipeline {
     /// issue-side bus occupancy (charged to the instruction) and extra result
     /// latency (charged to the scoreboard for loads). `contended` = the 68000
     /// is on the bus (not STOPped): page-hit accesses pay the row-thrash tax.
-    pub fn ext_access(&mut self, class: MemClass, addr: u32, contended: bool) -> (u32, u32) {
+    pub fn ext_access(&mut self, class: MemClass, addr: u32, contended: bool, now: u64) -> (u32, u32) {
         let (occ, lat) = match class {
             // Blitter-register block ($F022xx): HARDWARE (p_bcmdidle, bench
             // 2026-07-21 s2): a GPU load of B_CMD costs 2.0 cycles, not the
@@ -419,8 +428,47 @@ impl Pipeline {
             }
             MemClass::ExtOther => (1, EXT_OTHER),
         };
+        // DENSITY REGIME — HARDWARE (p_dens2/6/14/30 + lddram, bench
+        // 2026-07-21 s3). The flat model was wrong in both directions:
+        //  * a QUIET-BUS access 5..10 cycles after the previous one pays
+        //    ~+2 (dens2 B 8.20 vs 6.04 modeled) — yet back-to-back
+        //    streaming (lddram B, gap ~4) pays nothing: page streaming
+        //    holds the bus, a short idle gap forces re-arbitration.
+        //    Empirical window; mechanism note in NEXT_BENCH.md.
+        //  * the 68k tax exists ONLY inside that burst window: at game
+        //    density silicon mode A == mode B exactly (dens30: 1.94 both)
+        //    while the old flat tax charged every page-hit load.
+        let mut occ = occ;
+        if class == MemClass::Dram {
+            let gap = now
+                .saturating_sub(self.last_dram_cycle)
+                .saturating_sub(self.last_dram_extra);
+            let mut extra = 0u64;
+            if (5..10).contains(&gap) {
+                occ += 2; // quiet-bus re-arbitration window
+                extra += 2;
+                if contended {
+                    occ += 6; // 68k steals the re-grant (dens2 A−B = 6.1)
+                    self.stats.contention += 6;
+                    extra += 6;
+                }
+            } else if gap < 5 && contended {
+                occ += 4; // streaming under 68k pressure (lddram A−B = 4.3)
+                self.stats.contention += 4;
+                extra += 4;
+            }
+            self.last_dram_cycle = now;
+            self.last_dram_extra = extra;
+        }
         self.stats.mem_external += (occ + lat) as u64;
         (occ, lat)
+    }
+
+    /// Ticks added to the current DRAM access by OTHER models (OP tax): they
+    /// stretch spacing without lowering issue density, so exclude them from
+    /// the next regime-gap measurement (same reason as last_dram_extra).
+    pub fn note_dram_stretch(&mut self, t: u64) {
+        self.last_dram_extra += t;
     }
 
     /// Contention tax for a page-hit DRAM LOAD under a busy 68k (occupancy
