@@ -10,6 +10,25 @@ Headline: the simulator now renders OpenLara's textured 3D room, the optimizer
 proves its wins against real rendered output, and a one-character assembler bug
 that had been silently dropping conditional blocks is fixed.
 
+### 2026-07-21 — session 2: the bwait poll priced, the residual cornered
+
+Second console (USB fault turned out to be the finnicky-Skunkboard kind —
+a bounce cleared it; the cross-console test still isolated the earlier
+drops to the USB path). Full suite re-run (`calib/bench_20260721_s2.log`):
+
+- **`bcmdidle`: 2.02 cyc/poll on silicon vs 1.01 modeled** — a GPU read
+  of a Blitter register pays one extra bus cycle. Charged for the
+  $F022xx block (Internal-class accesses now route through ext_access);
+  jsim reproduces 2.02 exactly. `bcmdbusy` matches (blit-bound, ✓).
+- blitrmw/ldunderb reproduce session 1 byte-for-byte-close on the
+  SECOND console — the calibration is rig-stable.
+- Anchor ladder: the charge closed ~2pp; geometry builds sit at a
+  UNIFORM +28% with the ALLCULL floor exact (+0.2%). The residual shape
+  matches the disclosed mode-A dense-stream DRAM nonlinearity (lddramc
+  +10% measured edge); density sweep is the remaining path. The uniform
+  bias cancels in A/B, so jsim ranks optimizations correctly today —
+  only absolute fps on dense-geometry builds reads high.
+
 ### 2026-07-21 — first remote-driven silicon session: both blit questions answered
 
 Bench run end-to-end from the desk (jcp flash + reset, jagtap eyes,

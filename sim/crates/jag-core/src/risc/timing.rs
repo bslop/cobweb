@@ -399,6 +399,14 @@ impl Pipeline {
     /// is on the bus (not STOPped): page-hit accesses pay the row-thrash tax.
     pub fn ext_access(&mut self, class: MemClass, addr: u32, contended: bool) -> (u32, u32) {
         let (occ, lat) = match class {
+            // Blitter-register block ($F022xx): HARDWARE (p_bcmdidle, bench
+            // 2026-07-21 s2): a GPU load of B_CMD costs 2.0 cycles, not the
+            // 1.0 of a local access — one extra bus cycle to cross into the
+            // Blitter's register file. The core's own $F021xx control regs
+            // stay free (unprobed, but G_FLAGS polling matching the nop
+            // baseline anchors them). This is the bwait-poll under-charge:
+            // the shaded kernels poll B_CMD thousands of times per frame.
+            MemClass::Internal if (0x00F0_2200..0x00F0_2280).contains(&addr) => (1, 0),
             MemClass::Internal => (0, 0),
             MemClass::Dram => {
                 let row = addr >> DRAM_ROW_SHIFT;
