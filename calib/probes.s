@@ -725,6 +725,73 @@ _p_ldcunderb_s:
 	.data
 _p_ldcunderb_e:
 
+
+; ── p_fireintobusy: B_CMD store while the Blitter is BUSY — held or queued? ──
+; The ~8ms fill-slice gap (flag ladder 2026-07-22). Two 64-px blits fired
+; back-to-back (2nd store lands mid-blit-1), then 1600 nops, then bwait.
+; If silicon QUEUES the store (jsim model): nops overlap both blits →
+; rep ≈ nops (~1600cyc). If silicon HOLDS the writer until blit 1 idles:
+; rep ≈ blit1 + max(blit2,nops) (~2400cyc). 40% separation, sign decides.
+	.even
+	.globl	_p_fib_s
+	.globl	_p_fib_e
+_p_fib_s:
+	.gpu
+	PROBE_PRO
+	BLITSETUP
+	movei	#BB_BCOUNT,r0
+	movei	#$00010040,r1		; 64 px
+	store	r1,(r0)
+	movei	#BB_BCMD,r2
+	movei	#BB_CMDTEX,r1
+	store	r1,(r2)			; launch 1
+	movei	#BB_BCOUNT,r0		; re-arm count (blit consumed it)
+	movei	#$00010040,r3
+	store	r3,(r0)
+	store	r1,(r2)			; launch 2 — INTO the running blit
+	.rept	800
+	nop
+	.endr
+.bwfib:
+	load	(r2),r1
+	btst	#0,r1
+	jr	eq,.bwfib
+	nop
+	PROBE_EPI
+	.68000
+	.data
+_p_fib_e:
+
+; ── p_divext: DIV interleaved with consumed staging loads (geotex per-face) ──
+; NODIV ladder slice: silicon saves 5.8ms removing divides, jsim saves 0.
+; divhot/divsh (isolated) match — the in-kernel shape is div + staging
+; loads consumed inside the shadow. Unit: div, 2 consumed DRAM loads,
+; then consume the quotient.
+	.even
+	.globl	_p_divext_s
+	.globl	_p_divext_e
+_p_divext_s:
+	.gpu
+	PROBE_PRO
+	move	r19,r10
+	movei	#$10001,r5
+	movei	#3,r6
+	.rept	64
+	div	r6,r5
+	load	(r10),r1
+	or	r1,r1
+	addqt	#8,r10
+	load	(r10),r2
+	or	r2,r2
+	addqt	#8,r10
+	or	r5,r5			; consume quotient (in/after shadow)
+	movei	#$10001,r5		; re-seed dividend
+	.endr
+	PROBE_EPI
+	.68000
+	.data
+_p_divext_e:
+
 ; ── p_bcmdidle / p_bcmdbusy: what does a bwait POLL actually cost? ──────────
 ; The +30% geometry-build optimism suspect (bench 2026-07-21): a bwait spin
 ; is a stream of B_CMD reads — a Tom REGISTER read from the GPU, a shape no
