@@ -126,3 +126,15 @@ remains the measurement path. NOTE: the uniform bias cancels in A/B
 comparisons, so jsim correctly RANKS optimizations on these kernels today;
 only absolute fps on dense-geometry builds reads ~28% high.
 
+---
+
+## READY TO FLASH (2026-07-21 night — authored off-rig, dogfooded)
+
+`p_dens2/6/14/30` — the density sweep: one DRAM load per 4/8/16/32
+instructions, modes A+B. jsim baselines (cyc/instr): A 2.51/2.25/2.13/2.07,
+B 1.51/1.76/1.87/1.94. Silicon-minus-these vs density pins the mode-A
+bus-grant regime (the last +28%). Decision rule: fit the measured curve,
+replace the flat contention constant with the density-aware form, then the
+whole anchor ladder must re-validate in one pass (floor exact, geometry
+builds within ~5%). One flash of `build/calib_skunk.cof`, any rig, any time.
+
