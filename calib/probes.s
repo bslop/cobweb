@@ -684,6 +684,45 @@ _p_dens30_s:
 	.data
 _p_dens30_e:
 
+
+; ── p_ldcunderb: CONSUMED DRAM loads WHILE a long blit holds the bus ─────────
+; THE remaining dense-geometry suspect (2026-07-22 discrimination: ALLCULL =
+; staging + Jerry + no blits = EXACT; full builds = same + busy Blitter =
+; +28%). ldunderb proved unconsumed loads ride through a blit (+3%); lddramc
+; proved consumed loads cost 6.11 B on an idle-Blitter bus. This is the
+; missing cell: geotex staging CONSUMES its loads while the async fill runs.
+; Body = lddramc's consumed pairs, launched under a 2048-px blit.
+	.even
+	.globl	_p_ldcunderb_s
+	.globl	_p_ldcunderb_e
+_p_ldcunderb_s:
+	.gpu
+	PROBE_PRO
+	BLITSETUP
+	movei	#BB_BCOUNT,r0
+	movei	#$00010400,r1		; 1024 px: loads OUTLAST the blit, so the
+					; measurement is load-bound (2048 was
+					; blit-bound and read only the drain)
+	store	r1,(r0)
+	movei	#BB_BCMD,r2
+	movei	#BB_CMDTEX,r1
+	store	r1,(r2)			; launch; do NOT bwait
+	move	r19,r10
+	.rept	128
+	load	(r10),r1
+	or	r1,r1			; consume — the stall under test
+	addqt	#8,r10
+	.endr
+.bwlcu:
+	load	(r2),r1			; drain for a clean next rep
+	btst	#0,r1
+	jr	eq,.bwlcu
+	nop
+	PROBE_EPI
+	.68000
+	.data
+_p_ldcunderb_e:
+
 ; ── p_bcmdidle / p_bcmdbusy: what does a bwait POLL actually cost? ──────────
 ; The +30% geometry-build optimism suspect (bench 2026-07-21): a bwait spin
 ; is a stream of B_CMD reads — a Tom REGISTER read from the GPU, a shape no

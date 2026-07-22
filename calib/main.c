@@ -75,6 +75,7 @@ extern char p_dens2_s[], p_dens2_e[];
 extern char p_dens6_s[], p_dens6_e[];
 extern char p_dens14_s[], p_dens14_e[];
 extern char p_dens30_s[], p_dens30_e[];
+extern char p_ldcunderb_s[], p_ldcunderb_e[];
 extern char p_bcmdidle_s[], p_bcmdidle_e[];
 extern char p_bcmdbusy_s[], p_bcmdbusy_e[];
 extern char p_ldunderb_s[], p_ldunderb_e[];
@@ -175,6 +176,7 @@ static const struct probe probes[] = {
     { "dens6   ", p_dens6_s, p_dens6_e, 0, 0, 256, DRAM_BUF },
     { "dens14  ", p_dens14_s, p_dens14_e, 0, 0, 128, DRAM_BUF },
     { "dens30  ", p_dens30_s, p_dens30_e, 0, 0, 128, DRAM_BUF },
+    { "ldcunder", p_ldcunderb_s, p_ldcunderb_e, 0, 0, 128, DRAM_BUF },
     { "bcmdidle", p_bcmdidle_s, p_bcmdidle_e, 0, 0, 128, DRAM_BUF },
     { "bcmdbusy", p_bcmdbusy_s, p_bcmdbusy_e, 0, 0, 128, DRAM_BUF },
     { "lddramop", p_lddram_s, p_lddram_e, 0, 0, 512, DRAM_BUF, 0, 0, 1, 1 },
