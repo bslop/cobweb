@@ -138,3 +138,27 @@ replace the flat contention constant with the density-aware form, then the
 whole anchor ladder must re-validate in one pass (floor exact, geometry
 builds within ~5%). One flash of `build/calib_skunk.cof`, any rig, any time.
 
+---
+
+## FIT RESULTS (2026-07-22) — regime model landed; the +28% is NOT density
+
+Two-term density model implemented (issue-density gap, re-arbitration
+window [5,10) +2 quiet / +6 contended, streaming <5 +4 contended,
+consumed-load contended latency +8, OP-stretch excluded from gaps).
+The ENTIRE probe table now fits silicon: dens2..30 A+B within 3%,
+lddram/lddramc within 5%, lddramop 2.23 vs 2.29, all prior anchors
+byte-stable. But the geometry ladder DID NOT MOVE (still +28.0/27.7/
+28.8, floor exact): the game renders with the 68k STOPped, so the
+contended terms never fire in-game. Density is refuted as the game
+residual.
+
+Remaining suspects, now sharply framed (everything else is exact):
+1. **Consumed loads WHILE the Blitter runs** — the one unprobed
+   combination (ldunderb was unconsumed; lddramc was blitter-idle).
+   The geotex kernel does exactly this: staging consumes under async
+   fill. Probe: p_ldcunderb (lddramc body + long blit in flight).
+2. **Jerry's I2S/DSP DRAM traffic vs Tom** — dsp runs 93.5% of wall
+   in-game; lddramj (parked hammer) showed nothing, but the REAL
+   pose/audio access pattern may differ. Probe: dsp running the
+   actual AUDIO_PUMP loop while Tom streams.
+

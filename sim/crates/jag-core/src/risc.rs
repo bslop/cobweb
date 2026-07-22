@@ -555,16 +555,22 @@ impl Risc {
         // Blitter-register block ($F022xx) its measured extra bus cycle and
         // returns (0,0) for everything else internal (p_bcmdidle, 2026-07-21).
         if let Some(c) = mclass {
-            let (occ, lat) = self.pipe.ext_access(c, ea.unwrap(), contended);
+            let (occ, lat) = self.pipe.ext_access(c, ea.unwrap(), contended, now);
             cost += occ;
             if is_load {
                 ext_load_lat = lat;
                 // Row-thrash contention hits loads only (stores: write-
                 // buffered, HARDWARE stdram A == B). ext_access reports the
                 // quiet page-hit cost; add the tax here.
-                if contended && occ == 1 && c == MemClass::Dram {
-                    cost += self.pipe.charge_contention_load();
-                    ext_load_lat += 4;
+                // (flat 68k occupancy tax retired 2026-07-22: the density
+                // sweep showed burst-window-only contention, charged in
+                // ext_access.) A CONSUMED load under an active 68k still pays
+                // extra RESULT latency — the consume stall releases the bus
+                // and re-acquisition is slow. HARDWARE: lddramc A−B = 2.7
+                // cyc/unit ≈ +8 on the load's latency (unconsumed streams,
+                // dens* and lddram, show no such term: A==B there).
+                if contended && c == MemClass::Dram {
+                    ext_load_lat += 8;
                 }
             }
             // Object Processor scan-out steals DRAM cycles from both RISCs every
@@ -572,7 +578,9 @@ impl Risc {
             // 68k tax this applies to stores too — the OP occupies the bus, it
             // does not thrash a row.
             if c == MemClass::Dram {
-                cost += self.pipe.charge_op_tax(bus.tom.op.phrases_per_line);
+                let optax = self.pipe.charge_op_tax(bus.tom.op.phrases_per_line);
+                cost += optax;
+                self.pipe.note_dram_stretch(optax as u64);
             }
         }
 
