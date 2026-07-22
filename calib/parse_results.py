@@ -54,6 +54,7 @@ PROBES = [
     ("ldcunder", 384, "CONSUMED DRAM loads WHILE a 128-px blit runs (geotex staging shape)"),
     ("fib", 824, "2nd B_CMD store fired INTO a running blit + 800 nops (held vs queued)"),
     ("divext", 576, "DIV + consumed staging loads interleaved (geotex per-face shape)"),
+    ("divoff", 576, "divext body in DIV_OFFSET 16.16 mode (geotex perspective divide)"),
     ("bcmdidle", 256, "B_CMD register-read poll stream, Blitter idle (bwait baseline)"),
     ("bcmdbusy", 256, "B_CMD polls WHILE a 2048-px blit runs (the bwait spin, priced)"),
     ("lddramop", 512, "DRAM load stream WHILE the OP scans a full screen (Tom<->OP contention)"),
@@ -123,7 +124,7 @@ def reps_of(name):
         "vcmod": 0x80000, "null": 8192, "nop": 1024, "move": 1024,
         "moveq": 1024, "adddep": 1024, "addind": 1024, "ldsram": 512,
         "ldidx": 512, "lddram": 512, "lddramc": 256, "ldstride": 256, "stdram": 512,
-        "blitsm": 128, "blitbg": 128, "blit1": 128, "blit2": 128, "blit4": 128, "blittex1": 128, "blittexq": 128, "blitrmw": 128, "ldunderb": 128, "ldcunder": 128, "fib": 128, "divext": 128, "bcmdidle": 128, "bcmdbusy": 128, "dens2": 256, "dens6": 256, "dens14": 128, "dens30": 128, "m68kbus": 30, "m68kreg": 30, "m68kcpy": 30, "lddramj": 512, "lddramop": 512,
+        "blitsm": 128, "blitbg": 128, "blit1": 128, "blit2": 128, "blit4": 128, "blittex1": 128, "blittexq": 128, "blitrmw": 128, "ldunderb": 128, "ldcunder": 128, "fib": 128, "divext": 128, "divoff": 128, "bcmdidle": 128, "bcmdbusy": 128, "dens2": 256, "dens6": 256, "dens14": 128, "dens30": 128, "m68kbus": 30, "m68kreg": 30, "m68kcpy": 30, "lddramj": 512, "lddramop": 512,
         "divhot": 512, "divsh": 512, "jr": 256, "mainmov": 128,
         "mainnop": 128,
     }[name]
