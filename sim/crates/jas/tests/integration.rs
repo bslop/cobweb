@@ -568,6 +568,33 @@ fn elf_obj_is_wellformed_m68k_rel() {
 }
 
 #[test]
+fn elf_obj_folds_equ_constants_not_relocs() {
+    // An `equ` CONSTANT used as an absolute destination must encode its VALUE.
+    // Object mode used to relocate every identifier in an absolute context —
+    // including equates — emitting a reloc against a non-address symbol that
+    // resolved to 0. Caught on Quake: `move.l #_vi_isr,USER0` with
+    // `USER0 .equ $100` wrote the VI handler to vector $0, and the console
+    // died in the exception catcher on the first vertical interrupt.
+    let src = "\t.68000\n\
+        \t.text\n\
+        USER0 .equ $100\n\
+        entry:\n\
+        \tmove.l #entry,USER0\n";
+    let opts = Options { org: 0x4000, start_m68k: true, object_mode: true, relocatable: true, check_hazards: false, ..Default::default() };
+    let out = assemble(src, &opts);
+    assert_eq!(out.errors(), 0, "{:#?}", out.diags);
+    let bytes = jas::elf::write(&out).expect("elf");
+    let e = Elf { b: &bytes };
+    // move.l #imm32,(abs).l = op 2 + imm 4 (relocated `entry`) + abs.l 4
+    let (_, _, toff, tsz) = e.sh(1);
+    assert_eq!(tsz, 10, ".text size");
+    assert_eq!(&bytes[toff + 6..toff + 10], &[0, 0, 1, 0], "USER0 folded to $100, not relocated");
+    // exactly ONE reloc (the #entry immediate) — none for the equate
+    let (ty, _, _, rsz) = e.sh(2);
+    assert_eq!((ty, rsz), (4, 12), "one RELA entry only");
+}
+
+#[test]
 fn elf_obj_rejects_jrisc_movei_reloc() {
     // A JRISC MOVEI of an extern has no ELF relocation type — must be a clear
     // error, not silent corruption.
