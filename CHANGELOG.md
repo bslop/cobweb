@@ -6,6 +6,16 @@ assigned at release.
 
 ## Unreleased
 
+### 2026-07-22 — hazard counters now name the address
+
+- **`JSIM_HAZARD_TRACE=1` prints the PC of every `slot_movei`/`slot_jump`
+  event to stderr.** A nonzero hazard counter means the code is wrong on
+  real silicon, but a bare count is not actionable in a 1.4 MB image.
+  First use localized Quake's 14 slot_movei events/900 frames to a single
+  PC — the DSP kernel's entry point, executed with stale delay-slot state
+  because the 68k halted the core mid-spin (a taken jump 2 of every 3
+  cycles) before every relaunch. Env-gated, off by default, deterministic.
+
 ### 2026-07-22 — CRY16 scan-out byte order was swapped
 
 - **`cry16_to_rgb` read intensity from the high byte; the TRM format is
