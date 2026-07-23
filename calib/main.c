@@ -442,6 +442,7 @@ void cal_main(void)
      * (OLP only — VMODE and the VI are left exactly as booted.) */
     op_display(0);
 
+#ifndef DIVLAT_ONLY
     for (i = 0; i < NPROBES; i++) {
 #ifdef CPUBENCH_ONLY
         if (!probes[i].cpubench)
@@ -475,6 +476,8 @@ void cal_main(void)
             goto wedged;
     }
 
+#endif /* DIVLAT_ONLY */
+
     {   /* p_divlat: DIV readable-latency by quotient correctness (round 6.2).
          * Custom result layout: 16 readbacks at DIVRES[0..15], magic at [64].
          * Prints CAL DIVLAT k=NN v=XXXXXXXX for each K; host reads the first
@@ -501,6 +504,7 @@ void cal_main(void)
         }
     }
 
+#ifndef DIVLAT_ONLY
     {   /* did the DSP hammer actually run? ($D50D50D5 = yes) */
         char *d = line;
         d = put(d, "CAL DSPMARK val=");
@@ -509,6 +513,7 @@ void cal_main(void)
         *d = 0;
         say(line);
     }
+#endif /* DIVLAT_ONLY (DSPMARK) */
     R32(HDR + 12) = MAGIC_DONE;
     say("CAL DONE\n");
 #ifdef USE_SKUNK_CONSOLE

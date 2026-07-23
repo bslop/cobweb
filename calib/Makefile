@@ -73,6 +73,20 @@ $(BUILD)/calibcpu_skunk.cof: $(COMMON) $(BUILD)/maincpu_skunk.o $(BUILD)/skunkgl
 $(BUILD)/calibcpu_sim.cof: $(COMMON) $(BUILD)/maincpu_sim.o $(LAST)
 	$(RLN) -e -rq -a 4000 x x -o $@ $(BUILD)/bootstub.o $(BUILD)/maincpu_sim.o $(BUILD)/probes.o $(LAST)
 
+$(BUILD)/maindl_skunk.o: main.c | $(BUILD)
+	$(CC68) $(CFLAGS) -DUSE_SKUNK_CONSOLE -DDIVLAT_ONLY -c -o $@ $<
+
+$(BUILD)/calibdl_skunk.cof: $(COMMON) $(BUILD)/maindl_skunk.o $(BUILD)/skunkglue.o $(BUILD)/skunk.o $(LAST)
+	$(RLN) -e -rq -a 4000 x x -o $@ $(BUILD)/bootstub.o $(BUILD)/maindl_skunk.o $(BUILD)/probes.o $(BUILD)/skunkglue.o $(BUILD)/skunk.o $(LAST)
+
+$(BUILD)/maindl_sim.o: main.c | $(BUILD)
+	$(CC68) $(CFLAGS) -DDIVLAT_ONLY -c -o $@ $<
+
+$(BUILD)/calibdl_sim.cof: $(COMMON) $(BUILD)/maindl_sim.o $(LAST)
+	$(RLN) -e -rq -a 4000 x x -o $@ $(BUILD)/bootstub.o $(BUILD)/maindl_sim.o $(BUILD)/probes.o $(LAST)
+
+
+
 $(BUILD)/hwq_main_skunk.o: hwq_main.c | $(BUILD)
 	$(CC68) $(CFLAGS) -DUSE_SKUNK_CONSOLE -c -o $@ $<
 
