@@ -258,3 +258,26 @@ branch/jump costs in loop context (jr probe was a tight spin, not a
 branchy loop body), SRAM instruction-fetch interaction with data
 accesses, pipeline refill patterns unique to mixed code.
 
+---
+
+## PRIORITY RESET (2026-07-23) — correctness before fps
+
+Mission is bidirectional faithfulness (jsim ⇄ silicon), so a dev never
+ships jsim-passing code that black-wedges on hardware. That makes the
+OpenLara round 5-6 CORRECTNESS gaps the top priority, above the +28%
+fps residual:
+
+1. **p_divlat** (built, dogfooded, committed dc59c19) — smallest K with
+   v=0x55 on silicon = true div readable-latency. ONE flash. Unblocks:
+   recalibrate Lat::DIV (currently 18), then poison early div-dest reads
+   under Silicon fidelity.
+2. **load-consumed-across-taken-jump**: lift out of the BigPEmu-only gate
+   (timing.rs read_stall) — silicon does it too (their black-wedge
+   repro). Needs the erratum's true width (their prototype over-fired on
+   every loop-back load) — a characterization probe: internal load,
+   taken jump to consumer, sweep shadow length, check VALUE.
+3. THEN the +28% concurrency residual (meso-probe).
+
+Do NOT enable poisoning blind: it over-fires on correctly-scheduled
+code (70K false positives, their round 6) — LESS faithful, not more.
+

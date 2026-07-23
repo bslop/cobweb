@@ -1,5 +1,19 @@
 # ACCURACY ORACLE — Consolidated Jaguar/BigPEmu Accuracy & Quirk Catalogue
 
+> **Mission (2026-07-23).** jsim exists to be a faithful stand-in for a real
+> Jaguar, so a developer can build the whole game against it and **not burn out
+> hardware** — and trust the result. That trust is bidirectional and is the
+> whole point: what runs in jsim must run on silicon, and what BREAKS on silicon
+> must break in jsim. A false pass is the worst failure mode — it sends a dev to
+> ship code that black-wedges on hardware, forcing them back to the physical rig
+> to find out, which is the exact burn-out cycle jsim is meant to end. So under
+> `Fidelity::Silicon`, behavioral faithfulness (serve the garbage hardware
+> serves) outranks convenience, and correctness gaps (jsim says OK / silicon
+> says broken) are the highest-severity class — above absolute-fps calibration.
+> The bar below reads "match BigPEmu" for v1; the standing goal is match SILICON,
+> with every [HW≠BIGPEMU] resolved toward hardware as probes land.
+
+
 Implementation-grade regression-oracle target list for a from-scratch,
 cycle-accurate Atari Jaguar emulator in Rust. **v1 success bar = match BigPEmu**
 on the behaviors below; hardware-only facts are flagged where BigPEmu reportedly
