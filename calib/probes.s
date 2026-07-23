@@ -922,8 +922,7 @@ _p_ldjump_s:
 	.endr
 	; --- DRAM load across a taken jump ---
 	load	(r12),r1		; DRAM load into r1 (in flight ~15cyc)
-	movei	#.tgtD,r11
-	jump	t,(r11)
+	jr	t,.tgtD			; PC-relative taken jump (position-independent)
 	nop				; delay slot
 .tgtD:
 	move	r1,r0			; consume at target — load still in flight
@@ -934,8 +933,7 @@ _p_ldjump_s:
 	.endr
 	; --- SRAM load across a taken jump ---
 	load	(r14),r2		; SRAM load into r2
-	movei	#.tgtS,r11
-	jump	t,(r11)
+	jr	t,.tgtS			; PC-relative taken jump
 	nop				; delay slot
 .tgtS:
 	move	r2,r0			; consume at target
