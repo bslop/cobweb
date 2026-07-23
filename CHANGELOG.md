@@ -6,6 +6,17 @@ assigned at release.
 
 ## Unreleased
 
+### 2026-07-22 — CRY16 scan-out byte order was swapped
+
+- **`cry16_to_rgb` read intensity from the high byte; the TRM format is
+  cyan[15:12] red[11:8] Y[7:0].** Every CRY16 title scanned out as chroma
+  noise (the previous "verified against Cybermorph" was an eyeball of
+  white credits text — white survives either byte order, so it proved
+  nothing). Verified the corrected order against a CRY framebuffer that
+  renders correctly on BigPEmu *and* real silicon (the Quake port's
+  textured E1M1 scene), plus sanity anchors $0Fyy=red ramp, $F0yy=cyan,
+  $88FF≈white; Cybermorph's credits fringe-free after. `tom/cry.rs`.
+
 Headline: the simulator now renders OpenLara's textured 3D room, the optimizer
 proves its wins against real rendered output, and a one-character assembler bug
 that had been silently dropping conditional blocks is fixed.
