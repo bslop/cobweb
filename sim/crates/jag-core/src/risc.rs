@@ -491,9 +491,15 @@ impl Risc {
         if in_slot {
             if op == 38 {
                 self.pipe.stats.slot_movei += 1;
+                if std::env::var_os("JSIM_HAZARD_TRACE").is_some() {
+                    eprintln!("HAZARD slot_movei pc={:#010X}", self.pc);
+                }
             }
             if op == 52 || op == 53 {
                 self.pipe.stats.slot_jump += 1;
+                if std::env::var_os("JSIM_HAZARD_TRACE").is_some() {
+                    eprintln!("HAZARD slot_jump pc={:#010X}", self.pc);
+                }
             }
         }
 
