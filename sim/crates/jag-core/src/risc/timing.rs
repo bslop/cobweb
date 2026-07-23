@@ -44,19 +44,26 @@ pub enum Fidelity {
     ///
     /// GOAL (set 2026-07-23): be as close to real silicon as possible —
     /// including BEHAVIOR, not just timing. Where hardware serves garbage,
-    /// Silicon should serve garbage. Two known gaps (OpenLara blitter-bug
-    /// rounds 5-6, silicon-repro'd) where we currently serve a value-correct
-    /// result hardware corrupts:
-    ///   * a read of a DIV dest BEFORE the quotient is readable (no divider
-    ///     interlock on hardware) — `read_stall` serves the settled value;
-    ///   * an internal-SRAM load consumed across a taken jump (same erratum
-    ///     as the BigPEmu-only path below, but REAL on silicon).
-    /// Both need the true readable-latency threshold before modeling — a
-    /// blind poison over-fires on correctly-scheduled code (their prototype:
-    /// 70K false positives), which would be LESS faithful, not more. Blocked
-    /// on `p_divlat` (calib/probes.s): the smallest K reading 0x55 is the
-    /// threshold. Then: recalibrate `Lat::DIV`, poison early reads, and lift
-    /// the load-across-jump check out of the BigPEmu-only gate below.
+    /// Silicon should serve garbage.
+    ///
+    /// DIV dest reads — RESOLVED, no change (p_divlat, silicon 2026-07-23):
+    /// hardware SCOREBOARDS the div destination. A read at K=0..15 after the
+    /// div returns the CORRECT quotient (both a small 0x55 and a large
+    /// 0x2AAAAAA5 with late-computed significant bits), i.e. the read waited;
+    /// `divhot` confirms the ~16-cycle consume stall (silicon 6.68 ≈ model
+    /// 6.67). So `read_stall` serving the settled value IS faithful, and
+    /// Lat::DIV=18 is correct. OpenLara round-5's "garbage on early div read"
+    /// is refuted — the real hardware failure is elsewhere (a re-issued DIV
+    /// while the divider is busy, or the load-across-jump case below). NO div
+    /// poison — that would have made jsim LESS faithful, not more.
+    ///
+    /// STILL OPEN — internal-SRAM load consumed across a TAKEN JUMP (OpenLara
+    /// round 5.2, silicon black-wedge repro): we count this only under the
+    /// BigPEmu gate below, but it is reportedly real on silicon too. Needs a
+    /// characterization probe (load, taken jump to the consumer, sweep the
+    /// shadow, check VALUE) — their poison prototype over-fired on every
+    /// loop-back load (70K false positives), so the erratum is narrower than
+    /// "any load across any jump" and must be pinned before modeling.
     Silicon,
     /// Silicon timing minus BigPEmu's documented mismodels; divergences from
     /// silicon semantics are counted, not applied.
