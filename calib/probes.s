@@ -893,6 +893,65 @@ _p_divlat_s:
 	.data
 _p_divlat_e:
 
+
+; ── p_ldjump: load consumed across a TAKEN JUMP — scoreboard held or dropped? ──
+; OpenLara round 5.2: a load in flight, then a taken jump, then the consume at
+; the target. jsim (Silicon) scoreboards -> stalls -> correct value. Hardware
+; reportedly DROPS the scoreboard across the basic-block boundary -> the consume
+; reads stale/garbage. Tests both an internal SRAM load (their claim) and a slow
+; DRAM load (unambiguous: ~15cyc latency vs ~5cyc jump overhead, still in flight
+; at the target). Seeds known truths first, settles them, then load+jump+consume.
+; result[0] = DRAM readback (truth 0xABCD1234), result[4] = SRAM readback
+; (truth 0x5678DEF0), magic at [8]. Correct == truth; garbage != truth.
+	.even
+	.globl	_p_ldjump_s
+	.globl	_p_ldjump_e
+_p_ldjump_s:
+	.gpu
+	movei	#PRMRESULT,r16
+	load	(r16),r18		; result base
+	; seed a DRAM cell and an SRAM cell with known truths, let them settle
+	movei	#$00160000,r12		; DRAM scratch
+	movei	#$ABCD1234,r13
+	store	r13,(r12)
+	movei	#$F03E00,r14		; GPU SRAM scratch (below the param block)
+	movei	#$5678DEF0,r7
+	store	r7,(r14)
+	.rept	20
+	nop				; settle both stores
+	.endr
+	; --- DRAM load across a taken jump ---
+	load	(r12),r1		; DRAM load into r1 (in flight ~15cyc)
+	movei	#.tgtD,r11
+	jump	t,(r11)
+	nop				; delay slot
+.tgtD:
+	move	r1,r0			; consume at target — load still in flight
+	store	r0,(r18)		; result[0] = DRAM readback
+	addqt	#4,r18
+	.rept	20
+	nop
+	.endr
+	; --- SRAM load across a taken jump ---
+	load	(r14),r2		; SRAM load into r2
+	movei	#.tgtS,r11
+	jump	t,(r11)
+	nop				; delay slot
+.tgtS:
+	move	r2,r0			; consume at target
+	store	r0,(r18)		; result[4] = SRAM readback
+	addqt	#4,r18
+	movei	#MAGICD,r26
+	store	r26,(r18)		; magic at result+8
+	movei	#GCTRL,r27
+	moveq	#0,r28
+	store	r28,(r27)		; stop self
+	nop
+	nop
+	.68000
+	.data
+_p_ldjump_e:
+
 ; ── p_bcmdidle / p_bcmdbusy: what does a bwait POLL actually cost? ──────────
 ; The +30% geometry-build optimism suspect (bench 2026-07-21): a bwait spin
 ; is a stream of B_CMD reads — a Tom REGISTER read from the GPU, a shape no
