@@ -57,13 +57,24 @@ pub enum Fidelity {
     /// while the divider is busy, or the load-across-jump case below). NO div
     /// poison — that would have made jsim LESS faithful, not more.
     ///
-    /// STILL OPEN — internal-SRAM load consumed across a TAKEN JUMP (OpenLara
-    /// round 5.2, silicon black-wedge repro): we count this only under the
-    /// BigPEmu gate below, but it is reportedly real on silicon too. Needs a
-    /// characterization probe (load, taken jump to the consumer, sweep the
-    /// shadow, check VALUE) — their poison prototype over-fired on every
-    /// loop-back load (70K false positives), so the erratum is narrower than
-    /// "any load across any jump" and must be pinned before modeling.
+    /// Load across a TAKEN JUMP — REFUTED for `jr` (p_ldjump, silicon
+    /// 2026-07-23): a DRAM load (still in flight ~15cyc) and an SRAM load,
+    /// each consumed at the target of a PC-relative taken jump, BOTH read
+    /// their seeded truths (ABCD1234 / 5678DEF0). An un-scoreboarded read at
+    /// the target (~5cyc after the load) would return the stale register;
+    /// reading correct means silicon STALLED across the basic-block boundary.
+    /// So the scoreboard holds across `jr`, jsim is faithful, and OpenLara
+    /// round-5.2's "garbage across the jump" does not reproduce for jr — the
+    /// second correctness claim refuted the same way as the div one.
+    ///
+    /// UNTESTED variant: an ABSOLUTE `jump (rN)` (register-indirect). Both
+    /// refuted correctness gaps used jr; if the erratum exists at all it would
+    /// be here (a different pipeline path). Low priority given two refutations
+    /// — but a runtime-address jump(rN) probe would close it definitively.
+    /// NET: jsim's correctness model (scoreboard reads, don't protect writes)
+    /// is faithful to silicon on every case probed so far; the maintainer's
+    /// real hardware failures are misattributed to scoreboard-drop (candidates:
+    /// re-issued DIV while the divider is busy, or a plain bug-13 WAW).
     Silicon,
     /// Silicon timing minus BigPEmu's documented mismodels; divergences from
     /// silicon semantics are counted, not applied.
