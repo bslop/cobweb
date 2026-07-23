@@ -995,11 +995,16 @@ impl<'a> Assembler<'a> {
             if sym.starts_with('.') || !ident_ok(sym) {
                 return false;
             }
-            // Absolute references in relocatable mode relocate every symbol so
-            // the object can be placed anywhere; otherwise only externs (or any
-            // undefined symbol in object mode) relocate.
+            // Absolute references in relocatable mode relocate label (address)
+            // symbols so the object can be placed anywhere, plus anything not
+            // defined here (externs / forward refs). `equ` CONSTANTS must fold
+            // at assembly time instead: they are values, not addresses, and
+            // deferring one to the linker emits a reloc against a non-address
+            // symbol that resolves to 0 (caught on Quake: `move.l #_vi_isr,USER0`
+            // with `USER0 .equ $100` wrote the VI handler to vector $0 — the
+            // console then died in the exception catcher on the first VI).
             if abs && self.opts.relocatable && self.opts.object_mode {
-                return true;
+                return self.label_syms.contains(sym) || !self.symbols.contains_key(sym);
             }
             !self.symbols.contains_key(sym) && (self.opts.object_mode || self.externs.contains(sym))
         };
