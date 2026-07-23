@@ -299,3 +299,24 @@ shadow length, check VALUE. If silicon corrupts (stale/garbage) where
 jsim serves correct, that is the real erratum — and lift it out of the
 BigPEmu-only gate. Then the +28% concurrency residual (meso-probe).
 
+---
+
+## LOAD-ACROSS-JUMP: REFUTED for jr (2026-07-23) — correctness ledger clears
+
+p_ldjump on silicon: dram=ABCD1234 sram=5678DEF0 — both the DRAM load
+(in flight ~15cyc, consumed ~5cyc later at the jr target) and the SRAM
+load read their seeded truths. Silicon SCOREBOARDS across the taken jr;
+jsim is faithful; round 5.2 refuted like round 5.1 (div).
+
+BOTH headline correctness claims (rounds 5.1 div, 5.2 load-jump) are now
+refuted on silicon. jsim's correctness model is faithful on every case
+probed. The maintainer's real failures (0.14fps, black-wedge) are
+misattributed — likely re-issued-DIV-while-busy (TRM bug 25) or a plain
+bug-13 WAW, not scoreboard-drop.
+
+Remaining (both LOW priority — pattern strongly favors "jsim is right"):
+- absolute jump(rN) variant of load-across-jump (needs a runtime-address
+  probe; jr used a relative jump).
+- THE MAIN EVENT: the +28% concurrency residual (meso-probe). This is now
+  the only substantial accuracy gap left — everything else fits silicon.
+
