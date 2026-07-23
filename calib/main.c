@@ -485,19 +485,21 @@ void cal_main(void)
         u32 DIVRES = 0x00102000UL;
         u32 guard = 60000000UL;
         int k;
-        R32(DIVRES + 64) = 0;
+        R32(DIVRES + 128) = 0;
         copy16(G_RAM, p_divlat_s, p_divlat_e);
         R32(PARAM_RESULT) = DIVRES;
         R32(G_PC) = G_RAM;
         R32(G_CTRL) = 1;
-        while (R32(DIVRES + 64) != MAGIC_DONE && --guard)
+        while (R32(DIVRES + 128) != MAGIC_DONE && --guard)
             ;
         for (k = 0; k < 16; k++) {
             char *d = line;
             d = put(d, "CAL DIVLAT k=");
             d = puth(d, (u32)k);
-            d = put(d, " v=");
-            d = puth(d, R32(DIVRES + (u32)k * 4));
+            d = put(d, " sm=");
+            d = puth(d, R32(DIVRES + (u32)k * 8));      /* small (want 00000055) */
+            d = put(d, " lg=");
+            d = puth(d, R32(DIVRES + (u32)k * 8 + 4));  /* large (want 2AAAAAA5) */
             d = put(d, "\n");
             *d = 0;
             say(line);

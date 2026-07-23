@@ -835,6 +835,9 @@ _p_divoff_e:
 ; with value 0x55 = true readable latency. jsim serves 0x55 at ALL K (its
 ; dest value is correct-with-stall) — so this probe DOUBLES as the silicon-
 ; vs-jsim correctness demonstrator. Writes 16 longs then magic at [64].
+	; two operands per K: small (0xFF/3=0x55, settles early) then LARGE
+	; (0x7FFFFFF0/3=0x2AAAAAA5, MSB-first significant bits computed LAST —
+	; the actual garbage-window case round 5/6 point at).
 	.macro	DIVLAT k
 	movei	#255,r5
 	movei	#3,r6
@@ -842,8 +845,17 @@ _p_divoff_e:
 	.rept	\k
 	nop
 	.endr
-	move	r5,r0			; capture K instrs after div (reads r5 -> settles it)
-	store	r0,(r18)
+	move	r5,r0
+	store	r0,(r18)		; result[K*8]     = small quotient as-read
+	addqt	#4,r18
+	movei	#$7FFFFFF0,r5
+	movei	#3,r6
+	div	r6,r5
+	.rept	\k
+	nop
+	.endr
+	move	r5,r0
+	store	r0,(r18)		; result[K*8+4]   = LARGE quotient as-read
 	addqt	#4,r18
 	.endm
 
@@ -871,7 +883,7 @@ _p_divlat_s:
 	DIVLAT	14
 	DIVLAT	15
 	movei	#MAGICD,r26
-	store	r26,(r18)		; magic at result+64, written LAST
+	store	r26,(r18)		; magic at result+128, written LAST
 	movei	#GCTRL,r27
 	moveq	#0,r28
 	store	r28,(r27)		; stop self
