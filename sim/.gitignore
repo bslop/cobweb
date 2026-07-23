@@ -6,6 +6,9 @@
 /scripts/__pycache__
 *.bin
 *.wav
+# vendored cart boot block (jrom) — *.bin above must not swallow it
+# (it already did once: 4b48e0a said "vendored", the add was silently ignored)
+!crates/jrom/src/univ.bin
 
 # Editor / OS noise
 .DS_Store
