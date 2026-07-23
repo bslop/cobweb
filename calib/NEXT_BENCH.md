@@ -281,3 +281,21 @@ fps residual:
 Do NOT enable poisoning blind: it over-fires on correctly-scheduled
 code (70K false positives, their round 6) — LESS faithful, not more.
 
+---
+
+## DIV CORRECTNESS: RESOLVED (2026-07-23) — refuted, no model change
+
+p_divlat on silicon (both operands, K=0..15): the div dest reads the
+CORRECT quotient at every K — small 0x55 AND large 0x2AAAAAA5 (late
+significant bits). Silicon SCOREBOARDS the div destination (an
+un-interlocked K=0 read would return the stale dividend 0xFF, not the
+quotient). divhot confirms the ~16-cyc consume stall (silicon 6.68 vs
+model 6.67). So jsim's read_stall/Lat::DIV=18 is already faithful;
+OpenLara round-5 "garbage on early div read" is REFUTED. No div poison.
+
+REMAINING correctness item: load-consumed-across-taken-jump (round 5.2).
+Author p_ldjump: internal SRAM load, taken jump to the consumer, sweep
+shadow length, check VALUE. If silicon corrupts (stale/garbage) where
+jsim serves correct, that is the real erratum — and lift it out of the
+BigPEmu-only gate. Then the +28% concurrency residual (meso-probe).
+
