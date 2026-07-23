@@ -1,13 +1,16 @@
-//! Hardware CRY16 → RGB decode. CRY = intensity (high byte) + Cyan/Red chroma
+//! Hardware CRY16 → RGB decode. CRY = Cyan/Red chroma (high byte) + intensity
 //! (low byte). The three 16×16 modifier ROM tables are the Jaguar's, transcribed
 //! from the Technical Reference (TRM p.28). This is the decode the OP/DAC does —
 //! independent of any game-specific palette — so it matches BigPEmu.
 //!
-//! Byte order (verified against retail framebuffers — Cybermorph et al.): the
-//! DAC takes **intensity Y in the high byte** and the CRY chroma pair in the low
-//! byte. So for a big-endian 16-bit pixel `px`:
-//! `y = px[15:8]`, `cr = px[7:4]` (row), `cy = px[3:0]` (col).
-//! `R = CRY_RED[cr][cy] * y / 255`, likewise G/B.
+//! Byte order per the TRM pixel format (C-R-Y, high to low): cyan `px[15:12]`,
+//! red `px[11:8]`, intensity `y = px[7:0]`; `R = CRY_RED[red][cyan] * y / 255`,
+//! likewise G/B. Verified against a CRY framebuffer that renders correctly on
+//! BigPEmu *and* real silicon (the Quake port's E1M1 scene): this order
+//! reproduces it; the swapped order (Y in the high byte, previously claimed
+//! from a Cybermorph eyeball — white text survives either order, so it proved
+//! nothing) renders chroma noise. Sanity anchors: `$0Fyy` = pure red ramp,
+//! `$F0yy` = cyan ramp, `$88FF` ≈ white — all three hold only in this order.
 
 #[rustfmt::skip]
 const CRY_RED: [[u8; 16]; 16] = [
@@ -72,9 +75,9 @@ const CRY_BLUE: [[u8; 16]; 16] = [
 /// Decode a 16-bit CRY pixel to 8-bit RGB.
 #[inline]
 pub fn cry16_to_rgb(px: u16) -> (u8, u8, u8) {
-    let y = ((px >> 8) & 0xFF) as u32;
-    let cr = ((px >> 4) & 0xF) as usize;
-    let cy = (px & 0xF) as usize;
+    let cy = ((px >> 12) & 0xF) as usize; // cyan nibble (column)
+    let cr = ((px >> 8) & 0xF) as usize; // red nibble (row)
+    let y = (px & 0xFF) as u32;
     let scale = |m: u8| ((m as u32 * y) / 255) as u8;
     (scale(CRY_RED[cr][cy]), scale(CRY_GREEN[cr][cy]), scale(CRY_BLUE[cr][cy]))
 }
@@ -85,15 +88,19 @@ mod tests {
 
     #[test]
     fn cry_intensity_zero_is_black() {
-        // Y is the high byte; a zero high byte is black for any chroma.
-        assert_eq!(cry16_to_rgb(0x00FF), (0, 0, 0)); // y=0, any chroma
+        // Y is the low byte; a zero low byte is black for any chroma.
+        assert_eq!(cry16_to_rgb(0xFF00), (0, 0, 0)); // y=0, any chroma
     }
 
     #[test]
-    fn cry_full_intensity_white_corner() {
-        // y=0xFF (high byte), cr=15,cy=0 (chroma 0xF0) → RED=255,GREEN=0,BLUE=0.
-        assert_eq!(cry16_to_rgb(0xFFF0), (255, 0, 0));
-        // y=0xFF, cr=0,cy=0 (chroma 0x00) → RED=0,GREEN=0,BLUE=255 (blue corner).
-        assert_eq!(cry16_to_rgb(0xFF00), (0, 0, 255));
+    fn cry_primary_corners() {
+        // $0FFF: cyan=0, red=15, y=255 → pure red.
+        assert_eq!(cry16_to_rgb(0x0FFF), (255, 0, 0));
+        // $F0FF: cyan=15, red=0, y=255 → cyan.
+        assert_eq!(cry16_to_rgb(0xF0FF), (0, 255, 255));
+        // $00FF: no chroma, y=255 → blue corner of the CRY cube.
+        assert_eq!(cry16_to_rgb(0x00FF), (0, 0, 255));
+        // $88FF: centre chroma, full intensity ≈ white.
+        assert_eq!(cry16_to_rgb(0x88FF), (247, 255, 230));
     }
 }
