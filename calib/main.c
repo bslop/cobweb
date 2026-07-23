@@ -80,6 +80,7 @@ extern char p_divext_s[], p_divext_e[];
 extern char p_divoff_s[], p_divoff_e[];
 extern char p_ldcunderb_s[], p_ldcunderb_e[];
 extern char p_divlat_s[], p_divlat_e[];
+extern char p_ldjump_s[], p_ldjump_e[];
 extern char p_bcmdidle_s[], p_bcmdidle_e[];
 extern char p_bcmdbusy_s[], p_bcmdbusy_e[];
 extern char p_ldunderb_s[], p_ldunderb_e[];
@@ -504,6 +505,30 @@ void cal_main(void)
             *d = 0;
             say(line);
         }
+    }
+
+    {   /* p_ldjump: load consumed across a taken jump (round 5.2). Prints
+         * CAL LDJUMP dram=XXXXXXXX sram=XXXXXXXX. Correct == truths
+         * (ABCD1234 / 5678DEF0); anything else = scoreboard dropped across
+         * the jump = the erratum. jsim (Silicon) serves the truths (stalls). */
+        u32 LJRES = 0x00103000UL;
+        u32 guard = 60000000UL;
+        char *d;
+        R32(LJRES + 8) = 0;
+        copy16(G_RAM, p_ldjump_s, p_ldjump_e);
+        R32(PARAM_RESULT) = LJRES;
+        R32(G_PC) = G_RAM;
+        R32(G_CTRL) = 1;
+        while (R32(LJRES + 8) != MAGIC_DONE && --guard)
+            ;
+        d = line;
+        d = put(d, "CAL LDJUMP dram=");
+        d = puth(d, R32(LJRES));
+        d = put(d, " sram=");
+        d = puth(d, R32(LJRES + 4));
+        d = put(d, "\n");
+        *d = 0;
+        say(line);
     }
 
 #ifndef DIVLAT_ONLY
