@@ -827,6 +827,60 @@ _p_divoff_s:
 	.data
 _p_divoff_e:
 
+
+; ── p_divlat: DIV quotient READABLE-LATENCY by correctness (round 6.2 ask) ──
+; The keystone the poison tool and the div calibration both need. 255/3=0x55
+; (low 8 bits computed LAST, MSB-first divider). For K=0..15 instructions
+; after the div, capture r5 as-read into result[K]. Host reads: smallest K
+; with value 0x55 = true readable latency. jsim serves 0x55 at ALL K (its
+; dest value is correct-with-stall) — so this probe DOUBLES as the silicon-
+; vs-jsim correctness demonstrator. Writes 16 longs then magic at [64].
+	.macro	DIVLAT k
+	movei	#255,r5
+	movei	#3,r6
+	div	r6,r5
+	.rept	\k
+	nop
+	.endr
+	move	r5,r0			; capture K instrs after div (reads r5 -> settles it)
+	store	r0,(r18)
+	addqt	#4,r18
+	.endm
+
+	.even
+	.globl	_p_divlat_s
+	.globl	_p_divlat_e
+_p_divlat_s:
+	.gpu
+	movei	#PRMRESULT,r16
+	load	(r16),r18		; result block base
+	DIVLAT	0
+	DIVLAT	1
+	DIVLAT	2
+	DIVLAT	3
+	DIVLAT	4
+	DIVLAT	5
+	DIVLAT	6
+	DIVLAT	7
+	DIVLAT	8
+	DIVLAT	9
+	DIVLAT	10
+	DIVLAT	11
+	DIVLAT	12
+	DIVLAT	13
+	DIVLAT	14
+	DIVLAT	15
+	movei	#MAGICD,r26
+	store	r26,(r18)		; magic at result+64, written LAST
+	movei	#GCTRL,r27
+	moveq	#0,r28
+	store	r28,(r27)		; stop self
+	nop
+	nop
+	.68000
+	.data
+_p_divlat_e:
+
 ; ── p_bcmdidle / p_bcmdbusy: what does a bwait POLL actually cost? ──────────
 ; The +30% geometry-build optimism suspect (bench 2026-07-21): a bwait spin
 ; is a stream of B_CMD reads — a Tom REGISTER read from the GPU, a shape no
