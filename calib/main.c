@@ -79,6 +79,7 @@ extern char p_fib_s[], p_fib_e[];
 extern char p_divext_s[], p_divext_e[];
 extern char p_divoff_s[], p_divoff_e[];
 extern char p_ldcunderb_s[], p_ldcunderb_e[];
+extern char p_divlat_s[], p_divlat_e[];
 extern char p_bcmdidle_s[], p_bcmdidle_e[];
 extern char p_bcmdbusy_s[], p_bcmdbusy_e[];
 extern char p_ldunderb_s[], p_ldunderb_e[];
@@ -472,6 +473,32 @@ void cal_main(void)
         report(i, 1, ok);
         if (!ok)
             goto wedged;
+    }
+
+    {   /* p_divlat: DIV readable-latency by quotient correctness (round 6.2).
+         * Custom result layout: 16 readbacks at DIVRES[0..15], magic at [64].
+         * Prints CAL DIVLAT k=NN v=XXXXXXXX for each K; host reads the first
+         * K whose value == 00000055 as the true readable latency. */
+        u32 DIVRES = 0x00102000UL;
+        u32 guard = 60000000UL;
+        int k;
+        R32(DIVRES + 64) = 0;
+        copy16(G_RAM, p_divlat_s, p_divlat_e);
+        R32(PARAM_RESULT) = DIVRES;
+        R32(G_PC) = G_RAM;
+        R32(G_CTRL) = 1;
+        while (R32(DIVRES + 64) != MAGIC_DONE && --guard)
+            ;
+        for (k = 0; k < 16; k++) {
+            char *d = line;
+            d = put(d, "CAL DIVLAT k=");
+            d = puth(d, (u32)k);
+            d = put(d, " v=");
+            d = puth(d, R32(DIVRES + (u32)k * 4));
+            d = put(d, "\n");
+            *d = 0;
+            say(line);
+        }
     }
 
     {   /* did the DSP hammer actually run? ($D50D50D5 = yes) */
