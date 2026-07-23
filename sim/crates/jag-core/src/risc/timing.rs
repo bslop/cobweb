@@ -41,6 +41,22 @@ pub enum Fidelity {
     Functional,
     /// Full pipeline truth: scoreboard stalls, WAW landing order, indexed-store
     /// erratum, div shadow, jump refill, external fetch/page costs.
+    ///
+    /// GOAL (set 2026-07-23): be as close to real silicon as possible —
+    /// including BEHAVIOR, not just timing. Where hardware serves garbage,
+    /// Silicon should serve garbage. Two known gaps (OpenLara blitter-bug
+    /// rounds 5-6, silicon-repro'd) where we currently serve a value-correct
+    /// result hardware corrupts:
+    ///   * a read of a DIV dest BEFORE the quotient is readable (no divider
+    ///     interlock on hardware) — `read_stall` serves the settled value;
+    ///   * an internal-SRAM load consumed across a taken jump (same erratum
+    ///     as the BigPEmu-only path below, but REAL on silicon).
+    /// Both need the true readable-latency threshold before modeling — a
+    /// blind poison over-fires on correctly-scheduled code (their prototype:
+    /// 70K false positives), which would be LESS faithful, not more. Blocked
+    /// on `p_divlat` (calib/probes.s): the smallest K reading 0x55 is the
+    /// threshold. Then: recalibrate `Lat::DIV`, poison early reads, and lift
+    /// the load-across-jump check out of the BigPEmu-only gate below.
     Silicon,
     /// Silicon timing minus BigPEmu's documented mismodels; divergences from
     /// silicon semantics are counted, not applied.
