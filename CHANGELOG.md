@@ -6,6 +6,12 @@ assigned at release.
 
 ## Unreleased
 
+## v0.1.0 — 2026-07-24
+
+First tagged baseline: the JRISC/68k toolchain (jas, jsim, jopt, jtest,
+jcc68k, jln) with the silicon-calibration suite. Anchors the "before" point
+for the ongoing Skunkboard MMULT/hardware-fidelity work.
+
 ### 2026-07-24 — jsim MMULT read the wrong half of the matrix word
 
 - **`jsim`: MMULT read the matrix operand from the HIGH 16 bits of each
