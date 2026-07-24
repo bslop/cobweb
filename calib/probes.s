@@ -1814,6 +1814,89 @@ _p_mm_mm2s_s:
 	.data
 _p_mm_mm2s_e:
 
+; ── p_mm_mm3s: MTXA AUTO-ADVANCE confirmation (2026-07-24 round 5) ──────────
+; mm2s showed MTXA set once -> m1=row0(32), m2=row1(320): MMULT advances
+; MTXADDR by one row per call. This issues THREE settled mmults with MTXA set
+; ONCE and reads m2,m3 -> confirms the 3-step progression + constant stride.
+;   v0 = m2 = row1 = 140 (320)   v1 = m3 = row2 = C80 (3200)
+; jsim (no auto-advance yet) reads row0 thrice -> v0=v1=00000020: this arm is
+; the silicon discriminator for the pending isa.rs::mmult auto-advance fix.
+	.even
+	.globl	_p_mm_mm3s_s
+	.globl	_p_mm_mm3s_e
+_p_mm_mm3s_s:
+	.gpu
+	movei	#PRMRESULT,r14
+	load	(r14),r12
+	movei	#$F03A00,r1		; rows 0,1,2 LOW half
+	movei	#$00000001,r0
+	store	r0,(r1)
+	movei	#$F03A04,r1
+	movei	#$00000002,r0
+	store	r0,(r1)
+	movei	#$F03A08,r1
+	movei	#$00000003,r0
+	store	r0,(r1)
+	movei	#$F03A0C,r1
+	movei	#$0000000A,r0
+	store	r0,(r1)
+	movei	#$F03A10,r1
+	movei	#$00000014,r0
+	store	r0,(r1)
+	movei	#$F03A14,r1
+	movei	#$0000001E,r0
+	store	r0,(r1)
+	movei	#$F03A18,r1
+	movei	#$00000064,r0
+	store	r0,(r1)
+	movei	#$F03A1C,r1
+	movei	#$000000C8,r0
+	store	r0,(r1)
+	movei	#$F03A20,r1
+	movei	#$0000012C,r0
+	store	r0,(r1)
+	movei	#$F02104,r1		; MTXC = 3
+	moveq	#3,r0
+	store	r0,(r1)
+	movei	#$00050004,r2
+	moveta	r2,r2
+	moveq	#6,r3
+	moveta	r3,r3
+	movei	#$F02108,r9
+	movei	#$A00,r10		; MTXA set ONCE (row0)
+	store	r10,(r9)
+	nop
+	nop
+	mmult	r2,r4			; m1 = row0 = 32  (MTXA -> row1)
+	.rept	8
+	nop
+	.endr
+	mmult	r2,r5			; m2 = row1 = 320 (MTXA -> row2)
+	.rept	8
+	nop
+	.endr
+	mmult	r2,r6			; m3 = row2 = 3200
+	.rept	16
+	nop
+	.endr
+	store	r5,(r12)		; v0 = m2 (140 = row1)
+	addqt	#4,r12
+	store	r6,(r12)		; v1 = m3 (C80 = row2)
+	addqt	#8,r12
+	.rept	16
+	nop
+	.endr
+	movei	#MAGICD,r26
+	store	r26,(r12)
+	movei	#GCTRL,r27
+	moveq	#0,r28
+	store	r28,(r27)
+	nop
+	nop
+	.68000
+	.data
+_p_mm_mm3s_e:
+
 ; ── p_mmultw: width-3 MMULT throughput (timing, COBWEB_REQ item 3) ──────────
 ; Standard VC-timed probe: MTXC=3, MTXA at the safe $A00 region, then a run of
 ; back-to-back width-3 MMULTs. Runs in bank 0 so the vector regs are whatever —

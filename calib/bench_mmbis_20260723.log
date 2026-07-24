@@ -1,7 +1,7 @@
-Script started on 2026-07-23 23:30:21-06:00 [COMMAND="/home/jvilla/jaguar-tools/bin/jcp -c build/calibdl_skunk.cof" <not executed on terminal>]
+Script started on 2026-07-24 10:28:58-06:00 [COMMAND="/home/jvilla/jaguar-tools/bin/jcp -c build/calibdl_skunk.cof" <not executed on terminal>]
 jcp v02.04.02 built on Jul  6 2026
 
-COFF File:  Skip 168 bytes, base addr is $4000, length is 44896 bytes
+COFF File:  Skip 168 bytes, base addr is $4000, length is 46304 bytes
 Sending...|/-\|/-\.|/- 
 \|Jag accepted start request at $00004000.
  
@@ -32,3 +32,7 @@ CAL MMBIS w3s v0=00000000 v1=00000000
 CAL MMBIS mmhi v0=00000000 v1=00000000
 CAL MMBIS mmlo v0=00000020 v1=00000000
 CAL MMBIS mrd v0=00010000 v1=00000000
+CAL MMBIS mmovf v0=FFFE0000 v1=00000000
+CAL MMBIS mmrow v0=00000020 v1=FFFE0000
+CAL MMBIS mm2s v0=00000020 v1=00000140
+CAL MMBIS mm3s v0=00000140 v1=00000C80

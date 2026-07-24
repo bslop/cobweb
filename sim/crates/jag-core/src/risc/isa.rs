@@ -518,6 +518,14 @@ fn mmult(core: &mut Risc, bus: &mut Bus, r1: usize, r2: usize, b: usize) {
     let res = acc as u32;
     core.set_reg(b, r2, res);
     core.set_zn(res);
+    // MMULT auto-advances MTXADDR to the next row/column, so a run of MMULTs
+    // with MTXA written ONCE walks the matrix — the systolic array's purpose.
+    // By-row advance = one row = width*4 bytes: silicon-confirmed (2026-07-24,
+    // p_mm_mm2s/mm3s: MTXA set once -> rows 0,1,2 read 32/320/3200). An
+    // explicit later write to MTXA (per-row re-point) overrides this, as it
+    // must. By-column advance = 4 (next column) is inferred, UNVERIFIED.
+    let advance = if by_column { 4 } else { (width as u32) * 4 };
+    core.mtxa = core.mtxa.wrapping_add(advance);
 }
 
 /// MTOI: mantissa-to-integer — extract the 24-bit mantissa of an IEEE-754
