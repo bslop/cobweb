@@ -950,6 +950,148 @@ _p_ldjump_s:
 	.data
 _p_ldjump_e:
 
+; ── p_mmult: MMULT (op 54) operand-layout / bank / correctness (MMULT_SCOPE) ──
+; Silicon-validate the matrix unit before we build the vertex-transform on it.
+; v2 (2026-07-23): v1 returned all-zero on silicon. Two spec facts (RISC_ISA
+; §7.2) drove this rewrite: (1) "MMULT must NOT be preceded by a LOAD or STORE"
+; (TRM p.40) — v1 had `store mtxa; nop; nop; mmult`, the mtxa store sat in the
+; illegal shadow. Now: set mtxa, then 8 nops, then mmult; results held in regs
+; and stored to DRAM only at the END (no store adjacent to any mmult). (2) Rs is
+; the BANK-1 operand — so this run also READS BACK bank1 (movefa) and the SRAM
+; matrix, so a zero result is self-diagnosing.
+; Seeds an asymmetric 3x3 (10..90 row-major) and vector (2,3,5); computes R*v as
+; 3 MMULTs. Predict (jsim, row-major, mtxa=abs, vector bank1): 230,530,830 =
+; 000000E6 00000212 0000033E.  result longs:
+;   [0,4,8]  = mmult rows 0,1,2         (want E6, 212, 33E)
+;   [12]     = bank1.r10 readback       (want 00030002 -> moveta populated bank1)
+;   [16]     = bank1.r11 readback       (want 00000005)
+;   [20]     = SRAM matrix[0] readback  (want 000A0000 -> matrix store landed)
+;   [24]     = SRAM matrix[1] readback  (want 00140000)
+;   magic at [28].
+; Diagnosis if rows still 0: [12]/[16]=0 => bank1/moveta broken (run in bank1);
+; [20]/[24]=0 => SRAM matrix write/read failed; operands OK but rows 0 => MMULT
+; compute/hazard issue.
+MTXBASE		equ	$F03F00		; 3x3 scratch in GPU SRAM (below the PRM slots)
+MTXCREG		equ	$F02104		; G_MTXC: MWIDTH in low 4 bits, bit4=column-major
+MTXAREG		equ	$F02108		; G_MTXA: matrix address in GPU local RAM
+	.even
+	.globl	_p_mmult_s
+	.globl	_p_mmult_e
+_p_mmult_s:
+	.gpu
+	movei	#PRMRESULT,r16
+	load	(r16),r18		; result block base (DRAM)
+	; --- write the asymmetric 3x3 into SRAM, row-major, one s16 per long in
+	;     the high half (MMULT read16 at 4-byte stride reads the high 16 bits) ---
+	movei	#MTXBASE,r0
+	movei	#$000A0000,r1		; 10
+	store	r1,(r0)
+	addqt	#4,r0
+	movei	#$00140000,r1		; 20
+	store	r1,(r0)
+	addqt	#4,r0
+	movei	#$001E0000,r1		; 30
+	store	r1,(r0)
+	addqt	#4,r0
+	movei	#$00280000,r1		; 40
+	store	r1,(r0)
+	addqt	#4,r0
+	movei	#$00320000,r1		; 50
+	store	r1,(r0)
+	addqt	#4,r0
+	movei	#$003C0000,r1		; 60
+	store	r1,(r0)
+	addqt	#4,r0
+	movei	#$00460000,r1		; 70
+	store	r1,(r0)
+	addqt	#4,r0
+	movei	#$00500000,r1		; 80
+	store	r1,(r0)
+	addqt	#4,r0
+	movei	#$005A0000,r1		; 90
+	store	r1,(r0)
+	; --- MWIDTH = 3, row-major (bit4 = 0) ---
+	movei	#MTXCREG,r16
+	moveq	#3,r1
+	store	r1,(r16)
+	; --- vector (2,3,5) into bank0 r10,r11 AND bank1 (moveta) ---
+	movei	#$00030002,r10		; v0=2 (low), v1=3 (high)
+	moveq	#5,r11			; v2=5
+	moveta	r10,r10			; bank1.r10 = (2,3)
+	moveta	r11,r11			; bank1.r11 = 5
+	movei	#MTXAREG,r17		; r17 = G_MTXA for all rows below
+	.rept	16
+	nop				; settle matrix stores + control + moveta
+	.endr
+	; --- v4: BIWN VERIFIED IDIOM — `store (G_MTXA); mmult` BACK-TO-BACK. The
+	;     mtxa store ARMS the systolic unit; MMULT must immediately follow with
+	;     NO intervening instr. v3's 8-nop gap => MMULT no-op = 0. (Black Ice
+	;     White Noise engine.bin $52E0 does exactly `store r12,(r6); mmult r7,r0`
+	;     then reads Rd via `move r0,r3` — so Rd IS written on silicon.) RESMAC
+	;     kept as a secondary MAC read. ---
+	; ROW 0
+	movei	#MTXBASE,r2
+	store	r2,(r17)		; arm G_MTXA -> row0
+	mmult	r10,r3			; r3 = Rd (row0 . vec) — immediately after the store
+	resmac	r6			; r6 = MAC (secondary)
+	; ROW 1
+	movei	#MTXBASE+12,r2
+	store	r2,(r17)		; arm G_MTXA -> row1
+	mmult	r10,r4
+	resmac	r7
+	; ROW 2
+	movei	#MTXBASE+24,r2
+	store	r2,(r17)		; arm G_MTXA -> row2
+	mmult	r10,r5
+	resmac	r8
+	; --- INDEPENDENT manual MAC chain: acc = 2*10 + 3*20 + 5*30 = 230.
+	;     No matrix control regs involved — proves whether the GPU MAC + RESMAC
+	;     path works at all. Operands preloaded (no instr may fall BETWEEN the
+	;     imultn/imacn/resmac ops — TRM MAC-forwarding rule). ---
+	movei	#2,r20
+	movei	#10,r21
+	movei	#3,r22
+	movei	#20,r23
+	movei	#5,r24
+	movei	#30,r25
+	imultn	r21,r20			; mac = 2*10 = 20
+	imacn	r23,r22			; mac += 3*20 = 80
+	imacn	r25,r24			; mac += 5*30 = 230
+	resmac	r9			; r9 = 230 (E6) if MAC+RESMAC work
+	; --- sanity: bank1 vector + SRAM matrix (confirmed OK in v2, keep 1 each) ---
+	movefa	r10,r13			; r13 = bank1.r10 (want 00030002)
+	movei	#MTXBASE,r14
+	load	(r14),r14		; r14 = matrix[0] (want 000A0000)
+	; --- store everything ---
+	store	r3,(r18)		; [0]  MMULT row0 Rd
+	addqt	#4,r18
+	store	r4,(r18)		; [4]  MMULT row1 Rd
+	addqt	#4,r18
+	store	r5,(r18)		; [8]  MMULT row2 Rd
+	addqt	#4,r18
+	store	r6,(r18)		; [12] RESMAC after row0 (MAC)
+	addqt	#4,r18
+	store	r7,(r18)		; [16] RESMAC after row1 (MAC)
+	addqt	#4,r18
+	store	r8,(r18)		; [20] RESMAC after row2 (MAC)
+	addqt	#4,r18
+	store	r9,(r18)		; [24] manual MAC chain (want E6)
+	addqt	#4,r18
+	store	r13,(r18)		; [28] bank1.r10 (want 00030002)
+	addqt	#4,r18
+	store	r14,(r18)		; [32] matrix[0] (want 000A0000)
+	addqt	#4,r18
+	movei	#MAGICD,r26
+	store	r26,(r18)		; [36] done magic — written LAST
+	movei	#GCTRL,r27
+	moveq	#0,r28
+	store	r28,(r27)		; stop self
+	nop
+	nop
+	.68000
+	.data
+_p_mmult_e:
+
 ; ── p_face: synthetic per-face compute (divides + DDA + edge branches) ──
 ; The +28% discriminator (2026-07-23): the kernel is compute-bound on
 ; silicon (per-face compute > blit, spin exits free) but spin-bound in

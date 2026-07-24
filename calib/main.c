@@ -81,6 +81,7 @@ extern char p_divoff_s[], p_divoff_e[];
 extern char p_ldcunderb_s[], p_ldcunderb_e[];
 extern char p_divlat_s[], p_divlat_e[];
 extern char p_ldjump_s[], p_ldjump_e[];
+extern char p_mmult_s[], p_mmult_e[];
 extern char p_face_s[], p_face_e[];
 extern char p_facenb_s[], p_facenb_e[];
 extern char p_facebr_s[], p_facebr_e[];
@@ -552,6 +553,47 @@ void cal_main(void)
         d = puth(d, R32(LJRES));
         d = put(d, " sram=");
         d = puth(d, R32(LJRES + 4));
+        d = put(d, "\n");
+        *d = 0;
+        say(line);
+    }
+
+    {   /* p_mmult v3: MMULT Rd vs RESMAC(MAC) vs independent manual MAC chain.
+         * v2 showed operands OK (b1/mx correct) but MMULT Rd = 0. This splits:
+         *   rd  = MMULT dest reg   (want E6,212,33E — 0 => MMULT doesn't write Rd)
+         *   mac = RESMAC after each MMULT (want E6,212,33E => MMULT->MAC; need
+         *         explicit RESMAC in the kernel)
+         *   man = manual IMULTN/IMACN/RESMAC chain (want E6 => MAC+RESMAC work,
+         *         so a 0 mac above means MMULT itself never accumulated). */
+        u32 MMRES = 0x00104000UL;
+        u32 guard = 60000000UL;
+        char *d;
+        R32(MMRES + 36) = 0;
+        copy16(G_RAM, p_mmult_s, p_mmult_e);
+        R32(PARAM_RESULT) = MMRES;
+        R32(G_PC) = G_RAM;
+        R32(G_CTRL) = 1;
+        while (R32(MMRES + 36) != MAGIC_DONE && --guard)
+            ;
+        d = line;
+        d = put(d, "CAL MMULT rd=");
+        d = puth(d, R32(MMRES));
+        d = put(d, ",");
+        d = puth(d, R32(MMRES + 4));
+        d = put(d, ",");
+        d = puth(d, R32(MMRES + 8));
+        d = put(d, " mac=");
+        d = puth(d, R32(MMRES + 12));
+        d = put(d, ",");
+        d = puth(d, R32(MMRES + 16));
+        d = put(d, ",");
+        d = puth(d, R32(MMRES + 20));
+        d = put(d, " man=");
+        d = puth(d, R32(MMRES + 24));
+        d = put(d, " b1=");
+        d = puth(d, R32(MMRES + 28));
+        d = put(d, " mx=");
+        d = puth(d, R32(MMRES + 32));
         d = put(d, "\n");
         *d = 0;
         say(line);
