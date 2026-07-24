@@ -6,6 +6,18 @@ assigned at release.
 
 ## Unreleased
 
+### 2026-07-24 — jas: refuse two adjacent MMULTs (silicon hard-wedge)
+
+- **`jas` now errors on two immediately-consecutive MMULTs.** They hang the
+  GPU on real Tom (bug 23: bus held, only a power-cycle recovers) — the first
+  MMULT's systolic MAC has not drained when the second issues. Silicon-proven
+  (`calib` `p_mm_mm2` wedged at a zero-instruction gap; `p_mm_mm2s` ran clean
+  with an 8-instruction gap). The fix-it points at a settle, and notes that
+  MTXADDR auto-advances so a run of MMULTs with MTXA set once still walks the
+  matrix. A NOP (or any instruction) between the pair clears the error. This
+  is the assemble-time guard for the exact "passes in jsim, wedges on silicon"
+  class jas exists to catch — a likely cause of OpenLara's RUNBATCH crash.
+
 ### 2026-07-24 — jsim MMULT: MTXADDR auto-advance modeled
 
 - **`jsim`: MMULT now auto-advances MTXADDR by one row (`MWIDTH`×4) per call**,
