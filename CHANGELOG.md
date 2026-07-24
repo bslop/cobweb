@@ -6,6 +6,20 @@ assigned at release.
 
 ## Unreleased
 
+### 2026-07-24 — jsim MMULT: MTXADDR auto-advance modeled
+
+- **`jsim`: MMULT now auto-advances MTXADDR by one row (`MWIDTH`×4) per call**,
+  so a run of MMULTs with `MTXA` written once walks the matrix — the systolic
+  array's intended use for a matrix×vector product. jsim previously left
+  `MTXA` fixed and recomputed row 0 every call. Silicon-confirmed on a
+  Skunkboard (`p_mm_mm2s`/`p_mm_mm3s`: `MTXA` set once → successive MMULTs
+  read rows 0,1,2 = 32/320/3200); jsim now byte-matches, 42 jag-core tests
+  pass. An explicit `MTXA` write between MMULTs still overrides (per-row
+  re-point). By-column advance is inferred (`+4`), UNVERIFIED. Also recorded
+  (silicon): MAC resets per MMULT, and **two adjacent MMULTs hard-wedge the
+  GPU** (bug 23) — a settle is required between them. ISA §7.2 updated. This
+  closes the MMULT Phase-0 gate for OpenLara's vertex transform.
+
 ## v0.1.0 — 2026-07-24
 
 First tagged baseline: the JRISC/68k toolchain (jas, jsim, jopt, jtest,
