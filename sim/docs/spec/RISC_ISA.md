@@ -438,8 +438,24 @@ RESMAC` sequence of length = `MWIDTH` (3..15), producing one dot-product term:
   holding the first two elements of the row.
 - **The other matrix operand is in local RAM**, addressed by **`MTXADDR`**
   (matrix address register), traversed by **row** or **column** per `MADDW`.
+  Each element is **one 32-bit word (stride 4)**, and the value is taken from
+  the **LOW 16 bits** of that word, sign-extended (the MAC datapath is s16,
+  §7.1). *(Silicon 2026-07-23, `p_mm_mmlo`: value in the low half → correct,
+  high half → 0. jsim originally read the high half — fixed.)*
+- **`MTXADDR` AUTO-ADVANCES by one row/column per MMULT** (by-row: += `MWIDTH`×4
+  bytes), so a run of MMULTs with `MTXADDR` written **once** walks the matrix —
+  the systolic array's purpose (set `MTXA`, issue `MWIDTH` MMULTs, collect the
+  matrix×vector product). An explicit write to `MTXA` between MMULTs overrides
+  the advance (per-row re-point). *(Silicon 2026-07-24, `p_mm_mm2s`/`p_mm_mm3s`:
+  `MTXA` set once → successive MMULTs read rows 0,1,2 = 32/320/3200. by-column
+  advance is inferred, UNVERIFIED.)*
+- **Two ADJACENT MMULTs hard-wedge real Tom** (bug 23, bus held; power-cycle to
+  recover). Separate consecutive MMULTs by a settle (≥ a few instructions; an
+  8-nop gap is safe, zero is not). *(Silicon 2026-07-23, `p_mm_mm2` vs
+  `p_mm_mm2s`.)*
 - **`MWIDTH`** = number of multiply/accumulate terms (matrix width 3..15).
-- Result is written to `Rd` in the **currently selected** bank.
+- Result is written to `Rd` in the **currently selected** bank; the MAC
+  **resets per MMULT** (back-to-back MMULTs do not accumulate onto each other).
 - Flags reflect the **final** MAC: Z, N, and C=carry-out (TRM p.50).
 - **Atomic:** interrupts locked out for the whole MMULT (TRM p.39).
 - **Illegal combo (TRM p.40):** `MMULT` must **not** be preceded by a `LOAD` or
