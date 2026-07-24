@@ -81,6 +81,10 @@ extern char p_divoff_s[], p_divoff_e[];
 extern char p_ldcunderb_s[], p_ldcunderb_e[];
 extern char p_divlat_s[], p_divlat_e[];
 extern char p_ldjump_s[], p_ldjump_e[];
+extern char p_ldjumprn_s[], p_ldjumprn_e[];
+extern char p_mmult_s[], p_mmult_e[];
+extern char p_mmultw_s[], p_mmultw_e[];
+extern char p_mmulta_s[], p_mmulta_e[];
 extern char p_face_s[], p_face_e[];
 extern char p_facenb_s[], p_facenb_e[];
 extern char p_facebr_s[], p_facebr_e[];
@@ -190,6 +194,8 @@ static const struct probe probes[] = {
     { "fib     ", p_fib_s, p_fib_e, 0, 0, 128, DRAM_BUF },
     { "divext  ", p_divext_s, p_divext_e, 0, 0, 128, DRAM_BUF },
     { "divoff  ", p_divoff_s, p_divoff_e, 0, 0, 128, DRAM_BUF },
+    { "mmultw  ", p_mmultw_s, p_mmultw_e, 0, 0, 256, DRAM_BUF },
+    { "mmulta  ", p_mmulta_s, p_mmulta_e, 0, 0, 256, DRAM_BUF },
     { "face    ", p_face_s, p_face_e, 0, 0, 128, DRAM_BUF },
     { "facenb  ", p_facenb_s, p_facenb_e, 0, 0, 128, DRAM_BUF },
     { "facebr  ", p_facebr_s, p_facebr_e, 0, 0, 128, DRAM_BUF },
@@ -552,6 +558,64 @@ void cal_main(void)
         d = puth(d, R32(LJRES));
         d = put(d, " sram=");
         d = puth(d, R32(LJRES + 4));
+        d = put(d, "\n");
+        *d = 0;
+        say(line);
+    }
+
+    {   /* p_ldjumprn: load consumed across an ABSOLUTE jump (rN) — the one edge
+         * p_ldjump left untested (COBWEB_REQ_jumprn_load_scoreboard_probe.md).
+         * Prints CAL LDJUMPRN dram=XXXXXXXX sram=XXXXXXXX. Correct == truths
+         * (ABCD1234 / 5678DEF0) = silicon scoreboards across jump(rN) too;
+         * stale/garbage = the erratum is real for the absolute-jump form. */
+        u32 LJRES = 0x00103100UL;
+        u32 guard = 60000000UL;
+        char *d;
+        R32(LJRES + 8) = 0;
+        copy16(G_RAM, p_ldjumprn_s, p_ldjumprn_e);
+        R32(PARAM_RESULT) = LJRES;
+        R32(G_PC) = G_RAM;
+        R32(G_CTRL) = 1;
+        while (R32(LJRES + 8) != MAGIC_DONE && --guard)
+            ;
+        d = line;
+        d = put(d, "CAL LDJUMPRN dram=");
+        d = puth(d, R32(LJRES));
+        d = put(d, " sram=");
+        d = puth(d, R32(LJRES + 4));
+        d = put(d, "\n");
+        *d = 0;
+        say(line);
+    }
+
+    {   /* p_mmult: MMULT operand layout / s16 / MAC on real Tom (Phase-0 gate,
+         * COBWEB_REQ_mmult_silicon_probe.md). Prints
+         *   CAL MMULT o0=.. o1=.. o2=.. ovf=.. m1=.. m2=..
+         * Expected if silicon == jsim: 20 140 C80 FFFE0000 20 20 (hex).
+         * o0=654 (0x28E) instead of 32 => column/transpose layout; m2==2*m1 =>
+         * MMULT accumulates rather than resets. */
+        u32 MMRES = 0x00104000UL;
+        u32 guard = 60000000UL;
+        char *d;
+        R32(MMRES + 32) = 0;
+        copy16(G_RAM, p_mmult_s, p_mmult_e);
+        R32(G_PC) = G_RAM;
+        R32(G_CTRL) = 1;
+        while (R32(MMRES + 32) != MAGIC_DONE && --guard)
+            ;
+        d = line;
+        d = put(d, "CAL MMULT o0=");
+        d = puth(d, R32(MMRES));
+        d = put(d, " o1=");
+        d = puth(d, R32(MMRES + 4));
+        d = put(d, " o2=");
+        d = puth(d, R32(MMRES + 8));
+        d = put(d, " ovf=");
+        d = puth(d, R32(MMRES + 12));
+        d = put(d, " m1=");
+        d = puth(d, R32(MMRES + 16));
+        d = put(d, " m2=");
+        d = puth(d, R32(MMRES + 20));
         d = put(d, "\n");
         *d = 0;
         say(line);
