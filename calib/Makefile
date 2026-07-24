@@ -85,6 +85,20 @@ $(BUILD)/maindl_sim.o: main.c | $(BUILD)
 $(BUILD)/calibdl_sim.cof: $(COMMON) $(BUILD)/maindl_sim.o $(LAST)
 	$(RLN) -e -rq -a 4000 x x -o $@ $(BUILD)/bootstub.o $(BUILD)/maindl_sim.o $(BUILD)/probes.o $(LAST)
 
+$(BUILD)/mainface_skunk.o: main.c | $(BUILD)
+	$(CC68) $(CFLAGS) -DUSE_SKUNK_CONSOLE -DFACE_ONLY -c -o $@ $<
+
+$(BUILD)/calibface_skunk.cof: $(COMMON) $(BUILD)/mainface_skunk.o $(BUILD)/skunkglue.o $(BUILD)/skunk.o $(LAST)
+	$(RLN) -e -rq -a 4000 x x -o $@ $(BUILD)/bootstub.o $(BUILD)/mainface_skunk.o $(BUILD)/probes.o $(BUILD)/skunkglue.o $(BUILD)/skunk.o $(LAST)
+
+$(BUILD)/mainface_sim.o: main.c | $(BUILD)
+	$(CC68) $(CFLAGS) -DFACE_ONLY -c -o $@ $<
+
+$(BUILD)/calibface_sim.cof: $(COMMON) $(BUILD)/mainface_sim.o $(LAST)
+	$(RLN) -e -rq -a 4000 x x -o $@ $(BUILD)/bootstub.o $(BUILD)/mainface_sim.o $(BUILD)/probes.o $(LAST)
+
+
+
 
 
 $(BUILD)/hwq_main_skunk.o: hwq_main.c | $(BUILD)
