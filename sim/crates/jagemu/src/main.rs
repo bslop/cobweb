@@ -73,6 +73,7 @@ fn usage() {
          USAGE:\n\
          \x20 jagemu info <rom>\n\
          \x20 jagemu run <rom> [--frames N] [--fidelity functional|silicon|bigpemu]\n\
+         \x20 jagemu run <rom> --pc-histogram [--map m.map] [--start S] [--top K] [--bucket N]\n\
          \x20 jagemu screenshot <rom> [--frames N] [-o out.png]\n\
          \x20 jagemu video <rom> [--count N] [--every K] [--start S] [--cols C] [--dir D] -o film.png\n\
          \x20 jagemu audio <rom> [--frames N] [--press a] -o out.wav\n\
@@ -349,11 +350,16 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     if prof {
         let top = flag_val(args, "--top").map(parse_u32).transpose()?.unwrap_or(25) as usize;
         let gran = flag_val(args, "--bucket").map(parse_u32).transpose()?.unwrap_or(0);
+        // --start <frame>: run this many frames with the profiler DISARMED (boot /
+        // level-load excluded), then arm it and accumulate for --frames. Without
+        // it a short run ranks one-time boot loops as steady-state hotspots
+        // (COBWEB_REQ_pchistogram_warmup_start.md).
+        let start = flag_val(args, "--start").map(parse_u64).transpose()?.unwrap_or(0);
         let map = match flag_val(args, "--map") {
             Some(m) => load_map(m)?,
             None => Vec::new(),
         };
-        let jag = boot_profiled(&data, frames, btn, after, fidelity_arg(args)?, gran, top, &map)?;
+        let jag = boot_profiled(&data, start, frames, btn, after, fidelity_arg(args)?, gran, top, &map)?;
         println!(
             "{{\"ok\":true,\"path\":{},\"frames\":{},\"state\":{}}}",
             jstr(&path),
@@ -410,6 +416,7 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
 #[allow(clippy::too_many_arguments)]
 fn boot_profiled(
     rom: &[u8],
+    start: u64,
     frames: u64,
     buttons: u32,
     press_after: u64,
@@ -423,18 +430,39 @@ fn boot_profiled(
     attach_sd(&mut jag);
     jag.gpu.fidelity = fid;
     jag.dsp.fidelity = fid;
+    // Warmup: run to `start` with the profiler off, so one-time boot/level-load
+    // loops don't count as steady-state. A button press scheduled inside the
+    // warmup window still fires there; a later one fires in the armed window.
+    if start > 0 {
+        if buttons != 0 && press_after < start {
+            jag.run_frames(press_after);
+            jag.set_pad(0, buttons);
+            jag.run_frames(start - press_after);
+        } else {
+            jag.run_frames(start);
+        }
+    }
+    // Arm the profiler and accumulate over the [start, start+frames) window.
     jag.dbg.prof = Some(Box::new(jag_core::debug::Profile::new()));
-    if buttons != 0 && press_after < frames {
-        jag.run_frames(press_after);
+    let press_in_window = press_after.saturating_sub(start);
+    if buttons != 0 && press_after >= start && press_in_window < frames {
+        jag.run_frames(press_in_window);
         jag.set_pad(0, buttons);
-        jag.run_frames(frames - press_after);
+        jag.run_frames(frames - press_in_window);
     } else if frames > 0 {
         jag.run_frames(frames);
     }
     let p = jag.dbg.prof.as_ref().unwrap();
     let awake = p.main_cycles + p.isr_cycles;
     let tot = p.total_cycles.max(1);
-    eprintln!("=== 68k cycle profile ({frames} frames) ===");
+    if start > 0 {
+        eprintln!(
+            "=== 68k cycle profile ({frames} frames, armed window [{start}, {}) — boot excluded) ===",
+            start + frames
+        );
+    } else {
+        eprintln!("=== 68k cycle profile ({frames} frames) ===");
+    }
     eprintln!(
         "  total charged   {:>12}",
         p.total_cycles
