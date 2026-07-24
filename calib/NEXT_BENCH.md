@@ -383,3 +383,36 @@ facenb (no branches) / facebr (3 br/px) branch-density bisection of the
 facebr probe before flashing (possible wedge; the 48 unrolled jr targets
 need a check). face itself is proven.
 
+---
+
+## 2026-07-23 p_ovlap / p_serial — jsim DOES credit the overlap (dogfood, no board)
+
+Built OVLAP_ONLY fast build; jsim (silicon fidelity):
+
+    ovlap  (launch -> ~blit-worth of independent compute -> bwait)  118 ticks
+    serial (launch -> bwait -> the same compute)                    228 ticks
+
+serial - ovlap = 110 ticks of blit FULLY HIDDEN under compute. jsim's
+async blit_busy-drain model credits the overlap correctly — ovlap is
+~half of serial because the ~110-tick blit disappears under the compute.
+
+=> The +28% is NOT "jsim serializes what silicon overlaps." The
+concurrency accounting is structurally sound. What remains: does SILICON
+hide MORE or LESS blit than jsim? Flash calibovlap_skunk and compare the
+silicon ovlap/serial delta to jsim's 110. If silicon's delta > 110, jsim
+hides too little (charges the peeking blit as bwait spin) = the
+overcharge. If silicon's delta < 110, jsim hides too much. Either way
+this probe pins the sign and size of the balance-point error directly —
+it is THE flash to run next.
+
+Also captured (jsim, wide-window peek --len 2048 — the earlier "facebr
+wedge" was only the 1024-byte peek window truncating slots >=32, NOT a
+real wedge; all six face-bisection numbers are valid):
+
+    face   B 58305 cyc (1 edge branch/px)
+    facenb B 49855 cyc (0 branches)
+    facebr B 74360 cyc (3 branches/px)
+
+Monotone in branch count as expected; needs silicon ratio to bisect the
+~9% compute gap by branch density (secondary to the ovlap flash).
+
