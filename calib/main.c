@@ -551,12 +551,20 @@ void cal_main(void)
         u32 MMRES = 0x00104000UL;
         u32 guard = 60000000UL;
         char *d;
+        /* Start beacon: disambiguates a real GPU wedge from a USB dropout. If
+         * "CAL MMSTART" prints but "CAL MMULT" never does, the GPU hung the bus
+         * (probe bug); if neither prints, the link dropped before this block. */
+        say("CAL MMSTART\n");
         R32(MMRES + 32) = 0;
         copy16(G_RAM, p_mmult_s, p_mmult_e);
         R32(G_PC) = G_RAM;
         R32(G_CTRL) = 1;
         while (R32(MMRES + 32) != MAGIC_DONE && --guard)
             ;
+        /* Force the GPU to halt from the 68k side regardless of how the probe
+         * exited — if MMULT left it running it would hold the bus and hang the
+         * console; this guarantees we can read and print the results. */
+        R32(G_CTRL) = 0;
         d = line;
         d = put(d, "CAL MMULT o0=");
         d = puth(d, R32(MMRES));
