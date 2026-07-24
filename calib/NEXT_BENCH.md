@@ -458,3 +458,35 @@ if the compute path is ever re-opened.
 Also captured (jsim, wide-window peek --len 2048): full face/facenb/
 facebr branch-density bisection, monotone in branch count; needs a
 silicon ratio only if the +9% compute path is re-opened (low priority).
+
+---
+
+## 2026-07-23 QUEUED TO FLASH — 3 OpenLara probe reqs (dogfooded, board down)
+
+All authored + dogfooded in jsim, committed (5d3a0bc), waiting on a
+Skunkboard bounce. Flash calibdl_skunk.cof (custom runners, console) for
+the first two; calib_skunk.cof (full suite) for the timing pair.
+
+p_mmult (THE Phase-0 gate). Console: CAL MMULT o0=.. o1=.. o2=.. ovf=..
+m1=.. m2=..  jsim says: o0=20 o1=140 o2=C80 ovf=FFFE0000 m1=20 m2=20.
+  - o0/o1/o2 = 32/320/3200 => matrix-in-SRAM . vector-in-regs, ROW-major
+    (jsim's isa.rs is right, RISC_ISA.md §7.2's "bank-1 = matrix" wording
+    is loose). o0=654 (0x28E) instead => column/transpose; then OpenLara
+    lays the kernel out the other way.
+  - ovf=FFFE0000 => signed s16 operands + full s32 result (safe for the
+    3x32767x4096 accumulator range). Anything truncated to 16 bits => not.
+  - m1==m2 (both 20) => MMULT RESETS the MAC per call (the 3-MMULT/vert
+    plan is safe). m2==40 => it accumulates; kernel must RESMAC between.
+
+p_ldjumprn. Console: CAL LDJUMPRN dram=.. sram=..  jsim: ABCD1234 /
+5678DEF0 (scoreboards across jump(rN) exactly as across jr).
+  - both truths => erratum fully refuted for the absolute-jump form too;
+    the RUNBATCH silicon crash is bug-25/bug-13 (kernel side).
+  - stale/garbage => the erratum IS real for jump(rN); jsim Silicon must
+    then model an unsettled load whose consumer is reached via jump(rN),
+    and it explains the wedge. OpenLara already has the or-settle fix.
+
+p_mmultw / p_mmulta (timing). jsim: width-3 MMULT 4.04 cyc, +MTXA write
+5.05 (control write ~1 cyc). Silicon delta mmulta-mmultw = the real
+per-row MTXA re-point cost; if >> 1 cyc it changes the 3-MMULT/vert math.
+
