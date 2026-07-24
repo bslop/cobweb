@@ -1088,20 +1088,22 @@ _p_mmult_s:
 	movei	#$F02104,r1
 	moveq	#3,r0
 	store	r0,(r1)
-	; ---- switch to register bank 1 (REGPAGE bit14, IMASK clear) ----
-	movei	#$F02100,r1
-	movei	#$00004000,r0
-	store	r0,(r1)
-	nop
-	nop
-	; ---- bank 1: vector [4,5,6] ----
+	; ---- vector [4,5,6] into BANK 1 via MOVETA — STAY in bank 0 ----
+	; MMULT reads its vector operand from bank 1 regardless of the current bank,
+	; so we populate bank-1 r2/r3 with moveta and never switch REGPAGE. This
+	; avoids running (and self-stopping) the GPU in bank 1 — the earlier
+	; REGPAGE-switch version WEDGED real Tom (silicon 2026-07-23: DIVLAT printed,
+	; then the suite hung on MMULT); the whole probe now runs and stops from
+	; bank 0 exactly like every other probe.
 	; One MMULT per row, each fully drained before its result is stored: set
 	; MTXA, settle, mmult, settle 8 (the systolic result lands late — too short a
 	; settle lets a LATER store catch it, which skews every output), store. The
 	; MAC pair is the exception: mac1/mac2 run back-to-back with NO settle between
 	; so we see whether the second MMULT accumulates onto the first.
 	movei	#$00050004,r2		; element0=4 (low), element1=5 (high)
+	moveta	r2,r2			; bank1.r2 = (5<<16)|4
 	moveq	#6,r3			; element2=6 (low of r3)
+	moveta	r3,r3			; bank1.r3 = 6
 	movei	#$F02108,r9		; MTXA register address
 	; row0: MTXA=$100 -> o0
 	movei	#$A00,r10
@@ -1161,7 +1163,7 @@ _p_mmult_s:
 	store	r6,(r11)
 	movei	#$00104014,r11
 	store	r7,(r11)
-	; magic + stop (still bank 1)
+	; magic + stop (bank 0 throughout — no REGPAGE switch)
 	movei	#MAGICD,r26
 	movei	#$00104020,r11		; MMRES+32
 	store	r26,(r11)
