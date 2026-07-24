@@ -90,6 +90,10 @@ extern char p_mm_w3s_s[], p_mm_w3s_e[];
 extern char p_mm_mmhi_s[], p_mm_mmhi_e[];
 extern char p_mm_mmlo_s[], p_mm_mmlo_e[];
 extern char p_mm_mrd_s[], p_mm_mrd_e[];
+extern char p_mm_mmovf_s[], p_mm_mmovf_e[];
+extern char p_mm_mm2_s[], p_mm_mm2_e[];
+extern char p_mm_mmrow_s[], p_mm_mmrow_e[];
+extern char p_mm_mm2s_s[], p_mm_mm2s_e[];
 extern char p_mmultw_s[], p_mmultw_e[];
 extern char p_mmulta_s[], p_mmulta_e[];
 extern char p_face_s[], p_face_e[];
@@ -557,17 +561,25 @@ void cal_main(void)
          *                                 w3/w3s=20)
          *   CAL MMBIS <nm> WEDGED        (arm hung the GPU) */
         u32 RES = 0x00105000UL;
-        char *ks[7], *ke[7];
-        const char *nm[7];
+        char *ks[11], *ke[11];
+        const char *nm[11];
         int a;
-        ks[0] = p_mm_nov_s;  ke[0] = p_mm_nov_e;  nm[0] = "nov";
-        ks[1] = p_mm_w1_s;   ke[1] = p_mm_w1_e;   nm[1] = "w1";
-        ks[2] = p_mm_w3_s;   ke[2] = p_mm_w3_e;   nm[2] = "w3";
-        ks[3] = p_mm_w3s_s;  ke[3] = p_mm_w3s_e;  nm[3] = "w3s";
-        ks[4] = p_mm_mmhi_s; ke[4] = p_mm_mmhi_e; nm[4] = "mmhi";
-        ks[5] = p_mm_mmlo_s; ke[5] = p_mm_mmlo_e; nm[5] = "mmlo";
-        ks[6] = p_mm_mrd_s;  ke[6] = p_mm_mrd_e;  nm[6] = "mrd";
-        for (a = 0; a < 7; a++) {
+        /* Order: single-mmult arms first (never wedge), then multi-mmult by
+         * DESCENDING settle between consecutive mmults so the known wedger
+         * (mm2, zero settle) runs LAST — mmrow (~13-instr gap) and mm2s
+         * (8-nop gap) get to report before any wedge kills the session. */
+        ks[0]  = p_mm_nov_s;   ke[0]  = p_mm_nov_e;   nm[0]  = "nov";
+        ks[1]  = p_mm_w1_s;    ke[1]  = p_mm_w1_e;    nm[1]  = "w1";
+        ks[2]  = p_mm_w3_s;    ke[2]  = p_mm_w3_e;    nm[2]  = "w3";
+        ks[3]  = p_mm_w3s_s;   ke[3]  = p_mm_w3s_e;   nm[3]  = "w3s";
+        ks[4]  = p_mm_mmhi_s;  ke[4]  = p_mm_mmhi_e;  nm[4]  = "mmhi";
+        ks[5]  = p_mm_mmlo_s;  ke[5]  = p_mm_mmlo_e;  nm[5]  = "mmlo";
+        ks[6]  = p_mm_mrd_s;   ke[6]  = p_mm_mrd_e;   nm[6]  = "mrd";
+        ks[7]  = p_mm_mmovf_s; ke[7]  = p_mm_mmovf_e; nm[7]  = "mmovf";
+        ks[8]  = p_mm_mmrow_s; ke[8]  = p_mm_mmrow_e; nm[8]  = "mmrow";
+        ks[9]  = p_mm_mm2s_s;  ke[9]  = p_mm_mm2s_e;  nm[9]  = "mm2s";
+        ks[10] = p_mm_mm2_s;   ke[10] = p_mm_mm2_e;   nm[10] = "mm2";
+        for (a = 0; a < 11; a++) {
             u32 guard = 60000000UL;
             u32 slot = RES + (u32)a * 0x20; /* distinct slot per arm (sim peek) */
             char *d = line;

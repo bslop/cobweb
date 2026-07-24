@@ -1535,6 +1535,285 @@ _p_mm_mrd_s:
 	.data
 _p_mm_mrd_e:
 
+; ── p_mmult ROUND 3: overflow + MAC-reset + multi-mmult wedge (2026-07-23) ──
+; With the LOW-half matrix convention now known, these close the rest of the
+; Phase-0 gate. All matrices are stored LOW half. Ordered safe->risky so a
+; wedge in the multi-mmult arms cannot rob the single-mmult results:
+;   mmovf : one width-3 mmult, ovf row [-32768,0,0] -> v0 = FFFE0000
+;           (signed s16 operand + full s32 result). Truncated => not s32.
+;   mm2   : TWO back-to-back width-3 mmults, no settle between (the mac pair).
+;           v0 = m1, v1 = m2. If it self-stops: m1==m2==20 => MMULT resets the
+;           MAC per call (3-MMULT/vertex plan safe); m2==40 => accumulates.
+;           If it WEDGES: the back-to-back pair is the full-probe wedge trigger.
+;   mmrow : FOUR width-3 mmults with per-row MTXA re-point (the real kernel
+;           shape). v0 = o0 (=20), v1 = o3/ovf (=FFFE0000). Self-stop => the
+;           4-row loop is fine (the wedge was tied to the old high-half setup);
+;           WEDGE => the row loop / repeated MTXA is the trigger.
+
+	.even
+	.globl	_p_mm_mmovf_s
+	.globl	_p_mm_mmovf_e
+_p_mm_mmovf_s:
+	.gpu
+	movei	#PRMRESULT,r14
+	load	(r14),r12
+	movei	#$F03A00,r1		; row [-32768,0,0], LOW half
+	movei	#$00008000,r0		; -32768 (s16 $8000) in low 16
+	store	r0,(r1)
+	movei	#$F03A04,r1
+	moveq	#0,r0
+	store	r0,(r1)
+	movei	#$F03A08,r1
+	moveq	#0,r0
+	store	r0,(r1)
+	movei	#$F02104,r1		; MTXC = 3
+	moveq	#3,r0
+	store	r0,(r1)
+	movei	#$00050004,r2
+	moveta	r2,r2
+	moveq	#6,r3
+	moveta	r3,r3
+	movei	#$F02108,r9
+	movei	#$A00,r10
+	store	r10,(r9)
+	nop
+	nop
+	mmult	r2,r4			; -32768*4 + 0 + 0 = -131072 = FFFE0000
+	.rept	16
+	nop
+	.endr
+	store	r4,(r12)
+	addqt	#4,r12
+	moveq	#0,r5
+	store	r5,(r12)
+	addqt	#8,r12
+	.rept	16
+	nop
+	.endr
+	movei	#MAGICD,r26
+	store	r26,(r12)
+	movei	#GCTRL,r27
+	moveq	#0,r28
+	store	r28,(r27)
+	nop
+	nop
+	.68000
+	.data
+_p_mm_mmovf_e:
+
+	.even
+	.globl	_p_mm_mm2_s
+	.globl	_p_mm_mm2_e
+_p_mm_mm2_s:
+	.gpu
+	movei	#PRMRESULT,r14
+	load	(r14),r12
+	movei	#$F03A00,r1		; row0 [1,2,3] LOW half
+	movei	#$00000001,r0
+	store	r0,(r1)
+	movei	#$F03A04,r1
+	movei	#$00000002,r0
+	store	r0,(r1)
+	movei	#$F03A08,r1
+	movei	#$00000003,r0
+	store	r0,(r1)
+	movei	#$F02104,r1		; MTXC = 3
+	moveq	#3,r0
+	store	r0,(r1)
+	movei	#$00050004,r2
+	moveta	r2,r2
+	moveq	#6,r3
+	moveta	r3,r3
+	movei	#$F02108,r9
+	movei	#$A00,r10
+	store	r10,(r9)
+	nop
+	nop
+	mmult	r2,r6			; m1
+	mmult	r2,r7			; m2 — back-to-back, NO settle (wedge + reset test)
+	.rept	16
+	nop
+	.endr
+	store	r6,(r12)		; v0 = m1 (expect 20)
+	addqt	#4,r12
+	store	r7,(r12)		; v1 = m2 (20 = reset per mmult, 40 = accumulate)
+	addqt	#8,r12
+	.rept	16
+	nop
+	.endr
+	movei	#MAGICD,r26
+	store	r26,(r12)
+	movei	#GCTRL,r27
+	moveq	#0,r28
+	store	r28,(r27)
+	nop
+	nop
+	.68000
+	.data
+_p_mm_mm2_e:
+
+	.even
+	.globl	_p_mm_mmrow_s
+	.globl	_p_mm_mmrow_e
+_p_mm_mmrow_s:
+	.gpu
+	movei	#PRMRESULT,r14
+	load	(r14),r12
+	; full 4x3 matrix, row-major, stride-12 rows, LOW half
+	movei	#$F03A00,r1
+	movei	#$00000001,r0		; row0 1,2,3
+	store	r0,(r1)
+	movei	#$F03A04,r1
+	movei	#$00000002,r0
+	store	r0,(r1)
+	movei	#$F03A08,r1
+	movei	#$00000003,r0
+	store	r0,(r1)
+	movei	#$F03A0C,r1
+	movei	#$0000000A,r0		; row1 10,20,30
+	store	r0,(r1)
+	movei	#$F03A10,r1
+	movei	#$00000014,r0
+	store	r0,(r1)
+	movei	#$F03A14,r1
+	movei	#$0000001E,r0
+	store	r0,(r1)
+	movei	#$F03A18,r1
+	movei	#$00000064,r0		; row2 100,200,300
+	store	r0,(r1)
+	movei	#$F03A1C,r1
+	movei	#$000000C8,r0
+	store	r0,(r1)
+	movei	#$F03A20,r1
+	movei	#$0000012C,r0
+	store	r0,(r1)
+	movei	#$F03A24,r1
+	movei	#$00008000,r0		; ovf row -32768,0,0
+	store	r0,(r1)
+	movei	#$F03A28,r1
+	moveq	#0,r0
+	store	r0,(r1)
+	movei	#$F03A2C,r1
+	moveq	#0,r0
+	store	r0,(r1)
+	movei	#$F02104,r1		; MTXC = 3
+	moveq	#3,r0
+	store	r0,(r1)
+	movei	#$00050004,r2
+	moveta	r2,r2
+	moveq	#6,r3
+	moveta	r3,r3
+	movei	#$F02108,r9		; MTXA reg addr
+	movei	#$A00,r10		; row0
+	store	r10,(r9)
+	nop
+	nop
+	mmult	r2,r4			; o0 = 20
+	.rept	8
+	nop
+	.endr
+	movei	#$A0C,r10		; row1
+	store	r10,(r9)
+	nop
+	nop
+	mmult	r2,r5			; o1 = 140
+	.rept	8
+	nop
+	.endr
+	movei	#$A18,r10		; row2
+	store	r10,(r9)
+	nop
+	nop
+	mmult	r2,r6			; o2 = C80
+	.rept	8
+	nop
+	.endr
+	movei	#$A24,r10		; ovf row
+	store	r10,(r9)
+	nop
+	nop
+	mmult	r2,r7			; o3 = FFFE0000
+	.rept	8
+	nop
+	.endr
+	store	r4,(r12)		; v0 = o0 (20)
+	addqt	#4,r12
+	store	r7,(r12)		; v1 = o3 (FFFE0000)
+	addqt	#8,r12
+	.rept	8
+	nop
+	.endr
+	movei	#MAGICD,r26
+	store	r26,(r12)
+	movei	#GCTRL,r27
+	moveq	#0,r28
+	store	r28,(r27)
+	nop
+	nop
+	.68000
+	.data
+_p_mm_mmrow_e:
+
+; ── p_mm_mm2s: two mmults WITH an 8-nop settle between (2026-07-23 round 4) ──
+; mm2 (0 instrs between two mmults) WEDGED real Tom. This is mm2 with an 8-nop
+; settle inserted between the pair. Self-stop => a settle AVOIDS the wedge
+; (=> OpenLara/jas rule: never emit adjacent MMULTs; separate by >=N), and
+; v0/v1 finally answer MAC reset-vs-accumulate (m1==m2==20 reset, 40 accum).
+; Still wedges => 8 nops is not enough; mmrow's ~13-instr gap is the next rung.
+	.even
+	.globl	_p_mm_mm2s_s
+	.globl	_p_mm_mm2s_e
+_p_mm_mm2s_s:
+	.gpu
+	movei	#PRMRESULT,r14
+	load	(r14),r12
+	movei	#$F03A00,r1		; row0 [1,2,3] LOW half
+	movei	#$00000001,r0
+	store	r0,(r1)
+	movei	#$F03A04,r1
+	movei	#$00000002,r0
+	store	r0,(r1)
+	movei	#$F03A08,r1
+	movei	#$00000003,r0
+	store	r0,(r1)
+	movei	#$F02104,r1		; MTXC = 3
+	moveq	#3,r0
+	store	r0,(r1)
+	movei	#$00050004,r2
+	moveta	r2,r2
+	moveq	#6,r3
+	moveta	r3,r3
+	movei	#$F02108,r9
+	movei	#$A00,r10
+	store	r10,(r9)
+	nop
+	nop
+	mmult	r2,r6			; m1
+	.rept	8
+	nop
+	.endr
+	mmult	r2,r7			; m2 — 8-nop settle before this one (vs mm2's zero)
+	.rept	16
+	nop
+	.endr
+	store	r6,(r12)		; v0 = m1 (20)
+	addqt	#4,r12
+	store	r7,(r12)		; v1 = m2 (20 = reset per mmult, 40 = accumulate)
+	addqt	#8,r12
+	.rept	16
+	nop
+	.endr
+	movei	#MAGICD,r26
+	store	r26,(r12)
+	movei	#GCTRL,r27
+	moveq	#0,r28
+	store	r28,(r27)
+	nop
+	nop
+	.68000
+	.data
+_p_mm_mm2s_e:
+
 ; ── p_mmultw: width-3 MMULT throughput (timing, COBWEB_REQ item 3) ──────────
 ; Standard VC-timed probe: MTXC=3, MTXA at the safe $A00 region, then a run of
 ; back-to-back width-3 MMULTs. Runs in bank 0 so the vector regs are whatever —

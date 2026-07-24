@@ -714,3 +714,64 @@ STILL OPEN:
    mac-pair, which is also suspect #1. One probe can answer both: two mmults,
    read both results — if it does NOT wedge, compare m1 vs m2 (equal=reset).
 
+### ROUND 3 STAGED (2026-07-23 night) — built + dogfooded, waiting on a bounce
+
+Ladder extended to 10 arms; 3 new (all LOW-half matrix now), ordered
+safe->risky so a multi-mmult wedge can't rob the single-mmult data:
+  - mmovf : one width-3 mmult, ovf row [-32768,0,0] -> v0 = FFFE0000
+            (s16 operand + s32 result). Truncated => not full s32.
+  - mm2   : TWO back-to-back width-3 mmults (mac pair). v0=m1 v1=m2. Self-stop
+            + m1==m2==20 => MMULT resets MAC/call (3-per-vertex plan safe);
+            m2==40 => accumulates. WEDGE => the pair is the wedge trigger.
+  - mmrow : FOUR width-3 mmults w/ per-row MTXA re-point (real kernel shape).
+            v0=o0=20, v1=o3/ovf=FFFE0000. Self-stop => the 4-row loop is fine
+            (wedge was tied to the old high-half setup); WEDGE => row loop is it.
+jsim dogfood (peek): mmovf FFFE0000 / mm2 20,20 / mmrow 20,FFFE0000 — all
+self-stop. calibdl_skunk.cof rebuilt.
+
+### ROUND 3 SILICON RESULT (2026-07-23 night) — s32 confirmed; the WEDGE is found
+
+Flashed clean (connected on retry). Arms nov..mmovf all printed and matched
+jsim; then mm2 hung the console (clean tail, no output — bus-held hard wedge,
+68k guard stalls on the read and never prints). Killed after ~4.5 min.
+
+    CAL MMBIS nov  v0=000000A0
+    CAL MMBIS w1/w3/w3s/mmhi  v0=00000000
+    CAL MMBIS mmlo v0=00000020
+    CAL MMBIS mrd  v0=00010000
+    CAL MMBIS mmovf v0=FFFE0000        <- s16 operand + FULL s32 result CONFIRMED
+    CAL MMBIS mm2  (no line — hard wedge on the back-to-back pair)
+
+- **mmovf = FFFE0000**: MMULT sign-extends s16 operands and produces a full
+  s32 result (-32768*4 = -131072). Safe for OpenLara's accumulator range.
+  Open item CLOSED.
+- **THE MULTI-MMULT WEDGE IS TWO ADJACENT MMULTS.** mm2 = `mmult r2,r6;
+  mmult r2,r7` with ZERO instructions between -> hard-wedges real Tom (bug
+  23, bus held). Round 1 already proved a single mmult+self-stop never
+  wedges at any drain. So the original p_mmult wedged at its mac1/mac2 pair
+  (identical shape). NAMED. jsim runs adjacent mmults fine = a faithfulness
+  gap: jas should lint adjacent MMULTs and/or jsim-Silicon should model the
+  wedge. (mm2's reset-vs-accumulate values were lost to the wedge.)
+
+### ROUND 4 STAGED — settle threshold + reset/accumulate (built + dogfooded)
+
+11-arm ladder, reordered so the known wedger mm2 (0-gap) runs LAST; new
+mm2s (8-nop gap between the pair) and mmrow (~13-instr gap) run BEFORE it
+(settle DESCENDING). One flash bisects the settle threshold:
+  - mmrow  self-stop => a ~13-instr gap is safe (full 4-row kernel works);
+           v0=o0=20, v1=o3=FFFE0000 (layout holds through the loop).
+  - mm2s   self-stop => 8 nops already avoids the wedge; v0=m1 v1=m2 finally
+           answer MAC reset(20/20) vs accumulate(20/40). WEDGE => 8 too few.
+  - mm2    hard-wedges again (reconfirm; ends the session — expect a hang
+           after mm2s, ctrl-C then).
+Outcome => OpenLara/jas rule: never emit adjacent MMULTs, separate by >=
+(threshold) instructions; and the reset/accumulate answer sets the
+3-MMULT/vertex plan. jsim dogfood: mmrow 20/FFFE0000, mm2s 20/20, mm2 20/20
+(sim doesn't wedge). calibdl_skunk.cof rebuilt.
+
+BOARD IS WEDGED (mm2 bug-23). **Power-cycle the Jaguar** before the next
+flash, then:
+    script -qefc "jcp -c build/calibdl_skunk.cof" bench_mmbis_20260723.log
+    grep -a "CAL MMBIS" bench_mmbis_20260723.log
+    # expect through mm2s, then a hang at mm2 — ctrl-C
+
