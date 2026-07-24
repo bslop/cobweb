@@ -950,6 +950,281 @@ _p_ldjump_s:
 	.data
 _p_ldjump_e:
 
+; ── p_ldjumprn: load consumed across an ABSOLUTE jump (rN) ──────────────────
+; COBWEB_REQ_jumprn_load_scoreboard_probe.md: p_ldjump refuted the load-across-
+; jump erratum for `jr` (PC-relative). This is the one edge it deliberately did
+; NOT cover — an absolute `jump T,(rN)` with a RUNTIME-computed target, which is
+; the form OpenLara's kernel hot paths use (movei #tgt,r22 / jump T,(r22); the jr
+; ±16-word range is too short for their layout). Same structure as p_ldjump,
+; same seeded truths (ABCD1234 / 5678DEF0), same load->jump->consume window; only
+; the transfer form changes. The target address is GRAMBASE + (label - probe
+; start): the probe is copied to G_RAM ($F03000) and run there, so this is the
+; correct RUNTIME address — an assembly-time constant (label difference in one
+; section), NOT an absolute label reference (which would embed the wrong
+; assembled-org address and wedge the GPU). Correct readbacks == silicon
+; scoreboards across jump(rN) too (erratum fully refuted); stale/garbage == the
+; erratum is real for the absolute form and explains the RUNBATCH silicon crash.
+	.even
+	.globl	_p_ldjumprn_s
+	.globl	_p_ldjumprn_e
+_p_ldjumprn_s:
+	.gpu
+	movei	#PRMRESULT,r16
+	load	(r16),r18		; result base
+	; seed a DRAM cell and an SRAM cell with known truths, let them settle
+	movei	#$00160000,r12		; DRAM scratch
+	movei	#$ABCD1234,r13
+	store	r13,(r12)
+	movei	#$F03E00,r14		; GPU SRAM scratch (below the param block)
+	movei	#$5678DEF0,r7
+	store	r7,(r14)
+	.rept	20
+	nop				; settle both stores
+	.endr
+	; --- DRAM load across an ABSOLUTE jump (rN), runtime-computed target ---
+	movei	#GRAMBASE+(.rtgtD-_p_ldjumprn_s),r22	; RUNTIME addr of .rtgtD
+	load	(r12),r1		; DRAM load into r1 (in flight ~15cyc)
+	jump	t,(r22)			; absolute taken jump to runtime address
+	nop				; delay slot
+.rtgtD:
+	move	r1,r0			; consume at target — load still in flight
+	store	r0,(r18)		; result[0] = DRAM readback
+	addqt	#4,r18
+	.rept	20
+	nop
+	.endr
+	; --- SRAM load across an absolute jump (rN) ---
+	movei	#GRAMBASE+(.rtgtS-_p_ldjumprn_s),r23	; RUNTIME addr of .rtgtS
+	load	(r14),r2		; SRAM load into r2
+	jump	t,(r23)			; absolute taken jump
+	nop				; delay slot
+.rtgtS:
+	move	r2,r0			; consume at target
+	store	r0,(r18)		; result[4] = SRAM readback
+	addqt	#4,r18
+	movei	#MAGICD,r26
+	store	r26,(r18)		; magic at result+8
+	movei	#GCTRL,r27
+	moveq	#0,r28
+	store	r28,(r27)		; stop self
+	nop
+	nop
+	.68000
+	.data
+_p_ldjumprn_e:
+
+; ── p_mmult: silicon-validate MMULT operand layout / s16 / MAC ──────────────
+; COBWEB_REQ_mmult_silicon_probe.md: the Phase-0 gate for the vertex-transform
+; prize (~28% of frame). jsim's isa.rs::mmult and RISC_ISA.md §7.2 disagree on
+; which operand is the matrix, so SILICON decides. Setup follows mmult_ref.s
+; (matrix in local SRAM as high-16 words, stride 4; vector in bank-1 regs packed
+; 2x s16, first in low half; MTXC=width, MTXA=byte offset; REGPAGE=1 to reach
+; bank 1). The data is DELIBERATELY ASYMMETRIC so row-major vs column-major and
+; matrix-in-SRAM vs matrix-in-bank-1 each give distinct, recognizable outputs.
+; NOTE the matrix lives at $F03A00 (MTXA offset $A00), NOT $F03100: the probe's
+; own code exceeds 256 bytes, so a matrix at $F03100 would overwrite still-to-
+; execute instructions (this bit in jsim — o1/o2 came back corrupt until the
+; matrix was relocated; it would wedge silicon the same way). $A00 is past all
+; probe code and below the param block at $F03F80.
+;
+;   matrix M (row-major, high-16 words at $F03A00, row stride 12 bytes):
+;     row0 [1,2,3]      row1 [10,20,30]      row2 [100,200,300]
+;     ovf-row [-32768,0,0]  (s16 sign + 32-bit result test)
+;   vector V = [4,5,6]  (bank-1: r2=(5<<16)|4, r3=6)
+;
+; Expected IF silicon == jsim (matrix rows in SRAM . vector in regs, signed s16):
+;   out0 = 1*4+2*5+3*6      = 32       (0x00000020)
+;   out1 = 10*4+20*5+30*6   = 320      (0x00000140)
+;   out2 = 100*4+200*5+300*6= 3200     (0x00000C80)
+;   ovf  = -32768*4         = -131072  (0xFFFE0000)  -> signed s16 + s32 result
+;   mac1 = mac2 = 32                   -> MMULT RESETS the accumulator per call
+;         (mac2 == 64 would mean it accumulates across back-to-back MMULTs)
+; A transpose/column reading would give out0 = 1*4+10*5+100*6 = 654 instead of
+; 32 — so the three outputs alone decode the operand layout on real Tom.
+; Results land at MMRES ($00104000) as 32-bit words; magic at MMRES+32.
+	.even
+	.globl	_p_mmult_s
+	.globl	_p_mmult_e
+_p_mmult_s:
+	.gpu
+	; ---- bank 0: matrix into local SRAM (high-16 of each 32-bit word) ----
+	movei	#$F03A00,r1		; row0
+	movei	#$00010000,r0		; 1
+	store	r0,(r1)
+	movei	#$F03A04,r1
+	movei	#$00020000,r0		; 2
+	store	r0,(r1)
+	movei	#$F03A08,r1
+	movei	#$00030000,r0		; 3
+	store	r0,(r1)
+	movei	#$F03A0C,r1		; row1
+	movei	#$000A0000,r0		; 10
+	store	r0,(r1)
+	movei	#$F03A10,r1
+	movei	#$00140000,r0		; 20
+	store	r0,(r1)
+	movei	#$F03A14,r1
+	movei	#$001E0000,r0		; 30
+	store	r0,(r1)
+	movei	#$F03A18,r1		; row2
+	movei	#$00640000,r0		; 100
+	store	r0,(r1)
+	movei	#$F03A1C,r1
+	movei	#$00C80000,r0		; 200
+	store	r0,(r1)
+	movei	#$F03A20,r1
+	movei	#$012C0000,r0		; 300
+	store	r0,(r1)
+	movei	#$F03A24,r1		; ovf-row [-32768,0,0]
+	movei	#$80000000,r0		; -32768 in high-16
+	store	r0,(r1)
+	movei	#$F03A28,r1
+	moveq	#0,r0
+	store	r0,(r1)
+	movei	#$F03A2C,r1
+	moveq	#0,r0
+	store	r0,(r1)
+	; MTXC = 3 (width 3, by-row; bit4 MATCOL = 0)
+	movei	#$F02104,r1
+	moveq	#3,r0
+	store	r0,(r1)
+	; ---- switch to register bank 1 (REGPAGE bit14, IMASK clear) ----
+	movei	#$F02100,r1
+	movei	#$00004000,r0
+	store	r0,(r1)
+	nop
+	nop
+	; ---- bank 1: vector [4,5,6] ----
+	; One MMULT per row, each fully drained before its result is stored: set
+	; MTXA, settle, mmult, settle 8 (the systolic result lands late — too short a
+	; settle lets a LATER store catch it, which skews every output), store. The
+	; MAC pair is the exception: mac1/mac2 run back-to-back with NO settle between
+	; so we see whether the second MMULT accumulates onto the first.
+	movei	#$00050004,r2		; element0=4 (low), element1=5 (high)
+	moveq	#6,r3			; element2=6 (low of r3)
+	movei	#$F02108,r9		; MTXA register address
+	; row0: MTXA=$100 -> o0
+	movei	#$A00,r10
+	store	r10,(r9)
+	nop
+	nop
+	mmult	r2,r4
+	.rept	8
+	nop
+	.endr
+	movei	#$00104000,r11
+	store	r4,(r11)
+	; row1: MTXA=$10C -> o1
+	movei	#$A0C,r10
+	store	r10,(r9)
+	nop
+	nop
+	mmult	r2,r4
+	.rept	8
+	nop
+	.endr
+	movei	#$00104004,r11
+	store	r4,(r11)
+	; row2: MTXA=$118 -> o2
+	movei	#$A18,r10
+	store	r10,(r9)
+	nop
+	nop
+	mmult	r2,r4
+	.rept	8
+	nop
+	.endr
+	movei	#$00104008,r11
+	store	r4,(r11)
+	; ovf-row: MTXA=$124 -> ovf
+	movei	#$A24,r10
+	store	r10,(r9)
+	nop
+	nop
+	mmult	r2,r4
+	.rept	8
+	nop
+	.endr
+	movei	#$0010400C,r11
+	store	r4,(r11)
+	; MAC reset-vs-accumulate: two back-to-back MMULTs (row0, MTXA=$100)
+	movei	#$A00,r10
+	store	r10,(r9)
+	nop
+	nop
+	mmult	r2,r6			; mac1
+	mmult	r2,r7			; mac2 (==mac1 if reset per MMULT, ==2x if accumulate)
+	.rept	8
+	nop
+	.endr
+	movei	#$00104010,r11
+	store	r6,(r11)
+	movei	#$00104014,r11
+	store	r7,(r11)
+	; magic + stop (still bank 1)
+	movei	#MAGICD,r26
+	movei	#$00104020,r11		; MMRES+32
+	store	r26,(r11)
+	movei	#GCTRL,r27
+	moveq	#0,r28
+	store	r28,(r27)		; stop self
+	nop
+	nop
+	.68000
+	.data
+_p_mmult_e:
+
+; ── p_mmultw: width-3 MMULT throughput (timing, COBWEB_REQ item 3) ──────────
+; Standard VC-timed probe: MTXC=3, MTXA at the safe $A00 region, then a run of
+; back-to-back width-3 MMULTs. Runs in bank 0 so the vector regs are whatever —
+; timing is width-driven, not value-driven (jsim: cost += MTXC&0xF per MMULT).
+; cyc/instr here is the per-MMULT cost silicon actually charges for width 3.
+	.even
+	.globl	_p_mmultw_s
+	.globl	_p_mmultw_e
+_p_mmultw_s:
+	.gpu
+	PROBE_PRO
+	movei	#$F02104,r0		; MTXC = 3 (width 3, by-row)
+	moveq	#3,r1
+	store	r1,(r0)
+	movei	#$F02108,r0		; MTXA = $A00 (safe region, past code)
+	movei	#$A00,r1
+	store	r1,(r0)
+	.rept	256
+	mmult	r2,r4
+	.endr
+	PROBE_EPI
+	.68000
+	.data
+_p_mmultw_e:
+
+; ── p_mmulta: MMULT + a per-call MTXA control-write (timing, item 3) ─────────
+; Same as p_mmultw but each MMULT is preceded by a store to MTXA (the kernel
+; re-points MTXA per matrix row). p_mmulta - p_mmultw isolates the cost of the
+; MTXA control write, which jsim does NOT price separately — if it dominates the
+; 3-MMULTs/vertex plan, OpenLara needs to know before Phase 1. r1 (=$A00) is
+; loaded once; only the store is inside the loop, so the delta is the write.
+	.even
+	.globl	_p_mmulta_s
+	.globl	_p_mmulta_e
+_p_mmulta_s:
+	.gpu
+	PROBE_PRO
+	movei	#$F02104,r0		; MTXC = 3
+	moveq	#3,r1
+	store	r1,(r0)
+	movei	#$F02108,r0		; r0 = MTXA register address
+	movei	#$A00,r1		; r1 = MTXA value (loaded once)
+	.rept	256
+	store	r1,(r0)			; re-point MTXA (the priced control write)
+	mmult	r2,r4
+	.endr
+	PROBE_EPI
+	.68000
+	.data
+_p_mmulta_e:
+
 ; ── p_face: synthetic per-face compute (divides + DDA + edge branches) ──
 ; The +28% discriminator (2026-07-23): the kernel is compute-bound on
 ; silicon (per-face compute > blit, spin exits free) but spin-bound in
