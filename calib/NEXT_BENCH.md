@@ -490,3 +490,26 @@ p_mmultw / p_mmulta (timing). jsim: width-3 MMULT 4.04 cyc, +MTXA write
 5.05 (control write ~1 cyc). Silicon delta mmulta-mmultw = the real
 per-row MTXA re-point cost; if >> 1 cyc it changes the 3-MMULT/vert math.
 
+---
+
+## 2026-07-23 SILICON: p_ldjumprn CONFIRMED — jump(rN) scoreboards (erratum refuted)
+
+Flashed calibdl_skunk, clean console:
+
+    CAL LDJUMP   dram=ABCD1234 sram=5678DEF0
+    CAL LDJUMPRN dram=ABCD1234 sram=5678DEF0
+
+Real Tom serves BOTH truths across an absolute jump(rN) with a runtime
+target — it scoreboards the in-flight load exactly as it does across jr.
+**The load-across-jump erratum is fully refuted for the absolute-jump
+form too.** => OpenLara's RUNBATCH silicon-only crash is NOT this; it's
+bug-25 (DIV-while-busy) or bug-13 (WAW), kernel-side. jsim's Silicon
+fidelity is faithful here — no jump(rN) value-corruption model needed.
+
+p_mmult (Phase-0 gate) did NOT make it over USB: the finicky link dropped
+right after LDJUMPRN, before the MMULT line printed (the whole suite was
+computed on the Jaguar, but the console dropout ate the line). FIX for
+next flash: reordered so p_mmult prints FIRST (right after DIVLAT), in the
+healthy post-bounce window. calibdl_skunk.cof rebuilt and re-dogfooded
+(o0/o1/o2=20/140/C80, ovf=FFFE0000, m1=m2=20). One clean flash captures it.
+
