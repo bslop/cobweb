@@ -1898,10 +1898,16 @@ _p_mm_mm3s_s:
 _p_mm_mm3s_e:
 
 ; ── p_mmultw: width-3 MMULT throughput (timing, COBWEB_REQ item 3) ──────────
+; !!! DO NOT FLASH ON SILICON — WEDGES !!! (2026-07-24, bench_timing log)
+; This is 256 BACK-TO-BACK MMULTs, which HARD-WEDGE real Tom (bug 23, bus held;
+; power-cycle to recover) — the exact zero-gap hazard jas now errors on. It
+; hung the full suite the instant it launched (after divoff A). Back-to-back
+; MMULT throughput is therefore UNMEASURABLE on hardware; jsim's ~4.04 cyc is a
+; back-to-back-issue LOWER BOUND that never occurs. jsim-only reference; to get
+; a silicon number, rewrite as a SETTLED cadence (mmult, N filler, mmult, …).
 ; Standard VC-timed probe: MTXC=3, MTXA at the safe $A00 region, then a run of
 ; back-to-back width-3 MMULTs. Runs in bank 0 so the vector regs are whatever —
 ; timing is width-driven, not value-driven (jsim: cost += MTXC&0xF per MMULT).
-; cyc/instr here is the per-MMULT cost silicon actually charges for width 3.
 	.even
 	.globl	_p_mmultw_s
 	.globl	_p_mmultw_e
@@ -1923,6 +1929,11 @@ _p_mmultw_s:
 _p_mmultw_e:
 
 ; ── p_mmulta: MMULT + a per-call MTXA control-write (timing, item 3) ─────────
+; !!! RISKY ON SILICON — ONE instruction (the store) between MMULTs !!! The
+; safe gap is unverified (0 wedges, 8 is known-safe; this is 1). Never reached
+; on 2026-07-24 (p_mmultw wedged first). Also now moot: MTXADDR AUTO-ADVANCES
+; (silicon-confirmed), so the vertex kernel sets MTXA ONCE and never re-points
+; per row — the "MTXA control-write per row" this probe prices does not happen.
 ; Same as p_mmultw but each MMULT is preceded by a store to MTXA (the kernel
 ; re-points MTXA per matrix row). p_mmulta - p_mmultw isolates the cost of the
 ; MTXA control write, which jsim does NOT price separately — if it dominates the

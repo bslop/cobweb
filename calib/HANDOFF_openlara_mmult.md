@@ -10,7 +10,7 @@ Probe sources: `calib/probes.s` (`p_mm_*`); driver `calib/main.c`.
 |---|---|
 | **p_mmult** — operand layout / width / MAC semantics | **ANSWERED** (below) |
 | **p_ldjumprn** — load-across-`jump(rN)` erratum | **REFUTED** — silicon scoreboards the in-flight load across an absolute `jump(rN)` (dram=ABCD1234, sram=5678DEF0). Not a value-corruption erratum; jsim is faithful. |
-| **p_mmultw / p_mmulta** — per-MMULT timing | **PENDING one flash** (see Timing) — but auto-advance makes it moot for the re-point half (see below) |
+| **p_mmultw / p_mmulta** — per-MMULT timing | **UNMEASURABLE as written** — `p_mmultw` is 256 back-to-back MMULTs, which hard-wedge silicon (see Timing). jsim baseline 4.04 cyc is a lower bound. |
 
 ## MMULT semantics (all silicon-validated, jsim now matches)
 
@@ -66,11 +66,23 @@ jas will point at any offending pair.
 - `jas`: hard error on two adjacent MMULTs, with a settle fix-it.
 - ISA spec `RISC_ISA.md §7.2` documents all of the above.
 
-## Timing (pending the final flash before the board is returned)
+## Timing — back-to-back throughput is UNMEASURABLE on silicon
 
-`p_mmultw` (per-MMULT throughput at MTXC=3) and `p_mmulta` (MMULT + a per-call
-MTXA write). jsim baseline: mmultw ≈ 4.04 cyc/MMULT, mmulta ≈ 5.05 (control
-write ~1 cyc). Silicon numbers: **_TBD — last rig flash._** Note: with
-auto-advance, the per-row MTXA-write cost (`mmulta − mmultw`) no longer
-applies to the vertex kernel (set MTXA once), so `mmultw` alone is the number
-that matters for the frame budget.
+Attempted the final flash (2026-07-24, `bench_timing_20260724.log`). The
+suite ran clean through `divoff` (mode A) and then **wedged the instant
+`p_mmultw` launched** — because `p_mmultw` is `.rept 256 { mmult r2,r4 }`,
+**256 back-to-back MMULTs**, the exact zero-gap pattern that hard-wedges the
+GPU (#7). So "back-to-back MMULT throughput" is not a measurable quantity on
+real Tom — the hardware cannot issue two adjacent MMULTs at all. This is a
+third independent confirmation of the adjacent-MMULT wedge, and jas's new
+lint would reject `p_mmultw` itself.
+
+**What this means for the budget:** jsim's 4.04 cyc/MMULT is the back-to-back
+issue rate, which never occurs. The realistic per-MMULT cost is that plus the
+**mandatory inter-MMULT settle** (a few cycles of real work — which the kernel
+has anyway: vector setup / result store between rows). Budget each transform
+MMULT at roughly its jsim op cost **plus the settle you must insert**; treat
+4.04 as a lower bound, not the kernel figure. A silicon number would require a
+rewritten *settled-cadence* probe (`mmult`, N filler, `mmult`, …) — deferred;
+the board is being returned. `p_mmultw`/`p_mmulta` are flagged in-source as
+silicon-wedging / jsim-only.
