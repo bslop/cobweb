@@ -950,6 +950,180 @@ _p_ldjump_s:
 	.data
 _p_ldjump_e:
 
+; ── p_face: synthetic per-face compute (divides + DDA + edge branches) ──
+; The +28% discriminator (2026-07-23): the kernel is compute-bound on
+; silicon (per-face compute > blit, spin exits free) but spin-bound in
+; jsim (compute too fast, spins on the blit). This times the per-face
+; COMPUTE alone. jsim << silicon => the gap is here, in mixed code with
+; branches — not any isolated op (all of those are silicon-exact).
+	.even
+	.globl	_p_face_s
+	.globl	_p_face_e
+_p_face_s:
+	.gpu
+	PROBE_PRO
+	move	r19,r12			; DRAM/SRAM buffer base
+	movei	#$10001,r5
+	movei	#$7FFFFFF0,r7
+	movei	#3,r16
+	moveq	#1,r8			; du
+	moveq	#1,r10			; dv
+	moveq	#0,r9			; u
+	moveq	#0,r11			; v
+	movei	#8,r13			; edge threshold
+	div	r16,r5			; perspective divide 1 (in flight)
+	div	r16,r7			; perspective divide 2
+	add	r8,r9			; u += du
+	add	r10,r11			; v += dv
+	move	r12,r14
+	load	(r14),r1		; texel fetch
+	or	r1,r1			; consume
+	cmp	r13,r9			; edge check (u vs threshold)
+	jr	PL,.fk0		; ~half taken
+	moveq	#0,r9			; slot: wrap u (benign)
+.fk0:
+	add	r8,r9			; u += du
+	add	r10,r11			; v += dv
+	move	r12,r14
+	load	(r14),r1		; texel fetch
+	or	r1,r1			; consume
+	cmp	r13,r9			; edge check (u vs threshold)
+	jr	PL,.fk1		; ~half taken
+	moveq	#0,r9			; slot: wrap u (benign)
+.fk1:
+	add	r8,r9			; u += du
+	add	r10,r11			; v += dv
+	move	r12,r14
+	load	(r14),r1		; texel fetch
+	or	r1,r1			; consume
+	cmp	r13,r9			; edge check (u vs threshold)
+	jr	PL,.fk2		; ~half taken
+	moveq	#0,r9			; slot: wrap u (benign)
+.fk2:
+	add	r8,r9			; u += du
+	add	r10,r11			; v += dv
+	move	r12,r14
+	load	(r14),r1		; texel fetch
+	or	r1,r1			; consume
+	cmp	r13,r9			; edge check (u vs threshold)
+	jr	PL,.fk3		; ~half taken
+	moveq	#0,r9			; slot: wrap u (benign)
+.fk3:
+	add	r8,r9			; u += du
+	add	r10,r11			; v += dv
+	move	r12,r14
+	load	(r14),r1		; texel fetch
+	or	r1,r1			; consume
+	cmp	r13,r9			; edge check (u vs threshold)
+	jr	PL,.fk4		; ~half taken
+	moveq	#0,r9			; slot: wrap u (benign)
+.fk4:
+	add	r8,r9			; u += du
+	add	r10,r11			; v += dv
+	move	r12,r14
+	load	(r14),r1		; texel fetch
+	or	r1,r1			; consume
+	cmp	r13,r9			; edge check (u vs threshold)
+	jr	PL,.fk5		; ~half taken
+	moveq	#0,r9			; slot: wrap u (benign)
+.fk5:
+	add	r8,r9			; u += du
+	add	r10,r11			; v += dv
+	move	r12,r14
+	load	(r14),r1		; texel fetch
+	or	r1,r1			; consume
+	cmp	r13,r9			; edge check (u vs threshold)
+	jr	PL,.fk6		; ~half taken
+	moveq	#0,r9			; slot: wrap u (benign)
+.fk6:
+	add	r8,r9			; u += du
+	add	r10,r11			; v += dv
+	move	r12,r14
+	load	(r14),r1		; texel fetch
+	or	r1,r1			; consume
+	cmp	r13,r9			; edge check (u vs threshold)
+	jr	PL,.fk7		; ~half taken
+	moveq	#0,r9			; slot: wrap u (benign)
+.fk7:
+	add	r8,r9			; u += du
+	add	r10,r11			; v += dv
+	move	r12,r14
+	load	(r14),r1		; texel fetch
+	or	r1,r1			; consume
+	cmp	r13,r9			; edge check (u vs threshold)
+	jr	PL,.fk8		; ~half taken
+	moveq	#0,r9			; slot: wrap u (benign)
+.fk8:
+	add	r8,r9			; u += du
+	add	r10,r11			; v += dv
+	move	r12,r14
+	load	(r14),r1		; texel fetch
+	or	r1,r1			; consume
+	cmp	r13,r9			; edge check (u vs threshold)
+	jr	PL,.fk9		; ~half taken
+	moveq	#0,r9			; slot: wrap u (benign)
+.fk9:
+	add	r8,r9			; u += du
+	add	r10,r11			; v += dv
+	move	r12,r14
+	load	(r14),r1		; texel fetch
+	or	r1,r1			; consume
+	cmp	r13,r9			; edge check (u vs threshold)
+	jr	PL,.fk10		; ~half taken
+	moveq	#0,r9			; slot: wrap u (benign)
+.fk10:
+	add	r8,r9			; u += du
+	add	r10,r11			; v += dv
+	move	r12,r14
+	load	(r14),r1		; texel fetch
+	or	r1,r1			; consume
+	cmp	r13,r9			; edge check (u vs threshold)
+	jr	PL,.fk11		; ~half taken
+	moveq	#0,r9			; slot: wrap u (benign)
+.fk11:
+	add	r8,r9			; u += du
+	add	r10,r11			; v += dv
+	move	r12,r14
+	load	(r14),r1		; texel fetch
+	or	r1,r1			; consume
+	cmp	r13,r9			; edge check (u vs threshold)
+	jr	PL,.fk12		; ~half taken
+	moveq	#0,r9			; slot: wrap u (benign)
+.fk12:
+	add	r8,r9			; u += du
+	add	r10,r11			; v += dv
+	move	r12,r14
+	load	(r14),r1		; texel fetch
+	or	r1,r1			; consume
+	cmp	r13,r9			; edge check (u vs threshold)
+	jr	PL,.fk13		; ~half taken
+	moveq	#0,r9			; slot: wrap u (benign)
+.fk13:
+	add	r8,r9			; u += du
+	add	r10,r11			; v += dv
+	move	r12,r14
+	load	(r14),r1		; texel fetch
+	or	r1,r1			; consume
+	cmp	r13,r9			; edge check (u vs threshold)
+	jr	PL,.fk14		; ~half taken
+	moveq	#0,r9			; slot: wrap u (benign)
+.fk14:
+	add	r8,r9			; u += du
+	add	r10,r11			; v += dv
+	move	r12,r14
+	load	(r14),r1		; texel fetch
+	or	r1,r1			; consume
+	cmp	r13,r9			; edge check (u vs threshold)
+	jr	PL,.fk15		; ~half taken
+	moveq	#0,r9			; slot: wrap u (benign)
+.fk15:
+	or	r5,r5			; consume divide 1
+	or	r7,r7			; consume divide 2
+	PROBE_EPI
+	.68000
+	.data
+_p_face_e:
+
 ; ── p_bcmdidle / p_bcmdbusy: what does a bwait POLL actually cost? ──────────
 ; The +30% geometry-build optimism suspect (bench 2026-07-21): a bwait spin
 ; is a stream of B_CMD reads — a Tom REGISTER read from the GPU, a shape no
