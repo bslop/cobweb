@@ -1047,36 +1047,42 @@ _p_ldjumprn_e:
 	.globl	_p_mmult_e
 _p_mmult_s:
 	.gpu
-	; ---- bank 0: matrix into local SRAM (high-16 of each 32-bit word) ----
+	; ---- bank 0: matrix into local SRAM, each element in BOTH 16-bit halves ----
+	; SILICON FIX (OpenLara p_mmult, 2026-07-24): MMULT fetches the SRAM matrix
+	; element from the LOW 16 bits on real Tom, but jagemu's read16 takes the
+	; HIGH 16. A high-16-only layout reads as ZERO on silicon (mac=0, every output
+	; 0) while passing in jsim — the trap. Duplicating each s16 into both halves
+	; ((v<<16)|(v&0xFFFF)) is agnostic: silicon reads low, jsim reads high, both
+	; correct. Verified on the rig (rd=E6,212,33E for a [10..90] matrix).
 	movei	#$F03A00,r1		; row0
-	movei	#$00010000,r0		; 1
+	movei	#$00010001,r0		; 1
 	store	r0,(r1)
 	movei	#$F03A04,r1
-	movei	#$00020000,r0		; 2
+	movei	#$00020002,r0		; 2
 	store	r0,(r1)
 	movei	#$F03A08,r1
-	movei	#$00030000,r0		; 3
+	movei	#$00030003,r0		; 3
 	store	r0,(r1)
 	movei	#$F03A0C,r1		; row1
-	movei	#$000A0000,r0		; 10
+	movei	#$000A000A,r0		; 10
 	store	r0,(r1)
 	movei	#$F03A10,r1
-	movei	#$00140000,r0		; 20
+	movei	#$00140014,r0		; 20
 	store	r0,(r1)
 	movei	#$F03A14,r1
-	movei	#$001E0000,r0		; 30
+	movei	#$001E001E,r0		; 30
 	store	r0,(r1)
 	movei	#$F03A18,r1		; row2
-	movei	#$00640000,r0		; 100
+	movei	#$00640064,r0		; 100
 	store	r0,(r1)
 	movei	#$F03A1C,r1
-	movei	#$00C80000,r0		; 200
+	movei	#$00C800C8,r0		; 200
 	store	r0,(r1)
 	movei	#$F03A20,r1
-	movei	#$012C0000,r0		; 300
+	movei	#$012C012C,r0		; 300
 	store	r0,(r1)
 	movei	#$F03A24,r1		; ovf-row [-32768,0,0]
-	movei	#$80000000,r0		; -32768 in high-16
+	movei	#$80008000,r0		; -32768 in both halves
 	store	r0,(r1)
 	movei	#$F03A28,r1
 	moveq	#0,r0
@@ -1100,62 +1106,79 @@ _p_mmult_s:
 	; settle lets a LATER store catch it, which skews every output), store. The
 	; MAC pair is the exception: mac1/mac2 run back-to-back with NO settle between
 	; so we see whether the second MMULT accumulates onto the first.
-	movei	#$00050004,r2		; element0=4 (low), element1=5 (high)
-	moveta	r2,r2			; bank1.r2 = (5<<16)|4
-	moveq	#6,r3			; element2=6 (low of r3)
-	moveta	r3,r3			; bank1.r3 = 6
+	; SILICON FIX #2 (OpenLara p_mmult, 2026-07-24): the bank-1 vector must be
+	; moveta'd in the instructions IMMEDIATELY BEFORE each MMULT — a one-time
+	; setup moveta reads back fine (movefa) but MMULT sees a stale/zero operand,
+	; and firing MMULTs without that fresh moveta (or back-to-back) WEDGES real
+	; Tom (silicon 2026-07-24: CAL MMSTART then hang, reproduced 2x). The verified
+	; idiom (Black Ice White Noise engine.bin $5486): store MTXA; moveta; moveta;
+	; mmult. So keep the vector in bank-0 r2/r3 and re-moveta before every MMULT;
+	; no two MMULTs are ever adjacent.
+	movei	#$00050004,r2		; bank-0 src: element0=4 (low), element1=5 (high)
+	moveq	#6,r3			; bank-0 src: element2=6 (low)
 	movei	#$F02108,r9		; MTXA register address
-	; row0: MTXA=$100 -> o0
+	; row0: MTXA=$A00 -> o0
 	movei	#$A00,r10
 	store	r10,(r9)
-	nop
-	nop
+	moveta	r2,r2			; refresh bank1 vector — REQUIRED before each mmult
+	moveta	r3,r3
 	mmult	r2,r4
 	.rept	8
 	nop
 	.endr
 	movei	#$00104000,r11
 	store	r4,(r11)
-	; row1: MTXA=$10C -> o1
+	; row1: MTXA=$A0C -> o1
 	movei	#$A0C,r10
 	store	r10,(r9)
-	nop
-	nop
+	moveta	r2,r2
+	moveta	r3,r3
 	mmult	r2,r4
 	.rept	8
 	nop
 	.endr
 	movei	#$00104004,r11
 	store	r4,(r11)
-	; row2: MTXA=$118 -> o2
+	; row2: MTXA=$A18 -> o2
 	movei	#$A18,r10
 	store	r10,(r9)
-	nop
-	nop
+	moveta	r2,r2
+	moveta	r3,r3
 	mmult	r2,r4
 	.rept	8
 	nop
 	.endr
 	movei	#$00104008,r11
 	store	r4,(r11)
-	; ovf-row: MTXA=$124 -> ovf
+	; ovf-row: MTXA=$A24 -> ovf
 	movei	#$A24,r10
 	store	r10,(r9)
-	nop
-	nop
+	moveta	r2,r2
+	moveta	r3,r3
 	mmult	r2,r4
 	.rept	8
 	nop
 	.endr
 	movei	#$0010400C,r11
 	store	r4,(r11)
-	; MAC reset-vs-accumulate: two back-to-back MMULTs (row0, MTXA=$100)
+	; MTXA AUTO-ADVANCE test: MTXA set to $A00 (row0) ONCE, two MMULTs each with
+	; its own moveta + drain (NOT back-to-back — that wedges silicon). MTXA is NOT
+	; re-set before mmult2. jsim: m1==m2==row0 (32,32). SILICON 2026-07-24:
+	; m1=32 (row0) but m2=320 (=row1) — **hardware MMULT auto-advances MTXADDR by
+	; the matrix stride after each mmult; jsim does not.** (This is why the shipped
+	; idiom re-stores MTXA per row; also a candidate OpenLara optimization — let
+	; the pointer walk instead of storing it each row.)
 	movei	#$A00,r10
 	store	r10,(r9)
-	nop
-	nop
+	moveta	r2,r2
+	moveta	r3,r3
 	mmult	r2,r6			; mac1
-	mmult	r2,r7			; mac2 (==mac1 if reset per MMULT, ==2x if accumulate)
+	.rept	8
+	nop
+	.endr
+	moveta	r2,r2
+	moveta	r3,r3
+	mmult	r2,r7			; mac2 (== mac1 if reset per MMULT, 2x if accumulate)
 	.rept	8
 	nop
 	.endr
