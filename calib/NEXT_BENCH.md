@@ -418,7 +418,7 @@ Monotone in branch count as expected; needs silicon ratio to bisect the
 
 ---
 
-## 2026-07-23 p_ovlap/p_serial SILICON — EXACT. The +28% is NOT the GPU inner loop.
+## 2026-07-23 p_ovlap/p_serial SILICON — EXACT. Validates the async-blitter fix.
 
 Fresh-bounce flash, silicon (half-line ticks):
 
@@ -426,27 +426,35 @@ Fresh-bounce flash, silicon (half-line ticks):
     serial A 227  B 227     (jsim 228 / 227)
 
 Silicon MATCHES jsim to within 1 tick. Blit-hidden delta serial-ovlap =
-109 silicon vs 110 jsim — identical. The blit/compute overlap accounting
-is silicon-EXACT. Combined with:
-  - per-face compute      +9%  (face probe)
-  - blit RMW access/px    exact (DSTEN=1)
-  - density regime        silicon-exact (probe table)
-  - blit/compute overlap  EXACT (this probe)
+109 silicon vs 110 jsim — identical. jsim's blit/compute overlap
+accounting is silicon-EXACT.
 
-...every GPU-inner-loop micro-probe is silicon-exact or within 9%. Yet
-the whole game is +28%. CONCLUSION: the +28% does NOT live in the GPU
-per-face inner loop or the blitter. It lives at FRAME SCALE, in the one
-axis no single-subsystem probe reproduces: multi-master bus contention
-during ACTIVE DISPLAY — the Object Processor walking a large display
-list every scanline, concurrent with GPU compute + blitter + 68k. The
-probes all run with a minimal/quiet OP list; the game runs a big one.
+WHAT THIS ACTUALLY CONFIRMS (corrected framing — I re-read OpenLara's
+CURRENT reports after running this): the big fps gap (jsim 7.50 vs hw
+4.9) is already CLOSED. The async-Blitter charge took it to 5.43 (+11%);
+OP scan-out contention is modeled (+11.1%); Tom<->Jerry contention was
+measured NULL (656 vs 656) and the submitter WITHDREW that report (their
+42% counter was a PIT-readback artifact, since fixed); the residual
+frame time was traced to a bytewise framebuffer memcpy on the 68000
+(game-side, via the 68k PC histogram). So this ovlap/serial probe is NOT
+hunting an open bug — it INDEPENDENTLY VALIDATES the async-blitter
+concurrency model that closed the gap: the overlap the fix relies on is
+silicon-exact. A clean confirmation to hand back, not a new defect.
 
-NEXT PROBE (p_opcont): run the ovlap kernel with a LARGE OP object list
-active during visible scanout vs the quiet-display baseline. If silicon
-slows the GPU under OP scanout MORE than jsim does, the OP-tax sizing at
-frame scale is the +28%. jsim already has an OP-tax stretch in the
-density model (risc.rs) but it was tuned against quiet-display probes;
-this tests it under real scanout load. Design: build a full-screen OLP
-list of N objects (bitmap/scaled), enable display, run ovlap kernel in
-the visible region, measure GPU cyc vs N. Sweep N (0, small, game-size).
+(Earlier draft of this note speculated the residual was "frame-scale OP
+contention" — that was wrong; OP contention is already modeled at
++11.1% and the residual was the 68k memcpy. Corrected here.)
 
+Still possibly open (separate report, COBWEB_GAP_jerrypose_fps_
+overprediction, 2026-07-20 @ af1c3f6): jsim +27% when pose work moves
+68k->Jerry (jsim 6.00 vs silicon 4.72). Two-sided: 68k over-charged
+(the 68k side was since re-anchored in 147eda8, whole-program within 1%)
+and Jerry's marginal load invisible (resident-poll shows 98-100% busy
+either way). The Jerry-undercharge half wants a check against current
+HEAD before any new probe — do NOT model Tom<->Jerry DRAM contention
+(measured null). See the ovlap face-bisection probes for branch density
+if the compute path is ever re-opened.
+
+Also captured (jsim, wide-window peek --len 2048): full face/facenb/
+facebr branch-density bisection, monotone in branch count; needs a
+silicon ratio only if the +9% compute path is re-opened (low priority).
