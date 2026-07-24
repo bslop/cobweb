@@ -416,3 +416,37 @@ real wedge; all six face-bisection numbers are valid):
 Monotone in branch count as expected; needs silicon ratio to bisect the
 ~9% compute gap by branch density (secondary to the ovlap flash).
 
+---
+
+## 2026-07-23 p_ovlap/p_serial SILICON — EXACT. The +28% is NOT the GPU inner loop.
+
+Fresh-bounce flash, silicon (half-line ticks):
+
+    ovlap  A 118  B 117     (jsim 118 / 118)
+    serial A 227  B 227     (jsim 228 / 227)
+
+Silicon MATCHES jsim to within 1 tick. Blit-hidden delta serial-ovlap =
+109 silicon vs 110 jsim — identical. The blit/compute overlap accounting
+is silicon-EXACT. Combined with:
+  - per-face compute      +9%  (face probe)
+  - blit RMW access/px    exact (DSTEN=1)
+  - density regime        silicon-exact (probe table)
+  - blit/compute overlap  EXACT (this probe)
+
+...every GPU-inner-loop micro-probe is silicon-exact or within 9%. Yet
+the whole game is +28%. CONCLUSION: the +28% does NOT live in the GPU
+per-face inner loop or the blitter. It lives at FRAME SCALE, in the one
+axis no single-subsystem probe reproduces: multi-master bus contention
+during ACTIVE DISPLAY — the Object Processor walking a large display
+list every scanline, concurrent with GPU compute + blitter + 68k. The
+probes all run with a minimal/quiet OP list; the game runs a big one.
+
+NEXT PROBE (p_opcont): run the ovlap kernel with a LARGE OP object list
+active during visible scanout vs the quiet-display baseline. If silicon
+slows the GPU under OP scanout MORE than jsim does, the OP-tax sizing at
+frame scale is the +28%. jsim already has an OP-tax stretch in the
+density model (risc.rs) but it was tuned against quiet-display probes;
+this tests it under real scanout load. Design: build a full-screen OLP
+list of N objects (bitmap/scaled), enable display, run ovlap kernel in
+the visible region, measure GPU cyc vs N. Sweep N (0, small, game-size).
+

@@ -1,0 +1,24 @@
+Script started on 2026-07-23 19:35:36-06:00 [COMMAND="/home/jvilla/jaguar-tools/bin/jcp -c build/calibovlap_skunk.cof" <not executed on terminal>]
+jcp v02.04.02 built on Jul  6 2026
+
+COFF File:  Skip 168 bytes, base addr is $4000, length is 44512 bytes
+Sending...|/-\|/-\.|/ 
+-\|Jag accepted start request at $00004000.
+ 
+Finished in 5671 millis, 7KB/second.
+ 
+Starting console...
+Cobweb jsim calibration suite v1
+CAL ovlap    A s=0000005D e=000000D3 w=00000000 r=00000040
+CAL serial   A s=000000D2 e=000001B5 w=00000000 r=00000040
+CAL ovlap    B s=00000118 e=0000018D w=00000000 r=00000040
+CAL serial   B s=00000144 e=0000001A w=00000001 r=00000040
+CAL DIVLAT k=00000000 sm=00000055 lg=2AAAAAA5
+CAL DIVLAT k=00000001 sm=00000055 lg=2AAAAAA5
+CAL DIVLAT k=00000002 sm=00000055 lg=2AAAAAA5
+CAL DIVLAT k=00000003 sm=00000055 lg=2AAAAAA5
+CAL DIVLAT k=00000004 sm=00000055 lg=2AAAAAA5
+CAL DIVLAT k=00000005 sm=00000055 lg=2AAAAAA5
+CAL DIVLAT k=00000006 sm=00000055 lg=2AAAAAA5
+CAL DIVLAT k=00000007 sm=00000055 lg=2AAAAAA5
+CAL DIVLAT k=00000008 sm=00000055 lg=2AAAAAA5
