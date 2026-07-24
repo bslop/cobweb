@@ -6,6 +6,24 @@ assigned at release.
 
 ## Unreleased
 
+### 2026-07-24 — jsim MMULT read the wrong half of the matrix word
+
+- **`jsim`: MMULT read the matrix operand from the HIGH 16 bits of each
+  stride-4 local-RAM word; real Tom reads the LOW 16.** Fixed
+  `isa.rs::mmult` (`read16(addr)` → `read16(addr + 2)`), matching its own
+  ISA §7.1 (the MAC datapath takes the low 16 bits of each operand). Every
+  matrix packed high-half transformed to all zeros on silicon while jsim
+  computed the right answer — a silent divergence in the exact path
+  OpenLara's vertex transform uses. Proven on a Skunkboard by a bisection
+  ladder (`calib` `p_mm_*`): matrix in the high half → 0, low half → 32;
+  jsim now byte-matches silicon on all arms, 42 jag-core tests still pass.
+- **Silicon-validated MMULT semantics (for `jas`/docs and callers):** matrix
+  = one element per 32-bit word (stride 4) in the **low 16 bits**, s16;
+  vector = bank-1 regs, two s16 packed, via `moveta`; **row-major**;
+  s16 operands → full **s32** result; and **two adjacent MMULTs hard-wedge
+  the GPU** (bug 23) — a settle is required between them. (MTXADDR
+  auto-advance is under silicon confirmation on `wip/mmult-mtxa-autoadvance`.)
+
 ### 2026-07-22 — hazard counters now name the address
 
 - **`JSIM_HAZARD_TRACE=1` prints the PC of every `slot_movei`/`slot_jump`
