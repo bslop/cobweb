@@ -356,3 +356,30 @@ DECISION RULE:
 
 Everything else fits silicon. This is the last substantial accuracy gap.
 
+---
+
+## 2026-07-23 p_face RESULT — the +28% is NOT the compute; it's the blit-spin
+
+Clean silicon flash (calibface, mode B): **face silicon 3.55 vs jsim 3.26
+= +8.9%** (mode A even UNDER: 4.06 vs 4.22). The synthetic per-face
+compute (2 divides + 16px DDA + per-pixel edge branches) is only ~9% too
+fast in jsim — NOT the +28%. So the residual is dominated by the
+BLIT-SPIN INTERACTION, exactly where round-4 pointed: jsim's compute
+being only mildly fast still un-hides the blit because the kernel is
+right at the compute/blit balance point, but the bulk of the +28% is in
+how jsim's blit_busy-drain vs the poll-spin cadence accumulates across a
+full frame of launches — not in the raw compute.
+
+NEXT PROBE (the real one): p_ovlap — launch a 128px blit, do exactly
+blit-duration-worth of GPU compute (no bwait), THEN bwait; vs p_serial —
+launch, bwait immediately, then the same compute. On silicon the compute
+hides the blit (ovlap ~= compute, serial ~= blit+compute); the delta =
+blit hidden. If jsim's delta < silicon's, jsim under-credits the overlap
+= the +28%. This isolates the concurrency accounting directly.
+
+Staged but NOT silicon-confirmed (board dropped off USB mid-flash):
+facenb (no branches) / facebr (3 br/px) branch-density bisection of the
+9%. jsim facebr mode-B did not complete in the sim peek — VERIFY the
+facebr probe before flashing (possible wedge; the 48 unrolled jr targets
+need a check). face itself is proven.
+

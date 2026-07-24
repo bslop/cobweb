@@ -1124,6 +1124,407 @@ _p_face_s:
 	.data
 _p_face_e:
 
+; ── p_facenb / p_facebr: branch-density bisection of p_face ──────────────
+	.even
+	.globl	_p_facenb_s
+	.globl	_p_facenb_e
+_p_facenb_s:
+	.gpu
+	PROBE_PRO
+	move	r19,r12
+	movei	#$10001,r5
+	movei	#$7FFFFFF0,r7
+	movei	#3,r16
+	moveq	#1,r8
+	moveq	#1,r10
+	moveq	#0,r9
+	moveq	#0,r11
+	movei	#8,r13
+	div	r16,r5
+	div	r16,r7
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	load	(r14),r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	load	(r14),r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	load	(r14),r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	load	(r14),r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	load	(r14),r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	load	(r14),r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	load	(r14),r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	load	(r14),r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	load	(r14),r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	load	(r14),r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	load	(r14),r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	load	(r14),r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	load	(r14),r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	load	(r14),r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	load	(r14),r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	load	(r14),r1
+	or	r1,r1
+	or	r5,r5
+	or	r7,r7
+	PROBE_EPI
+	.68000
+	.data
+_p_facenb_e:
+
+	.even
+	.globl	_p_facebr_s
+	.globl	_p_facebr_e
+_p_facebr_s:
+	.gpu
+	PROBE_PRO
+	move	r19,r12
+	movei	#$10001,r5
+	movei	#$7FFFFFF0,r7
+	movei	#3,r16
+	moveq	#1,r8
+	moveq	#1,r10
+	moveq	#0,r9
+	moveq	#0,r11
+	movei	#8,r13
+	div	r16,r5
+	div	r16,r7
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	load	(r14),r1
+	or	r1,r1
+	cmp	r13,r9
+	jr	PL,.facebr0
+	moveq	#0,r9
+.facebr0:
+	cmp	r13,r9
+	jr	PL,.facebr1
+	moveq	#0,r9
+.facebr1:
+	cmp	r13,r9
+	jr	PL,.facebr2
+	moveq	#0,r9
+.facebr2:
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	load	(r14),r1
+	or	r1,r1
+	cmp	r13,r9
+	jr	PL,.facebr3
+	moveq	#0,r9
+.facebr3:
+	cmp	r13,r9
+	jr	PL,.facebr4
+	moveq	#0,r9
+.facebr4:
+	cmp	r13,r9
+	jr	PL,.facebr5
+	moveq	#0,r9
+.facebr5:
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	load	(r14),r1
+	or	r1,r1
+	cmp	r13,r9
+	jr	PL,.facebr6
+	moveq	#0,r9
+.facebr6:
+	cmp	r13,r9
+	jr	PL,.facebr7
+	moveq	#0,r9
+.facebr7:
+	cmp	r13,r9
+	jr	PL,.facebr8
+	moveq	#0,r9
+.facebr8:
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	load	(r14),r1
+	or	r1,r1
+	cmp	r13,r9
+	jr	PL,.facebr9
+	moveq	#0,r9
+.facebr9:
+	cmp	r13,r9
+	jr	PL,.facebr10
+	moveq	#0,r9
+.facebr10:
+	cmp	r13,r9
+	jr	PL,.facebr11
+	moveq	#0,r9
+.facebr11:
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	load	(r14),r1
+	or	r1,r1
+	cmp	r13,r9
+	jr	PL,.facebr12
+	moveq	#0,r9
+.facebr12:
+	cmp	r13,r9
+	jr	PL,.facebr13
+	moveq	#0,r9
+.facebr13:
+	cmp	r13,r9
+	jr	PL,.facebr14
+	moveq	#0,r9
+.facebr14:
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	load	(r14),r1
+	or	r1,r1
+	cmp	r13,r9
+	jr	PL,.facebr15
+	moveq	#0,r9
+.facebr15:
+	cmp	r13,r9
+	jr	PL,.facebr16
+	moveq	#0,r9
+.facebr16:
+	cmp	r13,r9
+	jr	PL,.facebr17
+	moveq	#0,r9
+.facebr17:
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	load	(r14),r1
+	or	r1,r1
+	cmp	r13,r9
+	jr	PL,.facebr18
+	moveq	#0,r9
+.facebr18:
+	cmp	r13,r9
+	jr	PL,.facebr19
+	moveq	#0,r9
+.facebr19:
+	cmp	r13,r9
+	jr	PL,.facebr20
+	moveq	#0,r9
+.facebr20:
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	load	(r14),r1
+	or	r1,r1
+	cmp	r13,r9
+	jr	PL,.facebr21
+	moveq	#0,r9
+.facebr21:
+	cmp	r13,r9
+	jr	PL,.facebr22
+	moveq	#0,r9
+.facebr22:
+	cmp	r13,r9
+	jr	PL,.facebr23
+	moveq	#0,r9
+.facebr23:
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	load	(r14),r1
+	or	r1,r1
+	cmp	r13,r9
+	jr	PL,.facebr24
+	moveq	#0,r9
+.facebr24:
+	cmp	r13,r9
+	jr	PL,.facebr25
+	moveq	#0,r9
+.facebr25:
+	cmp	r13,r9
+	jr	PL,.facebr26
+	moveq	#0,r9
+.facebr26:
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	load	(r14),r1
+	or	r1,r1
+	cmp	r13,r9
+	jr	PL,.facebr27
+	moveq	#0,r9
+.facebr27:
+	cmp	r13,r9
+	jr	PL,.facebr28
+	moveq	#0,r9
+.facebr28:
+	cmp	r13,r9
+	jr	PL,.facebr29
+	moveq	#0,r9
+.facebr29:
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	load	(r14),r1
+	or	r1,r1
+	cmp	r13,r9
+	jr	PL,.facebr30
+	moveq	#0,r9
+.facebr30:
+	cmp	r13,r9
+	jr	PL,.facebr31
+	moveq	#0,r9
+.facebr31:
+	cmp	r13,r9
+	jr	PL,.facebr32
+	moveq	#0,r9
+.facebr32:
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	load	(r14),r1
+	or	r1,r1
+	cmp	r13,r9
+	jr	PL,.facebr33
+	moveq	#0,r9
+.facebr33:
+	cmp	r13,r9
+	jr	PL,.facebr34
+	moveq	#0,r9
+.facebr34:
+	cmp	r13,r9
+	jr	PL,.facebr35
+	moveq	#0,r9
+.facebr35:
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	load	(r14),r1
+	or	r1,r1
+	cmp	r13,r9
+	jr	PL,.facebr36
+	moveq	#0,r9
+.facebr36:
+	cmp	r13,r9
+	jr	PL,.facebr37
+	moveq	#0,r9
+.facebr37:
+	cmp	r13,r9
+	jr	PL,.facebr38
+	moveq	#0,r9
+.facebr38:
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	load	(r14),r1
+	or	r1,r1
+	cmp	r13,r9
+	jr	PL,.facebr39
+	moveq	#0,r9
+.facebr39:
+	cmp	r13,r9
+	jr	PL,.facebr40
+	moveq	#0,r9
+.facebr40:
+	cmp	r13,r9
+	jr	PL,.facebr41
+	moveq	#0,r9
+.facebr41:
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	load	(r14),r1
+	or	r1,r1
+	cmp	r13,r9
+	jr	PL,.facebr42
+	moveq	#0,r9
+.facebr42:
+	cmp	r13,r9
+	jr	PL,.facebr43
+	moveq	#0,r9
+.facebr43:
+	cmp	r13,r9
+	jr	PL,.facebr44
+	moveq	#0,r9
+.facebr44:
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	load	(r14),r1
+	or	r1,r1
+	cmp	r13,r9
+	jr	PL,.facebr45
+	moveq	#0,r9
+.facebr45:
+	cmp	r13,r9
+	jr	PL,.facebr46
+	moveq	#0,r9
+.facebr46:
+	cmp	r13,r9
+	jr	PL,.facebr47
+	moveq	#0,r9
+.facebr47:
+	or	r5,r5
+	or	r7,r7
+	PROBE_EPI
+	.68000
+	.data
+_p_facebr_e:
+
 ; ── p_bcmdidle / p_bcmdbusy: what does a bwait POLL actually cost? ──────────
 ; The +30% geometry-build optimism suspect (bench 2026-07-21): a bwait spin
 ; is a stream of B_CMD reads — a Tom REGISTER read from the GPU, a shape no
