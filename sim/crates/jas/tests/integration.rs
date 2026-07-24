@@ -439,6 +439,31 @@ fn rejects_two_sequential_jumps() {
 }
 
 #[test]
+fn rejects_adjacent_mmults() {
+    // Two MMULTs with nothing between hard-wedge real Tom (bug 23); jas must
+    // refuse them (calib p_mm_mm2 on silicon 2026-07-24).
+    let errs = errors_of(
+        "        .gpu\n\
+         \x20       mmult r2,r4\n\
+         \x20       mmult r2,r5\n",
+    );
+    assert!(errs.iter().any(|e| e.contains("adjacent MMULTs")), "got: {errs:?}");
+}
+
+#[test]
+fn accepts_mmults_separated_by_a_settle() {
+    // A single instruction between the MMULTs clears the wedge (p_mm_mm2s ran
+    // clean with a gap); no adjacency error.
+    let errs = errors_of(
+        "        .gpu\n\
+         \x20       mmult r2,r4\n\
+         \x20       nop\n\
+         \x20       mmult r2,r5\n",
+    );
+    assert!(!errs.iter().any(|e| e.contains("adjacent MMULTs")), "got: {errs:?}");
+}
+
+#[test]
 fn rejects_far_jr() {
     // a jr whose target is far past the 5-bit word range.
     let mut src = String::from("        .gpu\nstart:  jr far\n        nop\n");

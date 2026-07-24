@@ -237,6 +237,28 @@ pub fn check(emitted: &[Emitted]) -> Vec<Diag> {
             }
         }
 
+        // Two ADJACENT MMULTs hard-wedge real Tom (bug 23: the GPU hangs with
+        // the bus held; only a power-cycle recovers). The first MMULT's
+        // systolic MAC must drain before the next issues. Confirmed on silicon
+        // 2026-07-24 (calib p_mm_mm2): zero instructions between wedged, while
+        // an 8-instruction gap (p_mm_mm2s) ran clean. Flag only the confirmed
+        // zero-gap case; a NOP (or any instruction) between them clears it.
+        if acc.op == 54 {
+            if let Some(next) = insns.get(i + 1) {
+                if next.op == Some(54) {
+                    diags.push(Diag::error(
+                        next.line,
+                        "two adjacent MMULTs hard-wedge the GPU on silicon (bug 23: \
+                         the systolic MAC has not drained; recovery needs a power-cycle)",
+                    ).with_fix(
+                        "separate consecutive MMULTs with a settle — an 8-instruction \
+                         gap is known-safe; MTXADDR auto-advances, so a run of MMULTs \
+                         with MTXA set once still walks the matrix",
+                    ));
+                }
+            }
+        }
+
         // Is `reg` still inside its producer's shadow at instruction `i`? The
         // scoreboard only mis-behaves while the slow result is IN FLIGHT — a
         // load settles in ~16 cycles, a divide at cycle 18 (jsim's calibrated
