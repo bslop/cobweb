@@ -539,6 +539,42 @@ void cal_main(void)
         }
     }
 
+    {   /* p_mmult: MMULT operand layout / s16 / MAC on real Tom (Phase-0 gate,
+         * COBWEB_REQ_mmult_silicon_probe.md). Runs FIRST (right after DIVLAT) so
+         * its one line lands in the healthy post-bounce USB window — it is the
+         * highest-value result and the finicky Skunkboard link tends to drop
+         * partway through a session. Prints
+         *   CAL MMULT o0=.. o1=.. o2=.. ovf=.. m1=.. m2=..
+         * Expected if silicon == jsim: 20 140 C80 FFFE0000 20 20 (hex).
+         * o0=654 (0x28E) instead of 32 => column/transpose layout; m2==2*m1 =>
+         * MMULT accumulates rather than resets. */
+        u32 MMRES = 0x00104000UL;
+        u32 guard = 60000000UL;
+        char *d;
+        R32(MMRES + 32) = 0;
+        copy16(G_RAM, p_mmult_s, p_mmult_e);
+        R32(G_PC) = G_RAM;
+        R32(G_CTRL) = 1;
+        while (R32(MMRES + 32) != MAGIC_DONE && --guard)
+            ;
+        d = line;
+        d = put(d, "CAL MMULT o0=");
+        d = puth(d, R32(MMRES));
+        d = put(d, " o1=");
+        d = puth(d, R32(MMRES + 4));
+        d = put(d, " o2=");
+        d = puth(d, R32(MMRES + 8));
+        d = put(d, " ovf=");
+        d = puth(d, R32(MMRES + 12));
+        d = put(d, " m1=");
+        d = puth(d, R32(MMRES + 16));
+        d = put(d, " m2=");
+        d = puth(d, R32(MMRES + 20));
+        d = put(d, "\n");
+        *d = 0;
+        say(line);
+    }
+
     {   /* p_ldjump: load consumed across a taken jump (round 5.2). Prints
          * CAL LDJUMP dram=XXXXXXXX sram=XXXXXXXX. Correct == truths
          * (ABCD1234 / 5678DEF0); anything else = scoreboard dropped across
@@ -583,39 +619,6 @@ void cal_main(void)
         d = puth(d, R32(LJRES));
         d = put(d, " sram=");
         d = puth(d, R32(LJRES + 4));
-        d = put(d, "\n");
-        *d = 0;
-        say(line);
-    }
-
-    {   /* p_mmult: MMULT operand layout / s16 / MAC on real Tom (Phase-0 gate,
-         * COBWEB_REQ_mmult_silicon_probe.md). Prints
-         *   CAL MMULT o0=.. o1=.. o2=.. ovf=.. m1=.. m2=..
-         * Expected if silicon == jsim: 20 140 C80 FFFE0000 20 20 (hex).
-         * o0=654 (0x28E) instead of 32 => column/transpose layout; m2==2*m1 =>
-         * MMULT accumulates rather than resets. */
-        u32 MMRES = 0x00104000UL;
-        u32 guard = 60000000UL;
-        char *d;
-        R32(MMRES + 32) = 0;
-        copy16(G_RAM, p_mmult_s, p_mmult_e);
-        R32(G_PC) = G_RAM;
-        R32(G_CTRL) = 1;
-        while (R32(MMRES + 32) != MAGIC_DONE && --guard)
-            ;
-        d = line;
-        d = put(d, "CAL MMULT o0=");
-        d = puth(d, R32(MMRES));
-        d = put(d, " o1=");
-        d = puth(d, R32(MMRES + 4));
-        d = put(d, " o2=");
-        d = puth(d, R32(MMRES + 8));
-        d = put(d, " ovf=");
-        d = puth(d, R32(MMRES + 12));
-        d = put(d, " m1=");
-        d = puth(d, R32(MMRES + 16));
-        d = put(d, " m2=");
-        d = puth(d, R32(MMRES + 20));
         d = put(d, "\n");
         *d = 0;
         say(line);
