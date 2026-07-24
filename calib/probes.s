@@ -981,34 +981,39 @@ _p_mmult_s:
 	.gpu
 	movei	#PRMRESULT,r16
 	load	(r16),r18		; result block base (DRAM)
-	; --- write the asymmetric 3x3 into SRAM, row-major, one s16 per long in
-	;     the high half (MMULT read16 at 4-byte stride reads the high 16 bits) ---
+	; --- write the asymmetric 3x3 into SRAM, row-major, one s16 per long, in
+	;     BOTH 16-bit halves (element E -> (E<<16)|E). MMULT reads the element as
+	;     16-bit at 4-byte stride; on SILICON it reads the LOW half (per BIWN's
+	;     sign-extended-in-low layout), while jsim's read16 reads the HIGH half —
+	;     duplicating into both halves makes the probe agnostic and keeps both
+	;     green. v1-v5 stored E<<16 (high only) -> silicon read the low half = 0
+	;     -> MMULT accumulated nothing. ---
 	movei	#MTXBASE,r0
-	movei	#$000A0000,r1		; 10
+	movei	#$000A000A,r1		; 10
 	store	r1,(r0)
 	addqt	#4,r0
-	movei	#$00140000,r1		; 20
+	movei	#$00140014,r1		; 20
 	store	r1,(r0)
 	addqt	#4,r0
-	movei	#$001E0000,r1		; 30
+	movei	#$001E001E,r1		; 30
 	store	r1,(r0)
 	addqt	#4,r0
-	movei	#$00280000,r1		; 40
+	movei	#$00280028,r1		; 40
 	store	r1,(r0)
 	addqt	#4,r0
-	movei	#$00320000,r1		; 50
+	movei	#$00320032,r1		; 50
 	store	r1,(r0)
 	addqt	#4,r0
-	movei	#$003C0000,r1		; 60
+	movei	#$003C003C,r1		; 60
 	store	r1,(r0)
 	addqt	#4,r0
-	movei	#$00460000,r1		; 70
+	movei	#$00460046,r1		; 70
 	store	r1,(r0)
 	addqt	#4,r0
-	movei	#$00500000,r1		; 80
+	movei	#$00500050,r1		; 80
 	store	r1,(r0)
 	addqt	#4,r0
-	movei	#$005A0000,r1		; 90
+	movei	#$005A005A,r1		; 90
 	store	r1,(r0)
 	; --- MWIDTH = 3, row-major (bit4 = 0) ---
 	movei	#MTXCREG,r16
@@ -1023,25 +1028,31 @@ _p_mmult_s:
 	.rept	16
 	nop				; settle matrix stores + control + moveta
 	.endr
-	; --- v4: BIWN VERIFIED IDIOM — `store (G_MTXA); mmult` BACK-TO-BACK. The
-	;     mtxa store ARMS the systolic unit; MMULT must immediately follow with
-	;     NO intervening instr. v3's 8-nop gap => MMULT no-op = 0. (Black Ice
-	;     White Noise engine.bin $52E0 does exactly `store r12,(r6); mmult r7,r0`
-	;     then reads Rd via `move r0,r3` — so Rd IS written on silicon.) RESMAC
-	;     kept as a secondary MAC read. ---
+	; --- v5: EXACT BIWN idiom (engine.bin $5486). Per row:
+	;       store <matrixptr>,(G_MTXA) ; moveta vec ; moveta vec ; mmult ; move Rd
+	;     THE KEY (v1-v4 all missed it): the vector must be moveta'd into bank1 in
+	;     the instructions IMMEDIATELY BEFORE each mmult — MMULT reads its bank-1
+	;     operand through a path a recent moveta arms; a one-time setup moveta
+	;     reads back fine (movefa) but MMULT sees zero. Rd is read directly. ---
 	; ROW 0
 	movei	#MTXBASE,r2
-	store	r2,(r17)		; arm G_MTXA -> row0
-	mmult	r10,r3			; r3 = Rd (row0 . vec) — immediately after the store
-	resmac	r6			; r6 = MAC (secondary)
+	store	r2,(r17)		; G_MTXA -> row0
+	moveta	r10,r10			; refresh bank1 vector (elements 0,1) — REQUIRED
+	moveta	r11,r11			; refresh bank1 vector (element 2)
+	mmult	r10,r3			; r3 = Rd = row0 . vec
+	resmac	r6			; r6 = MAC (secondary check)
 	; ROW 1
 	movei	#MTXBASE+12,r2
-	store	r2,(r17)		; arm G_MTXA -> row1
+	store	r2,(r17)		; G_MTXA -> row1
+	moveta	r10,r10
+	moveta	r11,r11
 	mmult	r10,r4
 	resmac	r7
 	; ROW 2
 	movei	#MTXBASE+24,r2
-	store	r2,(r17)		; arm G_MTXA -> row2
+	store	r2,(r17)		; G_MTXA -> row2
+	moveta	r10,r10
+	moveta	r11,r11
 	mmult	r10,r5
 	resmac	r8
 	; --- INDEPENDENT manual MAC chain: acc = 2*10 + 3*20 + 5*30 = 230.
