@@ -1176,6 +1176,365 @@ _p_mmult_s:
 	.data
 _p_mmult_e:
 
+; ── p_mmult WEDGE-BISECTION LADDER (2026-07-23) ─────────────────────────────
+; The full p_mmult WEDGES real Tom (bug 23 — no external GO clear; power-cycle)
+; in BOTH formulations tried so far (REGPAGE switch, and bank-0/moveta). These
+; four minimal arms isolate WHICH ingredient wedges. Each self-stops from
+; bank 0 and writes {v0 @ base, v1 @ base+4, magic @ base+12}, where `base`
+; comes from PRMRESULT (main.c hands each arm its own slot, so a sim peek sees
+; all four and silicon prints them between launches). The FIRST arm that never
+; writes magic is the wedge trigger (the board is then dead, so the ladder
+; stops there). jsim runs all four CLEAN — the wedge is silicon-only — so this
+; must be bisected on silicon; the arms' VALUES also advance the Phase-0
+; operand-layout gate for free (nov=A0, w1=4, w3/w3s=20).
+;
+;   nov : full MMULT setup MINUS the mmult instruction  (isolates the op)
+;   w1  : ONE width-1 mmult, LONG (32-nop) MAC drain    -> v0 = 4
+;   w3  : ONE width-3 mmult, LONG drain                 -> v0 = 20
+;   w3s : ONE width-3 mmult, MINIMAL drain -> self-stop (the wedging shape)
+; Decode: nov+w1+w3 clean and w3s WEDGE => self-stop into a still-busy MAC
+;   (cure = drain the MAC before clearing GO). w3 wedge, w1 clean => width-3
+;   systolic pass. w1 wedge => the mmult+self-stop pair itself. nov wedge =>
+;   the setup path (unlikely: differs between the two prior wedging versions).
+
+	.even
+	.globl	_p_mm_nov_s
+	.globl	_p_mm_nov_e
+_p_mm_nov_s:
+	.gpu
+	movei	#PRMRESULT,r14
+	load	(r14),r12		; r12 = result base (per-arm slot)
+	movei	#$F03A00,r1		; matrix row0 [1,2,3] (hi16 words)
+	movei	#$00010000,r0
+	store	r0,(r1)
+	movei	#$F03A04,r1
+	movei	#$00020000,r0
+	store	r0,(r1)
+	movei	#$F03A08,r1
+	movei	#$00030000,r0
+	store	r0,(r1)
+	movei	#$F02104,r1		; MTXC = 3
+	moveq	#3,r0
+	store	r0,(r1)
+	movei	#$F02108,r9		; MTXA = $A00 -> $F03A00
+	movei	#$A00,r10
+	store	r10,(r9)
+	movei	#$00050004,r2		; vector into bank 1 via moveta
+	moveta	r2,r2
+	moveq	#6,r3
+	moveta	r3,r3
+	movei	#$000000A0,r4		; sentinel — NO mmult issued
+	store	r4,(r12)		; [0] v0
+	addqt	#4,r12
+	moveq	#0,r5
+	store	r5,(r12)		; [4] v1
+	addqt	#8,r12			; -> [12]
+	.rept	32
+	nop
+	.endr
+	movei	#MAGICD,r26
+	store	r26,(r12)		; [12] magic LAST
+	movei	#GCTRL,r27
+	moveq	#0,r28
+	store	r28,(r27)		; stop self (bank 0)
+	nop
+	nop
+	.68000
+	.data
+_p_mm_nov_e:
+
+	.even
+	.globl	_p_mm_w1_s
+	.globl	_p_mm_w1_e
+_p_mm_w1_s:
+	.gpu
+	movei	#PRMRESULT,r14
+	load	(r14),r12		; result base
+	movei	#$F03A00,r1		; matrix[0] = 1
+	movei	#$00010000,r0
+	store	r0,(r1)
+	movei	#$F02104,r1		; MTXC = 1
+	moveq	#1,r0
+	store	r0,(r1)
+	movei	#$00050004,r2		; vector [4,5,6] into bank 1
+	moveta	r2,r2
+	moveq	#6,r3
+	moveta	r3,r3
+	movei	#$F02108,r9		; MTXA = $A00
+	movei	#$A00,r10
+	store	r10,(r9)
+	nop
+	nop
+	mmult	r2,r4			; r4 = 1*4 = 4
+	.rept	32			; LONG MAC drain before consuming r4
+	nop
+	.endr
+	store	r4,(r12)		; [0] v0 = 4
+	addqt	#4,r12
+	moveq	#0,r5
+	store	r5,(r12)		; [4] v1
+	addqt	#8,r12			; -> [12]
+	.rept	32			; LONG drain before self-stop (bug-23 test)
+	nop
+	.endr
+	movei	#MAGICD,r26
+	store	r26,(r12)
+	movei	#GCTRL,r27
+	moveq	#0,r28
+	store	r28,(r27)
+	nop
+	nop
+	.68000
+	.data
+_p_mm_w1_e:
+
+	.even
+	.globl	_p_mm_w3_s
+	.globl	_p_mm_w3_e
+_p_mm_w3_s:
+	.gpu
+	movei	#PRMRESULT,r14
+	load	(r14),r12		; result base
+	movei	#$F03A00,r1		; matrix row0 [1,2,3]
+	movei	#$00010000,r0
+	store	r0,(r1)
+	movei	#$F03A04,r1
+	movei	#$00020000,r0
+	store	r0,(r1)
+	movei	#$F03A08,r1
+	movei	#$00030000,r0
+	store	r0,(r1)
+	movei	#$F02104,r1		; MTXC = 3
+	moveq	#3,r0
+	store	r0,(r1)
+	movei	#$00050004,r2
+	moveta	r2,r2
+	moveq	#6,r3
+	moveta	r3,r3
+	movei	#$F02108,r9
+	movei	#$A00,r10
+	store	r10,(r9)
+	nop
+	nop
+	mmult	r2,r4			; 1*4+2*5+3*6 = 32
+	.rept	32			; LONG MAC drain
+	nop
+	.endr
+	store	r4,(r12)		; [0] v0 = 20
+	addqt	#4,r12
+	moveq	#0,r5
+	store	r5,(r12)		; [4] v1
+	addqt	#8,r12			; -> [12]
+	.rept	32			; LONG drain before self-stop
+	nop
+	.endr
+	movei	#MAGICD,r26
+	store	r26,(r12)
+	movei	#GCTRL,r27
+	moveq	#0,r28
+	store	r28,(r27)
+	nop
+	nop
+	.68000
+	.data
+_p_mm_w3_e:
+
+	.even
+	.globl	_p_mm_w3s_s
+	.globl	_p_mm_w3s_e
+_p_mm_w3s_s:
+	.gpu
+	movei	#PRMRESULT,r14
+	load	(r14),r12		; result base
+	movei	#$F03A00,r1		; matrix row0 [1,2,3]
+	movei	#$00010000,r0
+	store	r0,(r1)
+	movei	#$F03A04,r1
+	movei	#$00020000,r0
+	store	r0,(r1)
+	movei	#$F03A08,r1
+	movei	#$00030000,r0
+	store	r0,(r1)
+	movei	#$F02104,r1		; MTXC = 3
+	moveq	#3,r0
+	store	r0,(r1)
+	movei	#$00050004,r2
+	moveta	r2,r2
+	moveq	#6,r3
+	moveta	r3,r3
+	movei	#$F02108,r9
+	movei	#$A00,r10
+	store	r10,(r9)
+	nop
+	nop
+	mmult	r2,r4
+	nop				; MINIMAL drain — the wedging original's shape
+	nop
+	store	r4,(r12)		; [0] v0 = 20 (r4 read scoreboards on mmult)
+	addqt	#4,r12
+	moveq	#0,r5
+	store	r5,(r12)		; [4] v1
+	addqt	#8,r12			; -> [12]
+	movei	#MAGICD,r26		; self-stop IMMEDIATELY — MAC likely still busy
+	store	r26,(r12)
+	movei	#GCTRL,r27
+	moveq	#0,r28
+	store	r28,(r27)
+	nop
+	nop
+	.68000
+	.data
+_p_mm_w3s_e:
+
+; ── p_mmult WHY-ZERO bisection (2026-07-23 night, round 2) ──────────────────
+; Round 1 result: NO single-mmult arm wedged, but every mmult arm returned
+; v0=0 on silicon (jsim gives 4/20/20). So (a) the full-probe wedge is a
+; MULTI-mmult effect, and (b) silicon mmult reads ZERO operands here. These
+; three arms find WHY zero. Primary hypothesis: silicon reads each matrix
+; element from the LOW 16 bits of its SRAM word; jsim/mmult_ref store it in
+; the HIGH 16 (stride-4 high-word convention). r4 is preseeded $0000DEAD
+; before each mmult so v0 distinguishes: 0 = mmult wrote zero, DEAD = mmult
+; left Rd untouched (result lands elsewhere), 20 = correct.
+;   mmhi : matrix in HIGH 16 (reproduce round 1)     jsim 20, silicon 0 (pred)
+;   mmlo : matrix in LOW  16                          jsim 0,  silicon 20 (pred if low-half)
+;   mrd  : store $00010000 -> SRAM, load it back      both $00010000 (sanity)
+
+	.even
+	.globl	_p_mm_mmhi_s
+	.globl	_p_mm_mmhi_e
+_p_mm_mmhi_s:
+	.gpu
+	movei	#PRMRESULT,r14
+	load	(r14),r12
+	movei	#$F03A00,r1		; matrix row0 [1,2,3] in HIGH 16
+	movei	#$00010000,r0
+	store	r0,(r1)
+	movei	#$F03A04,r1
+	movei	#$00020000,r0
+	store	r0,(r1)
+	movei	#$F03A08,r1
+	movei	#$00030000,r0
+	store	r0,(r1)
+	movei	#$F02104,r1		; MTXC = 3
+	moveq	#3,r0
+	store	r0,(r1)
+	movei	#$00050004,r2		; vector -> bank 1
+	moveta	r2,r2
+	moveq	#6,r3
+	moveta	r3,r3
+	movei	#$F02108,r9		; MTXA = $A00
+	movei	#$A00,r10
+	store	r10,(r9)
+	movei	#$0000DEAD,r4		; preseed Rd
+	nop
+	nop
+	mmult	r2,r4
+	.rept	16
+	nop
+	.endr
+	store	r4,(r12)		; 0=wrote-zero, DEAD=inert, 20=ok
+	addqt	#4,r12
+	moveq	#0,r5
+	store	r5,(r12)
+	addqt	#8,r12
+	.rept	16
+	nop
+	.endr
+	movei	#MAGICD,r26
+	store	r26,(r12)
+	movei	#GCTRL,r27
+	moveq	#0,r28
+	store	r28,(r27)
+	nop
+	nop
+	.68000
+	.data
+_p_mm_mmhi_e:
+
+	.even
+	.globl	_p_mm_mmlo_s
+	.globl	_p_mm_mmlo_e
+_p_mm_mmlo_s:
+	.gpu
+	movei	#PRMRESULT,r14
+	load	(r14),r12
+	movei	#$F03A00,r1		; matrix row0 [1,2,3] in LOW 16
+	movei	#$00000001,r0
+	store	r0,(r1)
+	movei	#$F03A04,r1
+	movei	#$00000002,r0
+	store	r0,(r1)
+	movei	#$F03A08,r1
+	movei	#$00000003,r0
+	store	r0,(r1)
+	movei	#$F02104,r1		; MTXC = 3
+	moveq	#3,r0
+	store	r0,(r1)
+	movei	#$00050004,r2
+	moveta	r2,r2
+	moveq	#6,r3
+	moveta	r3,r3
+	movei	#$F02108,r9
+	movei	#$A00,r10
+	store	r10,(r9)
+	movei	#$0000DEAD,r4		; preseed Rd
+	nop
+	nop
+	mmult	r2,r4
+	.rept	16
+	nop
+	.endr
+	store	r4,(r12)		; 20 here => silicon reads the LOW half
+	addqt	#4,r12
+	moveq	#0,r5
+	store	r5,(r12)
+	addqt	#8,r12
+	.rept	16
+	nop
+	.endr
+	movei	#MAGICD,r26
+	store	r26,(r12)
+	movei	#GCTRL,r27
+	moveq	#0,r28
+	store	r28,(r27)
+	nop
+	nop
+	.68000
+	.data
+_p_mm_mmlo_e:
+
+	.even
+	.globl	_p_mm_mrd_s
+	.globl	_p_mm_mrd_e
+_p_mm_mrd_s:
+	.gpu
+	movei	#PRMRESULT,r14
+	load	(r14),r12
+	movei	#$F03A00,r1
+	movei	#$00010000,r0
+	store	r0,(r1)			; store a known word to the matrix SRAM
+	nop
+	nop
+	load	(r1),r4			; read it straight back -> expect $00010000
+	store	r4,(r12)
+	addqt	#4,r12
+	moveq	#0,r5
+	store	r5,(r12)
+	addqt	#8,r12
+	.rept	16
+	nop
+	.endr
+	movei	#MAGICD,r26
+	store	r26,(r12)
+	movei	#GCTRL,r27
+	moveq	#0,r28
+	store	r28,(r27)
+	nop
+	nop
+	.68000
+	.data
+_p_mm_mrd_e:
+
 ; ── p_mmultw: width-3 MMULT throughput (timing, COBWEB_REQ item 3) ──────────
 ; Standard VC-timed probe: MTXC=3, MTXA at the safe $A00 region, then a run of
 ; back-to-back width-3 MMULTs. Runs in bank 0 so the vector regs are whatever —
