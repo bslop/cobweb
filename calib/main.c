@@ -84,6 +84,8 @@ extern char p_ldjump_s[], p_ldjump_e[];
 extern char p_face_s[], p_face_e[];
 extern char p_facenb_s[], p_facenb_e[];
 extern char p_facebr_s[], p_facebr_e[];
+extern char p_ovlap_s[], p_ovlap_e[];
+extern char p_serial_s[], p_serial_e[];
 extern char p_bcmdidle_s[], p_bcmdidle_e[];
 extern char p_bcmdbusy_s[], p_bcmdbusy_e[];
 extern char p_ldunderb_s[], p_ldunderb_e[];
@@ -191,6 +193,8 @@ static const struct probe probes[] = {
     { "face    ", p_face_s, p_face_e, 0, 0, 128, DRAM_BUF },
     { "facenb  ", p_facenb_s, p_facenb_e, 0, 0, 128, DRAM_BUF },
     { "facebr  ", p_facebr_s, p_facebr_e, 0, 0, 128, DRAM_BUF },
+    { "ovlap   ", p_ovlap_s, p_ovlap_e, 0, 0, 64, DRAM_BUF },
+    { "serial  ", p_serial_s, p_serial_e, 0, 0, 64, DRAM_BUF },
     { "bcmdidle", p_bcmdidle_s, p_bcmdidle_e, 0, 0, 128, DRAM_BUF },
     { "bcmdbusy", p_bcmdbusy_s, p_bcmdbusy_e, 0, 0, 128, DRAM_BUF },
     { "lddramop", p_lddram_s, p_lddram_e, 0, 0, 512, DRAM_BUF, 0, 0, 1, 1 },
@@ -455,6 +459,10 @@ void cal_main(void)
         if (probes[i].ks != p_face_s && probes[i].ks != p_facenb_s && probes[i].ks != p_facebr_s)
             continue;
 #endif
+#ifdef OVLAP_ONLY
+        if (probes[i].ks != p_ovlap_s && probes[i].ks != p_serial_s)
+            continue;
+#endif
 #ifdef CPUBENCH_ONLY
         if (!probes[i].cpubench)
             continue; /* fast ROM: 68k bench only, completes inside one capture */
@@ -474,6 +482,10 @@ void cal_main(void)
     for (i = 1; i < NPROBES; i++) { /* vcmod runs once; skip in mode B */
 #ifdef FACE_ONLY
         if (probes[i].ks != p_face_s && probes[i].ks != p_facenb_s && probes[i].ks != p_facebr_s)
+            continue;
+#endif
+#ifdef OVLAP_ONLY
+        if (probes[i].ks != p_ovlap_s && probes[i].ks != p_serial_s)
             continue;
 #endif
 #ifdef CPUBENCH_ONLY

@@ -97,6 +97,18 @@ $(BUILD)/mainface_sim.o: main.c | $(BUILD)
 $(BUILD)/calibface_sim.cof: $(COMMON) $(BUILD)/mainface_sim.o $(LAST)
 	$(RLN) -e -rq -a 4000 x x -o $@ $(BUILD)/bootstub.o $(BUILD)/mainface_sim.o $(BUILD)/probes.o $(LAST)
 
+$(BUILD)/mainovlap_skunk.o: main.c | $(BUILD)
+	$(CC68) $(CFLAGS) -DUSE_SKUNK_CONSOLE -DOVLAP_ONLY -c -o $@ $<
+
+$(BUILD)/calibovlap_skunk.cof: $(COMMON) $(BUILD)/mainovlap_skunk.o $(BUILD)/skunkglue.o $(BUILD)/skunk.o $(LAST)
+	$(RLN) -e -rq -a 4000 x x -o $@ $(BUILD)/bootstub.o $(BUILD)/mainovlap_skunk.o $(BUILD)/probes.o $(BUILD)/skunkglue.o $(BUILD)/skunk.o $(LAST)
+
+$(BUILD)/mainovlap_sim.o: main.c | $(BUILD)
+	$(CC68) $(CFLAGS) -DOVLAP_ONLY -c -o $@ $<
+
+$(BUILD)/calibovlap_sim.cof: $(COMMON) $(BUILD)/mainovlap_sim.o $(LAST)
+	$(RLN) -e -rq -a 4000 x x -o $@ $(BUILD)/bootstub.o $(BUILD)/mainovlap_sim.o $(BUILD)/probes.o $(LAST)
+
 
 
 
