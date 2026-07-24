@@ -504,10 +504,14 @@ fn mmult(core: &mut Risc, bus: &mut Bus, r1: usize, r2: usize, b: usize) {
         let reg_idx = r1 + i / 2;
         let regw = core.reg(1, reg_idx & 0x1F);
         let a = if i & 1 == 0 { regw & 0xFFFF } else { regw >> 16 } as i16 as i64;
-        // local-RAM operand.
+        // local-RAM operand: one element per 32-bit word (stride 4), and the
+        // MAC datapath takes the LOW 16 bits of each operand (§7.1). On this
+        // big-endian bus read16(addr) is the HIGH half, so read addr+2.
+        // (Silicon 2026-07-23, p_mm_mmlo: value in the low half -> 32; value
+        // in the high half -> 0. read16(addr) had it backwards.)
         let stride = if by_column { (width as u32) * 4 } else { 4 };
         let addr = sram + mtxaddr + (i as u32) * stride;
-        let m = bus.read16(addr) as i16 as i64;
+        let m = bus.read16(addr + 2) as i16 as i64;
         acc += a * m;
     }
     core.mac = acc;

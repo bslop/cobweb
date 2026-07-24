@@ -83,6 +83,13 @@ extern char p_divlat_s[], p_divlat_e[];
 extern char p_ldjump_s[], p_ldjump_e[];
 extern char p_ldjumprn_s[], p_ldjumprn_e[];
 extern char p_mmult_s[], p_mmult_e[];
+extern char p_mm_nov_s[], p_mm_nov_e[];
+extern char p_mm_w1_s[], p_mm_w1_e[];
+extern char p_mm_w3_s[], p_mm_w3_e[];
+extern char p_mm_w3s_s[], p_mm_w3s_e[];
+extern char p_mm_mmhi_s[], p_mm_mmhi_e[];
+extern char p_mm_mmlo_s[], p_mm_mmlo_e[];
+extern char p_mm_mrd_s[], p_mm_mrd_e[];
 extern char p_mmultw_s[], p_mmultw_e[];
 extern char p_mmulta_s[], p_mmulta_e[];
 extern char p_face_s[], p_face_e[];
@@ -539,6 +546,57 @@ void cal_main(void)
         }
     }
 
+    {   /* p_mm bisection ladder: WHICH ingredient of MMULT wedges real Tom.
+         * The full p_mmult wedges (bug 23) in two formulations; these four
+         * minimal arms each self-stop from bank 0 and write magic at RES+12.
+         * Launch them in order; the FIRST that never writes magic is the wedge
+         * trigger — and the board is then dead (bug 23), so stop the ladder.
+         * jsim runs all four clean (the wedge is silicon-only). Prints:
+         *   CAL MMBIS <nm> v0=.. v1=..   (arm completed — value also decodes
+         *                                 the operand layout: nov=A0, w1=4,
+         *                                 w3/w3s=20)
+         *   CAL MMBIS <nm> WEDGED        (arm hung the GPU) */
+        u32 RES = 0x00105000UL;
+        char *ks[7], *ke[7];
+        const char *nm[7];
+        int a;
+        ks[0] = p_mm_nov_s;  ke[0] = p_mm_nov_e;  nm[0] = "nov";
+        ks[1] = p_mm_w1_s;   ke[1] = p_mm_w1_e;   nm[1] = "w1";
+        ks[2] = p_mm_w3_s;   ke[2] = p_mm_w3_e;   nm[2] = "w3";
+        ks[3] = p_mm_w3s_s;  ke[3] = p_mm_w3s_e;  nm[3] = "w3s";
+        ks[4] = p_mm_mmhi_s; ke[4] = p_mm_mmhi_e; nm[4] = "mmhi";
+        ks[5] = p_mm_mmlo_s; ke[5] = p_mm_mmlo_e; nm[5] = "mmlo";
+        ks[6] = p_mm_mrd_s;  ke[6] = p_mm_mrd_e;  nm[6] = "mrd";
+        for (a = 0; a < 7; a++) {
+            u32 guard = 60000000UL;
+            u32 slot = RES + (u32)a * 0x20; /* distinct slot per arm (sim peek) */
+            char *d = line;
+            R32(slot + 12) = 0;
+            copy16(G_RAM, ks[a], ke[a]);
+            R32(PARAM_RESULT) = slot;
+            R32(G_PC) = G_RAM;
+            R32(G_CTRL) = 1;
+            while (R32(slot + 12) != MAGIC_DONE && --guard)
+                ;
+            R32(G_CTRL) = 0; /* force-stop (fails under bug 23 if wedged) */
+            d = put(d, "CAL MMBIS ");
+            d = put(d, nm[a]);
+            if (guard == 0) {
+                d = put(d, " WEDGED\n");
+                *d = 0;
+                say(line);
+                break; /* board dead (bug 23) — stop the ladder here */
+            }
+            d = put(d, " v0=");
+            d = puth(d, R32(slot));
+            d = put(d, " v1=");
+            d = puth(d, R32(slot + 4));
+            d = put(d, "\n");
+            *d = 0;
+            say(line);
+        }
+    }
+
     {   /* p_mmult: MMULT operand layout / s16 / MAC on real Tom (Phase-0 gate,
          * COBWEB_REQ_mmult_silicon_probe.md). Runs FIRST (right after DIVLAT) so
          * its one line lands in the healthy post-bounce USB window — it is the
@@ -547,7 +605,11 @@ void cal_main(void)
          *   CAL MMULT o0=.. o1=.. o2=.. ovf=.. m1=.. m2=..
          * Expected if silicon == jsim: 20 140 C80 FFFE0000 20 20 (hex).
          * o0=654 (0x28E) instead of 32 => column/transpose layout; m2==2*m1 =>
-         * MMULT accumulates rather than resets. */
+         * MMULT accumulates rather than resets.
+         * DISABLED by default (2026-07-23): this multi-MMULT probe WEDGES real
+         * Tom (bug 23) and would end the session on a bus-held hang. The MMBIS
+         * ladder above supersedes it. Define RUN_OLD_MMULT to re-enable. */
+#ifdef RUN_OLD_MMULT
         u32 MMRES = 0x00104000UL;
         u32 guard = 60000000UL;
         char *d;
@@ -581,6 +643,7 @@ void cal_main(void)
         d = put(d, "\n");
         *d = 0;
         say(line);
+#endif /* RUN_OLD_MMULT */
     }
 
     {   /* p_ldjump: load consumed across a taken jump (round 5.2). Prints

@@ -513,3 +513,204 @@ next flash: reordered so p_mmult prints FIRST (right after DIVLAT), in the
 healthy post-bounce window. calibdl_skunk.cof rebuilt and re-dogfooded
 (o0/o1/o2=20/140/C80, ovf=FFFE0000, m1=m2=20). One clean flash captures it.
 
+---
+
+## 2026-07-23 SILICON: p_mmult WEDGES real Tom — the bank-0 rewrite did NOT cure it
+
+Clean post-bounce flash of calibdl_skunk (USB healthy: 5.67s transfer, all
+16 DIVLAT rows printed, beacon fired). Console:
+
+    CAL DIVLAT k=0..0F  sm=00000055 lg=2AAAAAA5   (all 16, clean)
+    CAL MMSTART
+    L WEDGED: GPU stuck (bug 23 - no external GO clear). Power-cycle.
+    <bus-held garbage — GPU holds the bus, console corrupts>
+
+**MMSTART printed, MMULT never did, and the 68k-side force-stop
+(G_CTRL=0, main.c:567) could NOT recover it — bug 23: the external GO
+clear does not halt a wedged GPU. Board needs a physical power-cycle.**
+
+The beacon did its whole job: this is unambiguously a GPU WEDGE, not a USB
+drop (link was clean through DIVLAT + the beacon; jcp then lost the 68k
+handshake because the wedged GPU holds the bus).
+
+This is now the SECOND distinct MMULT formulation to wedge real Tom:
+- REGPAGE-switch version (pre-91c48f8): DIVLAT printed, then hung on MMULT.
+- bank-0 / moveta version (91c48f8, "stays in bank 0", meant to be the
+  fix): STILL wedges at the same point.
+
+So "run MMULT entirely from bank 0, populate the bank-1 vector via moveta"
+did NOT cure the wedge. Both formulations run CLEAN in jsim and wedge on
+silicon — a real bidirectional-faithfulness gap (jsim-passing code that
+black-wedges on hardware, exactly the failure class the 2026-07-23 priority
+reset put first). MMULT operand-layout / s16 / MAC semantics remain
+UNCAPTURED; the Phase-0 gate for OpenLara's vertex-transform prize is still
+open, now blocked by the wedge rather than by USB.
+
+Next-session diagnosis (isolate what in the MMULT drive sequence wedges —
+jsim can't reproduce it, so this must be bisected on silicon, each arm a
+tiny probe that self-stops and prints a beacon before touching MMULT):
+1. **A single MMULT, nothing else** — MTXC=width, MTXA set, one `mmult`,
+   settle, self-stop. If THIS wedges, MMULT itself (not the moveta/vector
+   setup or the multi-row loop) is the trigger.
+2. **moveta-then-read WITHOUT mmult** — confirm the bank-1 population path
+   is innocent (strong prior it is).
+3. **Vary settle length after mmult** — the MAC may still be draining when
+   the self-stop store to GCTRL executes; a self-stop into a busy MAC is a
+   known wedge shape. Try a much longer drain + an explicit MAC-idle spin
+   before the GCTRL write.
+4. **MTXC width sweep (1,2,3)** — width-3 systolic pass may read past the
+   3-word matrix / cross a bank boundary on silicon.
+Each arm is one flash; the first that stays clean names the trigger.
+Until then the board is WEDGED — power-cycle before ANY further flash.
+
+### LADDER BUILT + DOGFOODED (2026-07-23) — blocked on USB connect
+
+The bisection ladder above is IMPLEMENTED as one flash: four minimal arms
+`p_mm_{nov,w1,w3,w3s}` (probes.s, after p_mmult) driven by a loop in main.c
+that runs BEFORE the old wedging p_mmult and prints one line per arm:
+
+    CAL MMBIS nov v0=000000A0 v1=00000000
+    CAL MMBIS w1  v0=00000004 v1=00000000
+    CAL MMBIS w3  v0=00000020 v1=00000000
+    CAL MMBIS w3s v0=00000020 v1=00000000     <- or "CAL MMBIS w3s WEDGED"
+
+Each arm takes its result slot from PRMRESULT (distinct per arm), self-stops
+from bank 0, and writes magic last; main.c breaks the ladder on the first arm
+whose magic never lands (= the wedge trigger; board then dead, bug 23).
+
+jsim dogfood (calibdl_sim.cof, peek $105000): ALL FOUR clean —
+nov=A0 / w1=4 / w3=20 / w3s=20, every magic C0DED04E. The wedge is
+silicon-only, so jsim can only confirm the arms are well-formed; silicon is
+the discriminator. Arm ORDER is simplest->wedging so one flash bisects up to
+the first wedge and prints every clean arm before it.
+
+Arms:
+- nov: full setup (matrix, MTXC=3, MTXA, moveta vector) but NO mmult.
+- w1 : one width-1 mmult, 32-nop MAC drain both before store and before GO=0.
+- w3 : one width-3 mmult, same long drains.
+- w3s: one width-3 mmult, MINIMAL drain then immediate GO=0 (the wedging shape).
+Decode rule as in the plan above (w3s-only wedge => drain the MAC before
+clearing GO; w3 wedge => width-3 systolic; w1 wedge => mmult+self-stop pair).
+
+TO FLASH (calibdl_skunk.cof — MMBIS prints first, right after DIVLAT):
+    cd calib && make build/calibdl_skunk.cof
+    script -qefc "jcp -c build/calibdl_skunk.cof" bench_mmbis_20260723.log
+
+STATUS 2026-07-23 night: board power-cycled, but the Skunkboard USB link is
+back in its marginal state — "can't connect with skunkboard" on 4 straight
+attempts (one flash DID connect earlier tonight → the wedge finding above).
+This is the documented cable/port fault, NOT the probe and NOT the console.
+Needs a physical USB bounce (reseat/swap cable, different port/hub) before
+the ladder can go over. Everything software-side is ready; it is one clean
+connect away from the answer.
+
+### ROUND 1 SILICON RESULT (2026-07-23 night) — TWO surprises
+
+The 4-arm ladder flashed clean (board off→on caught a good USB window).
+Console (log later overwritten by failed reconnects; values transcribed here):
+
+    CAL MMBIS nov v0=000000A0 v1=00000000     <- setup path OK (sentinel)
+    CAL MMBIS w1  v0=00000000 v1=00000000     <- expected 4
+    CAL MMBIS w3  v0=00000000 v1=00000000     <- expected 20
+    CAL MMBIS w3s v0=00000000 v1=00000000     <- expected 20
+
+1. **NO arm WEDGED.** All four self-stopped (each printed a value line, none
+   "WEDGED"). A single MMULT + self-stop does NOT wedge silicon — not at
+   width 1 or 3, not at 32-nop or 2-nop drain. => the full-p_mmult wedge is a
+   **MULTI-mmult effect** (back-to-back MAC pair w/ no settle, or the 4-row
+   repeat), NOT a single op and NOT self-stop-into-busy-MAC. The whole
+   "drain the MAC" hypothesis is REFUTED; drain length made no difference.
+
+2. **Every mmult arm returned v0=0** (jsim gives 4/20/20; nov's non-mmult
+   sentinel A0 came back correct, so store/slot/self-stop all work). w3
+   (32-nop) and w3s (2-nop) are identical zeros => NOT a result-not-retired
+   race; silicon MMULT is genuinely reading ZERO operands in this setup.
+   This is a real jsim<->silicon MMULT faithfulness gap — the "vertices
+   transform to all-zero garbage" failure class OpenLara would hit. It also
+   moots the row-vs-column layout question until the zero is explained.
+
+### ROUND 2 — WHY-ZERO bisection (built + dogfooded, waiting on USB)
+
+Ladder extended to 7 arms (nov,w1,w3,w3s + mmhi,mmlo,mrd). New arms, primary
+hypothesis = silicon reads each matrix element from the LOW 16 bits of its
+SRAM word while jsim/mmult_ref use the HIGH 16 (stride-4 high-word):
+  - mmhi: matrix in HIGH 16, Rd preseeded $0000DEAD before mmult.
+          silicon 0 = mmult wrote zero; DEAD = mmult left Rd untouched
+          (result lands elsewhere); 20 = correct.
+  - mmlo: matrix in LOW 16, same preseed. **20 here => silicon reads the
+          low half (the answer; jsim's bus.read16 high-half is the bug).**
+  - mrd : store $00010000 to $F03A00, load it straight back (SRAM sanity —
+          rules out "the matrix store never landed").
+jsim dogfood (peek): nov A0 / w1 4 / w3 20 / w3s 20 / mmhi 20 / mmlo 0 /
+mrd 00010000 — all self-stop. mmlo=0 in jsim is deliberate (it's the
+silicon discriminator). Old wedging p_mmult now guarded behind
+RUN_OLD_MMULT (off) so the session ends cleanly (ldjump/DONE) instead of on
+a bus-held wedge. calibdl_skunk.cof rebuilt.
+
+TO FLASH (once USB reconnects — needs a physical cable/port bounce):
+    cd calib && make build/calibdl_skunk.cof
+    script -qefc "jcp -c build/calibdl_skunk.cof" bench_mmbis_20260723.log
+    grep -aE "CAL MMBIS" bench_mmbis_20260723.log
+DECODE: mmlo=20 & mmhi=0 => low-half matrix read (fix jsim isa.rs mmult to
+read the low 16, re-anchor, tell OpenLara to pack matrices low). mmhi=DEAD
+=> mmult doesn't write Rd on silicon (result in MAC/elsewhere — chase that).
+both mmhi/mmlo=0 & mrd ok => not the matrix half; the ZERO is vector-side
+(moveta/bank-1 sourcing) — author a vector-readback (movefa) round next.
+Then, SEPARATELY, the multi-mmult WEDGE still needs its own probe: two
+back-to-back mmults (the mac1/mac2 pair) + self-stop, and a 4-row loop.
+
+### ROUND 2 SILICON RESULT (2026-07-23 night) — SOLVED + jsim FIXED
+
+Flashed clean after the USB bounce (Skunkboard red screen = ready):
+
+    CAL MMBIS nov  v0=000000A0     setup OK
+    CAL MMBIS w1   v0=00000000
+    CAL MMBIS w3   v0=00000000
+    CAL MMBIS w3s  v0=00000000     round 1 reproduced
+    CAL MMBIS mmhi v0=00000000     matrix HIGH half, Rd preseeded $DEAD -> WROTE 0 (not inert)
+    CAL MMBIS mmlo v0=00000020     matrix LOW half -> 32.  *** the answer ***
+    CAL MMBIS mrd  v0=00010000     SRAM store/readback fine
+
+**SILICON MMULT READS THE MATRIX OPERAND FROM THE LOW 16 BITS of each
+stride-4 local-RAM word; jsim read the HIGH 16.** Proof chain: mrd => the
+store lands; mmhi (value in high half) => mmult reads low=0, result 0, and
+it actively WROTE 0 (the $DEAD preseed was overwritten — mmult is not inert,
+Rd really holds the result); mmlo (value in low half) => reads 1,2,3 -> 32.
+mmlo=32 also needs the bank-1 vector [4,5,6] (moveta) read correctly, so it
+simultaneously CONFIRMS: vector = bank-1 packed 2xs16 via moveta (jsim
+right); layout = ROW-major (row0.V=32, not the column 654); and a single
+width-3 mmult does NOT wedge once the matrix is where silicon looks. Stride
+is 4 (one element/word), NOT packed-2 (that would give [0,1,0]->5, not 32).
+Consistent with the ISA doc: MMULT = internal IMULTN;IMACN*k;RESMAC, and
+§7.1 says the MAC datapath takes the LOW 16 bits of each operand — jsim
+contradicted its own spec.
+
+jsim FIX (committed to isa.rs::mmult): `read16(addr)` -> `read16(addr + 2)`
+(big-endian low half). Re-dogfooded the SAME calibdl_sim.cof: jsim now
+byte-matches silicon on ALL SEVEN arms (nov A0 / w1 w3 w3s mmhi 0 / mmlo 20 /
+mrd 00010000). All 42 jag-core tests still pass. The MMULT operand-read
+faithfulness gap is CLOSED.
+
+### PHASE-0 GATE — what's settled vs still open
+
+SETTLED for OpenLara's vertex transform:
+- Matrix operand: one element per 32-bit local-RAM word (stride 4), value in
+  the **LOW 16 bits** (sign-extended s16). Pack matrices low, not high.
+- Vector operand: bank-1 registers, two s16 packed per reg (low element
+  first), populated via moveta from bank 0 (no REGPAGE switch needed).
+- Layout: ROW-major (MTXC MADDW=0). MTXA = byte offset into local RAM.
+- A single width-3 MMULT is correct and does not wedge.
+
+STILL OPEN:
+1. **The multi-MMULT WEDGE** — the full 4-row + back-to-back mac1/mac2 probe
+   wedges real Tom (bug 23). Round 1 proved a single mmult+self-stop is fine,
+   so the trigger is the mac-pair (two mmults, no settle between) or the row
+   loop. Next probe: p_mm2 = two back-to-back width-3 mmults (matrix LOW
+   half now) + self-stop; and p_mmrow = the 4-row loop. Bisects the wedge.
+2. **s16/s32 result width (ovf)** — round 2 used small positives; the
+   -32768*4 = FFFE0000 overflow arm was not re-run with the low-half matrix.
+   Add p_mm_ovf (ovf row in the low half) next flash.
+3. **MAC reset-vs-accumulate (m1/m2)** — untested on silicon; needs the
+   mac-pair, which is also suspect #1. One probe can answer both: two mmults,
+   read both results — if it does NOT wedge, compare m1 vs m2 (equal=reset).
+
