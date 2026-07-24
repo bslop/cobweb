@@ -775,3 +775,26 @@ flash, then:
     grep -a "CAL MMBIS" bench_mmbis_20260723.log
     # expect through mm2s, then a hang at mm2 — ctrl-C
 
+### ROUND 5 (2026-07-24, wip/mmult-mtxa-autoadvance) — auto-advance CONFIRMED + fixed
+
+Flashed mm3s. Silicon: **mm2s 20/140, mm3s 140/C80** — three settled MMULTs
+with MTXA set ONCE read rows 0,1,2 = 32/320/3200. MTXADDR auto-advances by
+one row (width*4) per MMULT, constant stride, 3 steps confirmed. MAC resets
+per call (each row alone, no accumulation).
+
+jsim FIX (isa.rs::mmult, on the branch): after each MMULT, advance core.mtxa
+by width*4 (by-row; by-column +4 inferred/UNVERIFIED). Re-dogfooded: jsim now
+matches silicon — mm2s 20/140, mm3s 140/C80, and mmrow still 20/FFFE0000
+(explicit per-row re-points override the advance). 42 jag-core tests pass.
+ISA doc §7.2 updated (low-half element + auto-advance + adjacent-MMULT wedge
++ MAC-reset). Ready to merge to main once reviewed.
+
+### PHASE-0 GATE — CLOSED for OpenLara
+
+All MMULT semantics for the vertex transform are silicon-validated and jsim
+is faithful: LOW-half s16 matrix (stride 4), bank-1 packed-s16 vector via
+moveta, row-major, s16->s32 result, MTXADDR auto-advances one row/MMULT (set
+MTXA once, issue MWIDTH MMULTs), MAC resets per call, and NEVER emit two
+adjacent MMULTs (settle >= a few instrs). Remaining low-priority: by-column
+advance value (unverified), and MTXA-write timing vs auto-advance edge cases.
+
