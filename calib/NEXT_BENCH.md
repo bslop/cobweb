@@ -320,3 +320,39 @@ Remaining (both LOW priority — pattern strongly favors "jsim is right"):
 - THE MAIN EVENT: the +28% concurrency residual (meso-probe). This is now
   the only substantial accuracy gap left — everything else fits silicon.
 
+---
+
+## HANDOFF TO OPENLARA (2026-07-23) — the +28% discriminator is ready to flash
+
+The mechanism is found; one flash confirms it. The kernel's bwait is a
+software-pipelined spin: SILICON is compute-bound (per-face compute >
+blit, the spin exits free), jsim is spin-bound (compute too fast, spins
+on the blit). So the +28% is jsim's per-face COMPUTE being ~28% too
+FAST, which un-hides the blit — round-4's "concurrency overcharge" is
+the symptom, not the cause.
+
+**p_face** (committed) times that compute in isolation: 2 perspective
+divides + a 16-px DDA span walk with per-pixel edge branches (jr, the
+real mix, no blit/no sync). jsim baseline: **face B 3.26 cyc/instr,
+face A 4.22**.
+
+TO FLASH (after a Skunkboard reconnect — it dropped off USB here):
+  cd calib && make            # rebuild calib_skunk.cof with p_face
+  script -qefc "jcp -c build/calib_skunk.cof" bench.log
+  # wait for CAL face A and B (mid-table, both modes), then CAL DONE
+  python3 parse_results.py --console bench.log | grep -E "face|jr"
+
+DECISION RULE:
+  * face silicon B ~= 4.2 (>~28% over jsim's 3.26) -> the +28% lives in
+    the per-face compute mix. BISECT: rebuild p_face variants removing
+    (a) the per-pixel branches, (b) the divides, (c) the loads, one at a
+    time; whichever removal collapses the jsim-vs-silicon gap names the
+    culprit. Strongest prior: branch/jump refill in a real branchy loop
+    (the isolated jr probe is a tight 2-instr spin; mixed code differs).
+  * face silicon ~= jsim 3.26 -> the gap is NOT the compute mix; it is
+    specifically the blit-spin interaction (jsim's blit_busy drain vs the
+    poll-spin cadence). Then probe: launch + measured compute + bwait,
+    varying compute length across the blit duration.
+
+Everything else fits silicon. This is the last substantial accuracy gap.
+
