@@ -47,6 +47,22 @@ Never open the V4L2 device directly — jagtap replaces that for everyone.
 `bigpemu_divergence`). Nonzero hazard counters in code you generated mean
 your code is wrong on real silicon even if results look right.
 
+Those are whole-core totals — they say a kernel stalls, not *where*. For that,
+`run --pc-histogram --core 68k|gpu|dsp|all` gives exact per-PC cycle
+attribution with the same categories sliced per instruction (no sampling).
+`jas --map f.map` emits symbols; feed them back with `--gpu-map`/`--dsp-map`.
+Two cautions when reading a RISC profile:
+
+- **`issue` + the stall rows + `fetch_external` partition the cycles; the rows
+  below the separator do not.** `mem_external` is bus occupancy *plus* result
+  latency — the occupancy half is charged to the loading instruction, the
+  latency half is paid later (and only if a consumer is close) as `stall_load`.
+  Adding it to the others double-counts.
+- **A resident core that spins absorbs new work into its spin.** Its cycle
+  total barely moves, so added work looks free. Use `--prof-json` plus
+  `sim/tools/profdiff.py` to see the poll loop shrink by what the new routine
+  grew — that diff, not the total, is the price of a work move.
+
 ## Hard-won rules (violating these produced real bugs here)
 
 - **JRISC has exactly ONE delay slot** after JUMP/JR, always executed.

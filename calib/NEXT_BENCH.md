@@ -798,3 +798,212 @@ MTXA once, issue MWIDTH MMULTs), MAC resets per call, and NEVER emit two
 adjacent MMULTs (settle >= a few instrs). Remaining low-priority: by-column
 advance value (unverified), and MTXA-write timing vs auto-advance edge cases.
 
+
+---
+
+## 2026-07-27 QUEUED TO FLASH — p_dsphammerw (Jerry DRAM WRITES vs Tom)
+
+Authored, assembled, and registered; **retired from the default table** like
+its sibling, so it takes a deliberate edit to run. One flash answers it.
+
+WHY: `lddramj` settled Jerry↔Tom contention for **reads** (Tom's stream 656
+alone, 656 with Jerry hammering, twice, DSPMARK proving the DSP ran). That null
+is what jsim's zero-arbitration model rests on, and it is the right call for
+reads. **Writes were never probed**, and reads/writes are not symmetric here —
+stores are buffered, and silicon `stdram` measured mode A == mode B where the
+load probe did not. Write traffic is exactly what a Jerry-side vertex transform
+produces (posed vertices streamed back to DRAM), which is the one live case:
+`COBWEB_GAP_jerrypose_fps_overprediction` still reproduces on HEAD (jsim +19.2%
+on the RP_jpose / RP_nojerryx_default pair vs silicon ~−3%).
+
+`p_dsphammerw` is `p_dsphammer` with `load (r2),rN` → `store r11,(r2)`: same
+dense 8-access unrolled body, same bounded `DHAMMER_PASSES`, same self-stop,
+distinct mark (`$001B0004` = `$D50D50D6`) so you can prove it ran.
+
+TO RUN (deliberately, alone — NOT in a routine bench):
+    # uncomment the lddramjw row in calib/main.c's probe table
+    cd calib && make build/calib_skunk.cof
+    script -qefc "jcp -c build/calib_skunk.cof" bench_dsphw.log
+    python3 parse_results.py --console bench_dsphw.log | grep -E "lddramjw|lddram"
+
+DECODE (compare against `lddram` / the retired `lddramj` 656 baseline, mode B):
+  * Tom's stream still ~656 → the null holds for writes too. jsim is right to
+    charge zero for Tom↔Jerry, both directions, and the jerrypose
+    over-prediction is NOT a bus story — it is the completion-latency one (a
+    resident spinning DSP has unbounded free capacity in the model; see below).
+  * measurably slower → Jerry's DRAM **writes** are a real cost jsim charges at
+    zero. The coefficient comes straight off the delta, and it is the first
+    calibrated number this gap has ever had.
+
+WEDGE WARNING: saturating the shared bus from Jerry has hard-wedged this
+console before (power-cycle, red boot screen). Same class as `lddramj`. Flash
+it on its own, expect to bounce the board afterwards.
+
+### Also landed 2026-07-27 (no rig needed)
+
+- **GPU/DSP PC histogram** — `jagemu run --pc-histogram --core 68k|gpu|dsp|all`,
+  exact per-PC cycles with the stall categories sliced per instruction, plus
+  `jas --map` for symbols and `--prof-json` + `sim/tools/profdiff.py` to diff
+  two runs. Closes the GPU half of `COBWEB_REQ_68k_pc_histogram`.
+- **Counter fix**: attributed stalls could exceed a core's own cycle count
+  (an instruction reading two in-flight registers was billed for both waits;
+  it stalls once, for the longer). `stall_load`/`stall_alu` in `gpu.timing`
+  were overstated on load-heavy kernels. **No modeled timing changed** — the
+  charged cost was always the max — so every constant in this file still
+  stands and no re-anchor is needed.
+- **The jerrypose mechanism is named**: on the RP_jpose pair, Jerry's total
+  moves 1,383 cycles out of 255M (0.0005%) while ~1.75M cycles relocate inside
+  it — the pose work appears at new PCs and the poll loop shrinks by the same
+  amount. A resident spinner absorbs work for free. No per-access charge fixes
+  that, which is why the write probe above (not a tuned constant) is the path.
+
+---
+
+## 2026-07-27 SESSION — full table re-anchored for the first time
+
+### The blocker was in-tree, not the rig
+
+Every session since 2026-07-24 lost the back half of the probe table to what
+looked like a flaky USB link. It was not. `p_mmultw` is `.rept 256 { mmult }` —
+256 back-to-back MMULTs, the zero-gap hazard proven to wedge Tom (bug 23) — and
+it sat at table index 210, immediately after `divoff`. The 2026-07-24 session
+found this, flagged it "DO NOT FLASH" **in a comment, and left the row in the
+default table.** A comment cannot gate a flash. Three more sessions and three
+power-cycles went to it.
+
+Now `#ifdef RUN_MMULTW`. `parse_results.py`'s positional slot map was realigned
+to match (mmultw/mmulta appended, like lddramjw — the peek path is
+position-keyed and must track main.c's DEFAULT table). Verified: `face`
+A/B land on their known jsim baselines after the move.
+
+Result: the suite ran end to end, **both modes, for the first time** — 118 CAL
+rows vs a 31-row ceiling. Log: `bench_full_20260727_022056.log`.
+
+### HEADLINE: jsim's mode-A (68k-active) contention tax is OVER-BROAD
+
+Silicon charges the 68k-contention penalty on sequential DRAM **loads** only.
+jsim charges it on stores, page-miss loads, and loads under a blit as well:
+
+| probe | silicon A/B | jsim A/B | |
+|---|---|---|---|
+| lddram (seq loads) | 1341 / 655 = 2.05x | 1257 / 640 = 1.96x | both charge — OK |
+| lddramc (consumed) | 1036 / 719 = 1.44x | 1056 / 746 = 1.42x | both — OK |
+| dens2 | 286 / 167 = 1.71x | 279 / 165 = 1.69x | both — OK |
+| **stdram** (stores) | 654 / 651 = **1.00x** | 1257 / 640 = **1.96x** | **jsim wrong** |
+| **ldstride** (page miss) | 208 / 209 = **1.00x** | 510 / 281 = **1.81x** | **jsim wrong** |
+| **ldcunder** (load under blit) | 294 / 293 = **1.00x** | 538 / 383 = **1.40x** | **jsim wrong** |
+
+`risc.rs` already states the correct rule — "Row-thrash contention hits loads
+only (stores: write-buffered, HARDWARE stdram A == B)" — but the burst-window
+occupancy tax in `mem_cost` fires on any `MemClass::Dram` access, so stores pay
+it anyway. The comment and the code disagree and silicon sides with the
+comment. It hid because nearly all calibration reads mode B.
+**CONFIRMED 2026-07-27 03:05** (`bench_full2_20260727_030510.log`), second
+independent capture, reproducible to within 1 tick on every arm:
+
+| probe | run1 A/B | run2 A/B | silicon | jsim |
+|---|---|---|---|---|
+| lddram | 1341/655 | 1340/654 | 2.05x, 2.05x | 1.96x OK |
+| lddramc | 1036/719 | 1035/719 | 1.44x, 1.44x | 1.42x OK |
+| dens2 | 286/167 | 287/168 | 1.71x, 1.71x | 1.69x OK |
+| **stdram** | 654/651 | 653/651 | **1.00x, 1.00x** | **1.96x** BAD |
+| **ldstride** | 208/209 | 208/208 | **1.00x, 1.00x** | **1.81x** BAD |
+| **ldcunder** | 294/293 | 294/293 | **1.00x, 1.00x** | **1.40x** BAD |
+| ldunderb | 3600/3598 | 3600/3599 | 1.00x, 1.00x | 1.00x OK (control) |
+
+Each failing arm has a coherent mechanism: **stores** are write-buffered and
+never wait; **page-miss loads** already pay a full miss so 68k row-thrash adds
+nothing; **loads under an active blit** are unaffected because the Blitter
+already owns the bus. `ldunderb` (UNconsumed loads under a blit) is the control
+jsim gets right, which localises the ldcunder error to the contended
+consumed-load extra latency (`risc.rs`: `if contended && Dram { ext_load_lat += 8 }`).
+
+**STILL NOT FIXED, deliberately — do not apply this in isolation.**
+
+jsim predicts 5.43 fps vs hardware 4.9: already **+11% too fast**. This
+over-charge is the only known error pushing the other way. Removing it alone
+makes the whole-program prediction WORSE. The two confirmed errors have
+opposite signs and are partly cancelling:
+
+  * mode-A contention tax: jsim OVER-charges  -> slows jsim toward truth
+  * branch-free compute (facenb +9%): jsim UNDER-charges -> speeds jsim away
+
+Fix BOTH together or NEITHER, and re-validate against the anchors that are
+currently exact (ALLCULL floor 9.57 vs 9.55; the TC/v4b/NOFILL ladder). Fixing
+the visible one first would break a balance that currently produces a validated
+number — the same trade this project already caught twice (Tom<->Jerry
+arbitration, and the blitter "concurrency overcharge" framing).
+
+### Confirmations (jsim silicon-exact)
+
+- **bcmdbusy 3493 vs jsim 3488** — the bwait B_CMD poll under a busy Blitter,
+  the last unprobed suspect from 2026-07-21. It is priced correctly. The
+  "shade pass is nearly free in jsim while silicon pays 23%" suspicion is dead.
+- **ovlap/serial 117/227 vs 118/226** — third confirmation of the async-Blitter
+  concurrency model.
+- divhot 6.69 vs 6.67 · jr 2.34 vs 2.33 · mainmov 13.46 vs 13.50 · the whole
+  ALU/SRAM block within 0.5%.
+
+### The per-face compute gap: NOT branch density (prior refuted)
+
+Mode B, two independent captures (`calibface` and the full suite):
+
+| probe | branches/px | silicon | jsim | delta |
+|---|---|---|---|---|
+| facenb | 0 | 64, 65 | 59 | **+9%** |
+| face | 1 | 69, 70 | 69 | **~0%** |
+| facebr | 3 | 89, 88 | 88 | +1% |
+
+The standing prior was taken-jump refill in a branchy loop. It is the opposite:
+the gap is in the BRANCH-FREE body, and adding branches makes jsim MORE
+accurate. Reading: two compensating errors — straight-line DDA/divide
+under-charged ~9%, `jump_refill` charged slightly rich — cancelling at 1
+branch/px, the density the real kernel uses. **Do not tune jump_refill in
+isolation**; it is the compensating term and `face` currently matches exactly.
+
+### 68000 speed: all three mixes in one session
+
+m68kcpy 1.60x · m68kbus 1.44x · m68kreg 1.23x too FAST (silicon/jsim blocks).
+Fetch-only is least wrong, data-heavy most — the wait belongs mostly on DATA.
+This is the three-mix fit `wip/m68k-bus-wait` was waiting for.
+
+### dsphw (Jerry DRAM WRITES vs Tom): RESOLVED — null, witness-confirmed
+
+**RESULT (rerun 02:54, `bench_dsphw_20260727_025432.log`, `valw=D50D50D6`
+proving the hammer ran): lddram B 655 vs lddramjw B 656 = +1 tick, +0.15%.**
+Precision ~1 tick in 655; a 5% slowdown would have been ~33 ticks. **The
+Tom<->Jerry null now covers WRITES as well as READS** — jsim is right to charge
+zero for cross-RISC DRAM arbitration in both directions, and no coefficient is
+needed. This closes the last bus-side explanation for
+COBWEB_GAP_jerrypose_fps_overprediction: that gap is the resident-spinner /
+completion-latency mechanism, not contention.
+
+Mode A (68k busy-polling) showed +2.0% and +2.6% across the two paired runs —
+same sign both times, but n=2 and lddram A's own between-run spread tonight was
+1326-1343 (17 ticks), comparable to the effect. Suggestive of a small three-way
+term when the 68k is also on the bus; NOT calibratable from two samples, and
+far too small to matter for the fps gap. More paired samples if anyone cares.
+
+#### The first attempt had to be thrown out (recorded so it is not repeated)
+
+Measured lddram B 658 vs lddramjw B 657 (a clean null), **and it does not
+count.** Two faults, both mine, both now fixed:
+
+1. `main.c`'s DSPMARK printer read `$1B0000` (the READ hammer's mark); the
+   write hammer marks `$1B0004`, so the witness would have read 0 regardless.
+   Both marks are now cleared and both printed (`val=` / `valw=`).
+2. The print sits after the ldjump/MMBIS ladders and the capture timed out
+   before reaching it. Under `DSPHW_ONLY` the witness now prints IMMEDIATELY
+   after the probe loop.
+
+A null from a DSP that may not have been executing is not a null. Rerun
+`make dsphw` + `./run_bench.sh build/calibdsphw_skunk.cof dsphw` and require
+`valw=D50D50D6` before believing any number. (jsim dogfood confirms the probe
+is well-formed and the witness discriminates: val=0, valw=D50D50D6.)
+
+### Process
+
+`./run_bench.sh <rom> [tag] [limit]` — timestamped logs (never overwritten),
+timeout sized for the full suite, and it distinguishes "did not connect" from
+"wedged" from "ended early". Two captures were lost tonight to a short timeout
+killing the console mid-suite and a retry overwriting the log.

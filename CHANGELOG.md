@@ -6,6 +6,41 @@ assigned at release.
 
 ## Unreleased
 
+### 2026-07-27 — jsim: GPU/DSP PC histogram, and the stall counters stop double-counting
+
+- **`--pc-histogram` now profiles Tom and Jerry, not just the 68000.**
+  `jagemu run <rom> --pc-histogram --core 68k|gpu|dsp|all` gives exact per-PC
+  cycle attribution for the JRISC cores, with the stall categories sliced per
+  instruction: `stall_load`, `stall_alu`, `stall_div`, `stall_div_busy`,
+  `stall_flags`, `jump_refill`, `fetch_external`, `mem_external`, `blit_wait`,
+  `contention`. A core-wide `jump_refill` total says a kernel is refilling the
+  pipe without saying which jump does it — chasing one meant reading a listing
+  by hand (`COBWEB_REQ_68k_pc_histogram.md`). Exact, not sampled: a JRISC hot
+  loop is often a handful of instructions inside a 4 KB SRAM window, and any
+  sampling interval cheap enough to run is coarse enough to miss it.
+  Zero cost when unarmed; ~9% when armed. Machine state is bit-identical with
+  and without the profiler (asserted in-tree).
+- **Symbolization for RISC kernels:** `jas --map <file>` emits `ADDR label`
+  (labels only, not `equ` constants); `jagemu --gpu-map` / `--dsp-map` consume
+  it, so a GPU profile names routines instead of raw addresses.
+- **`--prof-json <file>` + `sim/tools/profdiff.py`:** the full per-PC profile
+  for every profiled core, and a diff. This is what makes a *work move*
+  priceable — a top-K table cannot answer "did moving this to the DSP help?",
+  because the routine that appeared is rarely near the top and the routine that
+  vanished leaves no row behind.
+- **Counter fix: attributed stalls could exceed the core's own cycle count.**
+  An instruction reading two in-flight registers stalls *once*, for the longer
+  wait; the counters were adding *both*. A load-heavy kernel reported
+  `stall_load` at 109% of its cycles. Only the binding operand is charged now.
+  Cost was always the max, so **no modeled timing changes** — the fps model,
+  every calibration constant, and all 46 jag-core tests are untouched.
+- **`calib`: new `p_dsphammerw`, the write-side twin of `p_dsphammer`.**
+  `lddramj` proved Jerry's DRAM *reads* do not slow Tom (656 vs 656), which is
+  why jsim models no Tom↔Jerry arbitration. Writes were never probed, and
+  writes are what a Jerry-side vertex transform actually produces. Retired from
+  the default run like its sibling (Jerry saturating the shared bus has
+  hard-wedged the console); enable deliberately.
+
 ### 2026-07-24 — jas: refuse two adjacent MMULTs (silicon hard-wedge)
 
 - **`jas` now errors on two immediately-consecutive MMULTs.** They hang the
