@@ -6,6 +6,33 @@ assigned at release.
 
 ## Unreleased
 
+### 2026-07-27 — jsim: CRY16 scan-out read the transposed chroma entry
+
+- **`cry16_to_rgb` indexed the base table backwards.** The chroma index is the
+  whole high byte used flat (`base[(px >> 8) & 0xFF]`); jsim computed
+  `red*16 + cyan` and so read the TRANSPOSE. Every CRY16 screenshot showed
+  plausible-but-wrong colours, which is why it survived: the transpose of a
+  colour is another colour, and a cube rendered every face wrong still looks
+  like a shaded cube. Silicon-adjudicated against a bubsy3d capture — four
+  authored face colours now decode exactly (`1DDD`→(29,215,220),
+  `ECF2`→(241,218,32), `7ECA`→(25,201,38), `E2E3`→(226,33,30)).
+- **Intensity scale is `>> 8`, not `/ 255`** — at most one count, invisible on
+  its own, and completely masked by the index bug.
+- **The base table was never wrong.** It is byte-for-byte the authentic Atari
+  `tga2cry` array (verified 256/256 against `crypal_tables.h`). The filed report
+  (`COBWEB_BUG_cry16_decode.md`) named the table as prime suspect; it was the
+  one part that was correct.
+- **The old corner tests asserted the bug.** `$0FFF` was checked as pure red;
+  `cry_base_rgb[0x0F]` is `(0,255,255)` — cyan. They were written from the same
+  wrong convention as the decoder, so they confirmed it rather than catching
+  it. Replaced with corrected corners plus the four interior silicon vectors —
+  interior because a transposed table passes at the corners and fails
+  everywhere a real renderer lives.
+
+This unblocks using a jsim screenshot to judge any shaded-3D Jaguar project:
+the Blitter's Gouraud path is CRY-only on silicon, so those projects all render
+in CRY.
+
 ### 2026-07-27 — jsim: GPU/DSP PC histogram, and the stall counters stop double-counting
 
 - **`--pc-histogram` now profiles Tom and Jerry, not just the 68000.**
