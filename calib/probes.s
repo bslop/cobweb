@@ -2216,6 +2216,239 @@ _p_face_s:
 	.data
 _p_face_e:
 
+; ── p_facend / p_facenl: WHICH class makes the branch-free body 9% fast? ────
+; 2026-07-27: facenb (0 branches) measures silicon 64-65 ticks vs jsim 59,
+; jsim ~9% FAST — while face (1 branch/px) matches EXACTLY and facebr (3/px) is
+; within 1%. So the residual is in the branch-free body, and the standing
+; "jump refill in a branchy loop" prior is refuted.
+;
+; The confounder: every ingredient of that body is already silicon-exact in
+; ISOLATION — divhot 6.69 vs 6.67, adddep 2.00 vs 2.00, addind 1.01 vs 1.00 —
+; and consumed DRAM loads (lddramc) have jsim SLOW, not fast. A mixture that is
+; 9% fast out of parts that are each exact means the miss is in OVERLAP: how
+; much independent work jsim lets hide under an in-flight latency.
+;
+; So these do not REMOVE instructions (that would change the count and make
+; cyc/instr incomparable). Each swaps one CLASS for ALU, holding the
+; instruction count and stream shape identical to facenb:
+;   p_facend  the 2 divides -> add   (removes the ~18-cycle DIV shadow)
+;   p_facenl  the 16 DRAM loads -> add (removes external load latency)
+;
+; DECODE, against facenb's own silicon/jsim ratio (~+9%):
+;   facend closes the gap  => jsim over-credits work hidden in the DIV shadow.
+;   facenl closes the gap  => jsim over-credits work hidden under load latency.
+;   both stay ~+9%         => it is the plain ALU stream, and adddep/addind
+;                             disagree with that, so suspect the probe.
+;   both collapse to ~0    => the two shadows interact; neither alone explains.
+
+	.even
+	.globl	_p_facend_s
+	.globl	_p_facend_e
+_p_facend_s:
+	.gpu
+	PROBE_PRO
+	move	r19,r12
+	movei	#$10001,r5
+	movei	#$7FFFFFF0,r7
+	movei	#3,r16
+	moveq	#1,r8
+	moveq	#1,r10
+	moveq	#0,r9
+	moveq	#0,r11
+	movei	#8,r13
+	add	r16,r5
+	add	r16,r7
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	load	(r14),r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	load	(r14),r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	load	(r14),r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	load	(r14),r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	load	(r14),r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	load	(r14),r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	load	(r14),r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	load	(r14),r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	load	(r14),r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	load	(r14),r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	load	(r14),r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	load	(r14),r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	load	(r14),r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	load	(r14),r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	load	(r14),r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	load	(r14),r1
+	or	r1,r1
+	or	r5,r5
+	or	r7,r7
+	PROBE_EPI
+	.68000
+	.data
+_p_facend_e:
+
+	.even
+	.globl	_p_facenl_s
+	.globl	_p_facenl_e
+_p_facenl_s:
+	.gpu
+	PROBE_PRO
+	move	r19,r12
+	movei	#$10001,r5
+	movei	#$7FFFFFF0,r7
+	movei	#3,r16
+	moveq	#1,r8
+	moveq	#1,r10
+	moveq	#0,r9
+	moveq	#0,r11
+	movei	#8,r13
+	div	r16,r5
+	div	r16,r7
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	or	r5,r5
+	or	r7,r7
+	PROBE_EPI
+	.68000
+	.data
+_p_facenl_e:
+
 ; ── p_facenb / p_facebr: branch-density bisection of p_face ──────────────
 	.even
 	.globl	_p_facenb_s

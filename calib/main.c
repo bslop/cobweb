@@ -101,6 +101,8 @@ extern char p_mmulta_s[], p_mmulta_e[];
 extern char p_face_s[], p_face_e[];
 extern char p_facenb_s[], p_facenb_e[];
 extern char p_facebr_s[], p_facebr_e[];
+extern char p_facend_s[], p_facend_e[];
+extern char p_facenl_s[], p_facenl_e[];
 extern char p_ovlap_s[], p_ovlap_e[];
 extern char p_serial_s[], p_serial_e[];
 extern char p_bcmdidle_s[], p_bcmdidle_e[];
@@ -230,6 +232,11 @@ static const struct probe probes[] = {
     { "face    ", p_face_s, p_face_e, 0, 0, 128, DRAM_BUF },
     { "facenb  ", p_facenb_s, p_facenb_e, 0, 0, 128, DRAM_BUF },
     { "facebr  ", p_facebr_s, p_facebr_e, 0, 0, 128, DRAM_BUF },
+    /* Class-swap bisection of facenb's ~9% gap. Inserted HERE, next to their
+     * sibling, not appended: parse_peek() maps result slots by position, so
+     * these must sit in the same place in parse_results.py's PROBES list. */
+    { "facend  ", p_facend_s, p_facend_e, 0, 0, 128, DRAM_BUF },
+    { "facenl  ", p_facenl_s, p_facenl_e, 0, 0, 128, DRAM_BUF },
     { "ovlap   ", p_ovlap_s, p_ovlap_e, 0, 0, 64, DRAM_BUF },
     { "serial  ", p_serial_s, p_serial_e, 0, 0, 64, DRAM_BUF },
     { "bcmdidle", p_bcmdidle_s, p_bcmdidle_e, 0, 0, 128, DRAM_BUF },
@@ -517,7 +524,9 @@ void cal_main(void)
 #ifndef DIVLAT_ONLY
     for (i = 0; i < NPROBES; i++) {
 #ifdef FACE_ONLY
-        if (probes[i].ks != p_face_s && probes[i].ks != p_facenb_s && probes[i].ks != p_facebr_s)
+        if (probes[i].ks != p_face_s && probes[i].ks != p_facenb_s
+            && probes[i].ks != p_facebr_s && probes[i].ks != p_facend_s
+            && probes[i].ks != p_facenl_s)
             continue;
 #endif
 #ifdef OVLAP_ONLY
@@ -559,7 +568,9 @@ void cal_main(void)
     }
     for (i = 1; i < NPROBES; i++) { /* vcmod runs once; skip in mode B */
 #ifdef FACE_ONLY
-        if (probes[i].ks != p_face_s && probes[i].ks != p_facenb_s && probes[i].ks != p_facebr_s)
+        if (probes[i].ks != p_face_s && probes[i].ks != p_facenb_s
+            && probes[i].ks != p_facebr_s && probes[i].ks != p_facend_s
+            && probes[i].ks != p_facenl_s)
             continue;
 #endif
 #ifdef OVLAP_ONLY
