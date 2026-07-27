@@ -73,7 +73,9 @@ fn usage() {
          USAGE:\n\
          \x20 jagemu info <rom>\n\
          \x20 jagemu run <rom> [--frames N] [--fidelity functional|silicon|bigpemu]\n\
-         \x20 jagemu run <rom> --pc-histogram [--map m.map] [--start S] [--top K] [--bucket N]\n\
+         \x20 jagemu run <rom> --pc-histogram [--core 68k|gpu|dsp|all] [--map m.map]\n\
+         \x20      [--gpu-map g.map] [--dsp-map d.map] [--start S] [--top K] [--bucket N]\n\
+         \x20      [--prof-json p.json]      # full per-PC profile; diff two with profdiff.py\n\
          \x20 jagemu screenshot <rom> [--frames N] [-o out.png]\n\
          \x20 jagemu video <rom> [--count N] [--every K] [--start S] [--cols C] [--dir D] -o film.png\n\
          \x20 jagemu audio <rom> [--frames N] [--press a] -o out.wav\n\
@@ -359,7 +361,39 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
             Some(m) => load_map(m)?,
             None => Vec::new(),
         };
-        let jag = boot_profiled(&data, start, frames, btn, after, fidelity_arg(args)?, gran, top, &map)?;
+        // --core selects which masters to profile. Default `all`: the 68k
+        // section is what it always was, GPU/DSP are additive. Naming one core
+        // keeps the run cheap when only that core is under investigation.
+        let core = flag_val(args, "--core").unwrap_or("all");
+        let cores = match core {
+            "all" => Cores { m68k: true, gpu: true, dsp: true },
+            "68k" | "68000" | "m68k" => Cores { m68k: true, gpu: false, dsp: false },
+            "gpu" | "tom" => Cores { m68k: false, gpu: true, dsp: false },
+            "dsp" | "jerry" => Cores { m68k: false, gpu: false, dsp: true },
+            other => return Err(format!("--core: expected 68k|gpu|dsp|all, got `{other}`")),
+        };
+        let gpu_map = match flag_val(args, "--gpu-map") {
+            Some(m) => load_map(m)?,
+            None => Vec::new(),
+        };
+        let dsp_map = match flag_val(args, "--dsp-map") {
+            Some(m) => load_map(m)?,
+            None => Vec::new(),
+        };
+        let maps = Maps { m68k: &map, gpu: &gpu_map, dsp: &dsp_map };
+        let jag = boot_profiled(
+            &data,
+            start,
+            frames,
+            btn,
+            after,
+            fidelity_arg(args)?,
+            gran,
+            top,
+            cores,
+            maps,
+            flag_val(args, "--prof-json"),
+        )?;
         println!(
             "{{\"ok\":true,\"path\":{},\"frames\":{},\"state\":{}}}",
             jstr(&path),
@@ -411,8 +445,24 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// Boot with the 68k profiler armed, then print the histogram to stderr (stdout
-/// stays a single JSON object, as every other command guarantees).
+/// Which masters to profile (`--core`).
+#[derive(Clone, Copy)]
+struct Cores {
+    m68k: bool,
+    gpu: bool,
+    dsp: bool,
+}
+
+/// Symbol maps, one per master.
+#[derive(Clone, Copy)]
+struct Maps<'a> {
+    m68k: &'a [(u32, String)],
+    gpu: &'a [(u32, String)],
+    dsp: &'a [(u32, String)],
+}
+
+/// Boot with the requested profilers armed, then print the histograms to stderr
+/// (stdout stays a single JSON object, as every other command guarantees).
 #[allow(clippy::too_many_arguments)]
 fn boot_profiled(
     rom: &[u8],
@@ -423,8 +473,11 @@ fn boot_profiled(
     fid: Fidelity,
     gran: u32,
     top: usize,
-    map: &[(u32, String)],
+    cores: Cores,
+    maps: Maps,
+    prof_json: Option<&str>,
 ) -> Result<Jaguar, String> {
+    let map = maps.m68k;
     let mut jag = Jaguar::new();
     jag.load(rom).map_err(|e| e.to_string())?;
     attach_sd(&mut jag);
@@ -442,8 +495,18 @@ fn boot_profiled(
             jag.run_frames(start);
         }
     }
-    // Arm the profiler and accumulate over the [start, start+frames) window.
-    jag.dbg.prof = Some(Box::new(jag_core::debug::Profile::new()));
+    // Arm the profilers and accumulate over the [start, start+frames) window.
+    // Each core's profiler is independent, so `--core gpu` pays nothing for the
+    // 68k's per-instruction bookkeeping and vice versa.
+    if cores.m68k {
+        jag.dbg.prof = Some(Box::new(jag_core::debug::Profile::new()));
+    }
+    if cores.gpu {
+        jag.gpu.arm_profiler();
+    }
+    if cores.dsp {
+        jag.dsp.arm_profiler();
+    }
     let press_in_window = press_after.saturating_sub(start);
     if buttons != 0 && press_after >= start && press_in_window < frames {
         jag.run_frames(press_in_window);
@@ -452,43 +515,45 @@ fn boot_profiled(
     } else if frames > 0 {
         jag.run_frames(frames);
     }
-    let p = jag.dbg.prof.as_ref().unwrap();
-    let awake = p.main_cycles + p.isr_cycles;
-    let tot = p.total_cycles.max(1);
-    if start > 0 {
+    let mut awake = 0u64;
+    if let Some(p) = jag.dbg.prof.as_ref() {
+        awake = p.main_cycles + p.isr_cycles;
+        let tot = p.total_cycles.max(1);
+        if start > 0 {
+            eprintln!(
+                "=== 68k cycle profile ({frames} frames, armed window [{start}, {}) — boot excluded) ===",
+                start + frames
+            );
+        } else {
+            eprintln!("=== 68k cycle profile ({frames} frames) ===");
+        }
         eprintln!(
-            "=== 68k cycle profile ({frames} frames, armed window [{start}, {}) — boot excluded) ===",
-            start + frames
+            "  total charged   {:>12}",
+            p.total_cycles
         );
-    } else {
-        eprintln!("=== 68k cycle profile ({frames} frames) ===");
+        eprintln!(
+            "  asleep in STOP  {:>12}  {:5.1}%   (waiting on an interrupt — not frame cost)",
+            p.stopped_cycles,
+            100.0 * p.stopped_cycles as f64 / tot as f64
+        );
+        eprintln!(
+            "  awake           {:>12}  {:5.1}%",
+            awake,
+            100.0 * awake as f64 / tot as f64
+        );
+        eprintln!(
+            "    in vblank ISR {:>12}  {:5.1}% of awake   ({} instrs)",
+            p.isr_cycles,
+            100.0 * p.isr_cycles as f64 / awake.max(1) as f64,
+            p.isr_instrs
+        );
+        eprintln!(
+            "    main line     {:>12}  {:5.1}% of awake   ({} instrs)",
+            p.main_cycles,
+            100.0 * p.main_cycles as f64 / awake.max(1) as f64,
+            p.main_instrs
+        );
     }
-    eprintln!(
-        "  total charged   {:>12}",
-        p.total_cycles
-    );
-    eprintln!(
-        "  asleep in STOP  {:>12}  {:5.1}%   (waiting on an interrupt — not frame cost)",
-        p.stopped_cycles,
-        100.0 * p.stopped_cycles as f64 / tot as f64
-    );
-    eprintln!(
-        "  awake           {:>12}  {:5.1}%",
-        awake,
-        100.0 * awake as f64 / tot as f64
-    );
-    eprintln!(
-        "    in vblank ISR {:>12}  {:5.1}% of awake   ({} instrs)",
-        p.isr_cycles,
-        100.0 * p.isr_cycles as f64 / awake.max(1) as f64,
-        p.isr_instrs
-    );
-    eprintln!(
-        "    main line     {:>12}  {:5.1}% of awake   ({} instrs)",
-        p.main_cycles,
-        100.0 * p.main_cycles as f64 / awake.max(1) as f64,
-        p.main_instrs
-    );
     // Wall-clock accounting (COBWEB_REQ_wall_clock_accounting.md): per-core
     // *cycles* cannot express "who was holding wall-clock time". These are
     // fractions of the SAME elapsed wall clock, so they legitimately sum past
@@ -520,26 +585,212 @@ fn boot_profiled(
         100.0 * dsp_c / wall_cyc
     );
 
+    if let Some(p) = jag.dbg.prof.as_ref() {
+        let rows = if gran > 0 { p.top_buckets(gran, top) } else { p.top(top) };
+        eprintln!(
+            "\n  {:<10} {:>12} {:>7} {:>12}  {}",
+            if gran > 0 { "bucket" } else { "pc" },
+            "cycles",
+            "% awake",
+            "instrs",
+            "symbol"
+        );
+        for (pc, cyc, n) in rows {
+            eprintln!(
+                "  0x{:06X}   {:>12} {:>6.2}% {:>12}  {}",
+                pc,
+                cyc,
+                100.0 * cyc as f64 / awake.max(1) as f64,
+                n,
+                sym_for(map, pc)
+            );
+        }
+    }
+    risc_profile_report("Tom GPU", jag.gpu.prof.as_deref(), gran, top, maps.gpu);
+    risc_profile_report("Jerry DSP", jag.dsp.prof.as_deref(), gran, top, maps.dsp);
+    if let Some(path) = prof_json {
+        let txt = profile_json(&jag, frames, start, maps);
+        std::fs::write(path, &txt).map_err(|e| format!("writing {path}: {e}"))?;
+        eprintln!("jagemu: wrote {path} ({} bytes)", txt.len());
+    }
+    Ok(jag)
+}
+
+/// The full per-PC profile as JSON — every executed PC, not just the top K.
+///
+/// This is what makes a *work move* priceable. "Did moving the pose to Jerry
+/// help?" is a diff of two profiles, and a top-K table cannot answer it: the
+/// routine that appeared is usually nowhere near the top, and the routine that
+/// vanished leaves no row behind. `sim/tools/profdiff.py` consumes this.
+fn profile_json(jag: &Jaguar, frames: u64, start: u64, maps: Maps) -> String {
+    let mut s = String::from("{\"frames\":");
+    s.push_str(&frames.to_string());
+    s.push_str(",\"start\":");
+    s.push_str(&start.to_string());
+    if let Some(p) = jag.dbg.prof.as_ref() {
+        s.push_str(",\"m68k\":{\"total_cycles\":");
+        s.push_str(&p.total_cycles.to_string());
+        s.push_str(",\"stopped_cycles\":");
+        s.push_str(&p.stopped_cycles.to_string());
+        s.push_str(",\"isr_cycles\":");
+        s.push_str(&p.isr_cycles.to_string());
+        s.push_str(",\"main_cycles\":");
+        s.push_str(&p.main_cycles.to_string());
+        s.push_str(",\"columns\":[\"pc\",\"cycles\",\"instrs\"],\"pcs\":[");
+        // usize::MAX: every PC, not a top-K slice — see the doc comment.
+        for (i, (pc, cyc, n)) in p.top(usize::MAX).into_iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str(&format!("[{pc},{cyc},{n}]"));
+        }
+        s.push_str("],\"symbols\":");
+        s.push_str(&sym_json(maps.m68k));
+        s.push('}');
+    }
+    for (key, prof, map) in [
+        ("gpu", jag.gpu.prof.as_deref(), maps.gpu),
+        ("dsp", jag.dsp.prof.as_deref(), maps.dsp),
+    ] {
+        let Some(p) = prof else { continue };
+        s.push_str(&format!(",\"{key}\":{{\"total_cycles\":{}", p.total.cycles));
+        s.push_str(&format!(",\"total_instrs\":{}", p.total.instrs));
+        s.push_str(
+            ",\"columns\":[\"pc\",\"cycles\",\"instrs\",\"stall_alu\",\"stall_load\",\
+             \"stall_div\",\"stall_flags\",\"stall_div_busy\",\"jump_refill\",\
+             \"fetch_external\",\"mem_external\",\"blit_wait\",\"contention\"],\"pcs\":[",
+        );
+        let mut rows = p.all();
+        rows.sort_unstable_by(|a, b| b.1.cycles.cmp(&a.1.cycles));
+        for (i, (pc, r)) in rows.into_iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str(&format!(
+                "[{},{},{},{},{},{},{},{},{},{},{},{},{}]",
+                pc,
+                r.cycles,
+                r.instrs,
+                r.stall_alu,
+                r.stall_load,
+                r.stall_div,
+                r.stall_flags,
+                r.stall_div_busy,
+                r.jump_refill,
+                r.fetch_external,
+                r.mem_external,
+                r.blit_wait,
+                r.contention
+            ));
+        }
+        s.push_str("],\"symbols\":");
+        s.push_str(&sym_json(map));
+        s.push('}');
+    }
+    s.push('}');
+    s
+}
+
+fn sym_json(map: &[(u32, String)]) -> String {
+    let mut s = String::from("[");
+    for (i, (a, n)) in map.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&format!("[{a},{}]", jstr(n)));
+    }
+    s.push(']');
+    s
+}
+
+/// Print one JRISC core's per-PC profile.
+///
+/// The stall columns are the point of this table. A core-wide `jump_refill`
+/// total tells you a kernel is refilling the pipe; it does not tell you which
+/// jump, which is why chasing one previously meant reading the listing by hand.
+/// Here every stalled tick is attributed to the instruction that paid it, so the
+/// hot PC and the reason it is hot arrive together.
+fn risc_profile_report(
+    name: &str,
+    prof: Option<&jag_core::debug::RiscProfile>,
+    gran: u32,
+    top: usize,
+    map: &[(u32, String)],
+) {
+    let Some(p) = prof else { return };
+    let t = &p.total;
+    if t.cycles == 0 {
+        eprintln!("\n=== {name} cycle profile ===\n  (core never ran)");
+        return;
+    }
+    let tot = t.cycles.max(1) as f64;
+    let pct = |v: u64| 100.0 * v as f64 / tot;
+    eprintln!("\n=== {name} cycle profile ===");
+    eprintln!("  cycles executed {:>12}   ({} instrs)", t.cycles, t.instrs);
+    // These partition the core's cycles: issue + stalls + external fetch = 100%.
+    eprintln!(
+        "  issue           {:>12}  {:5.1}%   (executing, not stalled)",
+        t.cycles.saturating_sub(t.total_stall() + t.fetch_external),
+        pct(t.cycles.saturating_sub(t.total_stall() + t.fetch_external))
+    );
+    for (label, v) in [
+        ("stall_load", t.stall_load),
+        ("stall_alu", t.stall_alu),
+        ("stall_div", t.stall_div),
+        ("stall_div_busy", t.stall_div_busy),
+        ("stall_flags", t.stall_flags),
+        ("jump_refill", t.jump_refill),
+        ("fetch_external", t.fetch_external),
+    ] {
+        if v > 0 {
+            eprintln!("  {label:<15} {v:>12}  {:5.1}%", pct(v));
+        }
+    }
+    // These do NOT partition the cycles above and must not be added to them.
+    // `mem_external` is bus occupancy PLUS result latency: the occupancy half is
+    // charged to the loading instruction, the latency half is paid later (and
+    // only if a consumer is close enough) as `stall_load`. `blit_wait` is
+    // already inside `issue` — the ticks are real B_CMD poll instructions.
+    // `contention` is the tax portion already included in the costs above.
+    if t.mem_external + t.blit_wait + t.contention > 0 {
+        eprintln!("  -- overlapping measures (not a share of the cycles above) --");
+        for (label, v) in [
+            ("mem_external", t.mem_external),
+            ("blit_wait", t.blit_wait),
+            ("contention", t.contention),
+        ] {
+            if v > 0 {
+                eprintln!("  {label:<15} {v:>12}");
+            }
+        }
+    }
     let rows = if gran > 0 { p.top_buckets(gran, top) } else { p.top(top) };
     eprintln!(
-        "\n  {:<10} {:>12} {:>7} {:>12}  {}",
+        "\n  {:<10} {:>12} {:>7} {:>10} {:>9} {:>9} {:>9} {:>9}  {}",
         if gran > 0 { "bucket" } else { "pc" },
         "cycles",
-        "% awake",
+        "% core",
         "instrs",
+        "ld",
+        "div",
+        "refill",
+        "mem",
         "symbol"
     );
-    for (pc, cyc, n) in rows {
+    for (pc, r) in rows {
         eprintln!(
-            "  0x{:06X}   {:>12} {:>6.2}% {:>12}  {}",
+            "  0x{:06X}   {:>12} {:>6.2}% {:>10} {:>9} {:>9} {:>9} {:>9}  {}",
             pc,
-            cyc,
-            100.0 * cyc as f64 / awake.max(1) as f64,
-            n,
+            r.cycles,
+            pct(r.cycles),
+            r.instrs,
+            r.stall_load,
+            r.stall_div + r.stall_div_busy,
+            r.jump_refill,
+            r.mem_external + r.fetch_external,
             sym_for(map, pc)
         );
     }
-    Ok(jag)
 }
 
 fn cmd_screenshot(args: &[String]) -> Result<(), String> {

@@ -22,6 +22,7 @@ fn main() -> ExitCode {
     let mut opts = Options::default();
     let mut org_set = false;
     let mut elf_obj = false;
+    let mut map_out: Option<String> = None;
 
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -80,6 +81,13 @@ fn main() -> ExitCode {
                 eprintln!("jas: --emit-gas needs an input file");
                 return ExitCode::FAILURE;
             }
+            "--map" => match it.next() {
+                Some(m) => map_out = Some(m.clone()),
+                None => {
+                    eprintln!("jas: --map needs a file");
+                    return ExitCode::FAILURE;
+                }
+            },
             "-I" => {
                 if let Some(d) = it.next() {
                     opts.include_dirs.push(d.clone());
@@ -129,6 +137,30 @@ fn main() -> ExitCode {
     if errs > 0 {
         eprintln!("jas: {errs} error(s), {warns} warning(s) — no output written");
         return ExitCode::FAILURE;
+    }
+
+    // --map: `ADDR name`, one per line, address-sorted. Labels only — `equ`
+    // constants are not code addresses and would name hot spots after whatever
+    // numeric constant happened to sort below them. This is what feeds
+    // `jagemu run --pc-histogram --gpu-map/--dsp-map`: without it a GPU profile
+    // is raw addresses and locating a routine means reading a listing by hand.
+    if let Some(mp) = &map_out {
+        let mut syms: Vec<(u32, &String)> = result
+            .symbols
+            .iter()
+            .filter(|(n, _)| result.label_syms.contains(*n))
+            .map(|(n, &v)| (v, n))
+            .collect();
+        syms.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
+        let mut txt = String::new();
+        for (addr, name) in &syms {
+            txt.push_str(&format!("{addr:08X} {name}\n"));
+        }
+        if let Err(e) = std::fs::write(mp, &txt) {
+            eprintln!("jas: cannot write {mp}: {e}");
+            return ExitCode::FAILURE;
+        }
+        eprintln!("jas: wrote {mp} ({} label symbols)", syms.len());
     }
 
     if let Some(out) = output {
@@ -193,6 +225,7 @@ fn usage() {
          \n\
          OPTIONS:\n\
          \x20 -o <file>            write flat binary output\n\
+         \x20 --map <file>        write `ADDR label` symbols (feeds jagemu --gpu-map/--dsp-map)\n\
          \x20 --elf-obj           write a GNU-linkable ELF32 m68k object (implies -r)\n\
          \x20 --gpu | --dsp       target core (default gpu; sets default org)\n\
          \x20 --68000            start in 68000 mode (pure-68k files w/o a .68000 directive)\n\

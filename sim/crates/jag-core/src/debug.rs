@@ -247,3 +247,168 @@ impl Profile {
         v
     }
 }
+
+// ── JRISC profiler (Tom GPU / Jerry DSP) ────────────────────────────────────
+
+/// One PC's worth of attributed cycles.
+///
+/// The stall fields are the same categories the whole-core `TimingStats`
+/// reports, sliced per instruction — so a hot spot can be read as *why* it is
+/// hot, not just *that* it is. That was the missing half of the 68k histogram:
+/// a core-wide `jump_refill` total says a kernel is refilling the pipe without
+/// saying which jump does it, which left static analysis as the only way to
+/// chase it.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct RiscRow {
+    pub cycles: u64,
+    pub instrs: u64,
+    pub stall_alu: u64,
+    pub stall_load: u64,
+    pub stall_div: u64,
+    pub stall_flags: u64,
+    pub stall_div_busy: u64,
+    pub jump_refill: u64,
+    pub fetch_external: u64,
+    pub mem_external: u64,
+    pub blit_wait: u64,
+    pub contention: u64,
+}
+
+impl RiscRow {
+    /// Total attributed stall ticks (excludes external fetch/data occupancy,
+    /// matching `TimingStats::total_stall`).
+    pub fn total_stall(&self) -> u64 {
+        self.stall_alu
+            + self.stall_load
+            + self.stall_div
+            + self.stall_flags
+            + self.stall_div_busy
+            + self.jump_refill
+    }
+
+    fn add(&mut self, o: &RiscRow) {
+        self.cycles += o.cycles;
+        self.instrs += o.instrs;
+        self.stall_alu += o.stall_alu;
+        self.stall_load += o.stall_load;
+        self.stall_div += o.stall_div;
+        self.stall_flags += o.stall_flags;
+        self.stall_div_busy += o.stall_div_busy;
+        self.jump_refill += o.jump_refill;
+        self.fetch_external += o.fetch_external;
+        self.mem_external += o.mem_external;
+        self.blit_wait += o.blit_wait;
+        self.contention += o.contention;
+    }
+}
+
+/// Exact per-PC cycle attribution for a JRISC core, the GPU/DSP counterpart of
+/// [`Profile`].
+///
+/// Exact, not sampled, for the same reason: a JRISC kernel's hot loop is often
+/// a handful of instructions inside a 4 KB SRAM window, and any sampling
+/// interval coarse enough to be cheap is coarse enough to miss it.
+///
+/// Addresses are routed to one of three stores rather than a single flat array,
+/// because a JRISC PC is not confined to one window: kernels run from local
+/// SRAM (`$F03000` / `$F1B000`), from DRAM when they outgrow it, and
+/// occasionally from ROM. A flat 2 MB mask — which is what the 68k profiler
+/// uses — would alias `$F03000` onto DRAM `$103000` and silently merge two
+/// unrelated hot spots.
+pub struct RiscProfile {
+    /// Base/size of this core's local SRAM window (GPU 4 KB, DSP 8 KB).
+    sram_base: u32,
+    /// `pc -> row index + 1` for local SRAM (0 = never executed).
+    sram_idx: Vec<u32>,
+    /// `pc -> row index + 1` for the 2 MB DRAM window.
+    dram_idx: Vec<u32>,
+    /// Anything else (ROM, device windows) — rare, so a map is fine.
+    other_idx: std::collections::HashMap<u32, u32>,
+    rows: Vec<RiscRow>,
+    pub total: RiscRow,
+}
+
+impl RiscProfile {
+    pub fn new(sram_base: u32, sram_size: u32) -> Self {
+        RiscProfile {
+            sram_base,
+            sram_idx: vec![0; (sram_size >> 1) as usize],
+            dram_idx: vec![0; 0x200000 >> 1],
+            other_idx: std::collections::HashMap::new(),
+            rows: Vec::new(),
+            total: RiscRow::default(),
+        }
+    }
+
+    /// Slot for `pc`, allocating a row on first execution.
+    #[inline]
+    fn slot(&mut self, pc: u32) -> usize {
+        let cell: &mut u32 = if pc >= self.sram_base
+            && ((pc - self.sram_base) >> 1) < self.sram_idx.len() as u32
+        {
+            let i = ((pc - self.sram_base) >> 1) as usize;
+            &mut self.sram_idx[i]
+        } else if pc < 0x200000 {
+            &mut self.dram_idx[(pc >> 1) as usize]
+        } else {
+            self.other_idx.entry(pc).or_insert(0)
+        };
+        if *cell == 0 {
+            self.rows.push(RiscRow::default());
+            *cell = self.rows.len() as u32; // stored +1 so 0 means "unused"
+        }
+        (*cell - 1) as usize
+    }
+
+    /// Attribute one instruction's cycles and stalls to the PC that issued it.
+    #[inline]
+    pub fn record(&mut self, pc: u32, row: &RiscRow) {
+        self.total.add(row);
+        let i = self.slot(pc);
+        self.rows[i].add(row);
+    }
+
+    /// Hottest PCs by cycles, descending.
+    pub fn top(&self, k: usize) -> Vec<(u32, RiscRow)> {
+        let mut v = self.all();
+        v.sort_unstable_by(|a, b| b.1.cycles.cmp(&a.1.cycles));
+        v.truncate(k);
+        v
+    }
+
+    /// Hot regions: cycles summed into `gran`-byte buckets, descending. Better
+    /// for naming a *routine* than its hottest single instruction.
+    pub fn top_buckets(&self, gran: u32, k: usize) -> Vec<(u32, RiscRow)> {
+        let g = gran.max(2) as u64;
+        let mut buckets: std::collections::HashMap<u64, RiscRow> = std::collections::HashMap::new();
+        for (pc, r) in self.all() {
+            buckets.entry(pc as u64 / g).or_default().add(&r);
+        }
+        let mut v: Vec<(u32, RiscRow)> =
+            buckets.into_iter().map(|(b, r)| ((b * g) as u32, r)).collect();
+        v.sort_unstable_by(|a, b| b.1.cycles.cmp(&a.1.cycles));
+        v.truncate(k);
+        v
+    }
+
+    /// Every executed PC with its row, unordered.
+    pub fn all(&self) -> Vec<(u32, RiscRow)> {
+        let mut v = Vec::with_capacity(self.rows.len());
+        for (i, &c) in self.sram_idx.iter().enumerate() {
+            if c != 0 {
+                v.push((self.sram_base + ((i as u32) << 1), self.rows[(c - 1) as usize]));
+            }
+        }
+        for (i, &c) in self.dram_idx.iter().enumerate() {
+            if c != 0 {
+                v.push(((i as u32) << 1, self.rows[(c - 1) as usize]));
+            }
+        }
+        for (&pc, &c) in self.other_idx.iter() {
+            if c != 0 {
+                v.push((pc, self.rows[(c - 1) as usize]));
+            }
+        }
+        v
+    }
+}
