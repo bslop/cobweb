@@ -76,6 +76,7 @@ fn usage() {
          \x20 jagemu run <rom> --pc-histogram [--core 68k|gpu|dsp|all] [--map m.map]\n\
          \x20      [--gpu-map g.map] [--dsp-map d.map] [--start S] [--top K] [--bucket N]\n\
          \x20      [--prof-json p.json]      # full per-PC profile; diff two with profdiff.py\n\
+         \x20 jagemu run <rom> --watchdog N   # warn if a core runs N frames without clearing GO\n\
          \x20 jagemu screenshot <rom> [--frames N] [-o out.png]\n\
          \x20 jagemu video <rom> [--count N] [--every K] [--start S] [--cols C] [--dir D] -o film.png\n\
          \x20 jagemu audio <rom> [--frames N] [--press a] -o out.wav\n\
@@ -210,6 +211,47 @@ fn attach_sd(jag: &mut Jaguar) {
     }
 }
 
+/// `--watchdog <frames>`, stashed so it reaches every boot path without adding
+/// a parameter to seven call sites for what is a debugging aid. 0 = disabled.
+static WATCHDOG_FRAMES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn apply_watchdog(jag: &mut Jaguar) {
+    let n = WATCHDOG_FRAMES.load(std::sync::atomic::Ordering::Relaxed);
+    if n > 0 {
+        jag.gpu.stuck_after_frames = Some(n);
+        jag.dsp.stuck_after_frames = Some(n);
+    }
+}
+
+/// Loud, unconditional diagnostics for the "renders here, black-screens on
+/// silicon" class (COBWEB_BUG_jagemu_runs_code_that_hangs_silicon.md).
+///
+/// Unconditional on purpose. Both signals are free, and the failure they catch
+/// costs a 195-second flash plus a physical power-cycle to discover the slow
+/// way — an opt-in flag would be off precisely on the run that needed it.
+fn report_hazard_diagnostics(jag: &Jaguar) {
+    for (name, t) in [("Tom GPU", &jag.gpu.pipe.stats), ("Jerry DSP", &jag.dsp.pipe.stats)] {
+        if t.div_by_zero > 0 {
+            eprintln!(
+                "jagemu: WARNING — {name} executed {} DIV(s) with a ZERO divisor. jsim \
+                 returns 0xFFFFFFFF and continues; real silicon does NOT, and a kernel \
+                 that divides by zero has black-screened a Jaguar while rendering fine \
+                 here. Silicon's exact behaviour is unmeasured, so this is reported, not \
+                 modelled — but treat a nonzero count as a hardware failure.",
+                t.div_by_zero
+            );
+        }
+    }
+    for (name, c) in [("Tom GPU", &jag.gpu), ("Jerry DSP", &jag.dsp)] {
+        if let Some((pc, frames)) = c.stuck_at {
+            eprintln!(
+                "jagemu: WARNING — {name} ran {frames} consecutive frames without clearing \
+                 RISCGO (first seen at pc={pc:#010X})."
+            );
+        }
+    }
+}
+
 fn boot_input(
     rom: &[u8],
     frames: u64,
@@ -222,6 +264,7 @@ fn boot_input(
     attach_sd(&mut jag);
     jag.gpu.fidelity = fid;
     jag.dsp.fidelity = fid;
+    apply_watchdog(&mut jag);
     if buttons != 0 && press_after < frames {
         jag.run_frames(press_after);
         jag.set_pad(0, buttons);
@@ -229,6 +272,7 @@ fn boot_input(
     } else if frames > 0 {
         jag.run_frames(frames);
     }
+    report_hazard_diagnostics(&jag);
     Ok(jag)
 }
 
@@ -348,6 +392,13 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     let (path, data) = load_rom(args)?;
     let frames = flag_val(args, "--frames").map(parse_u64).transpose()?.unwrap_or(60);
     let (btn, after) = press_args(args)?;
+    // --watchdog <frames>: warn if a core never clears RISCGO for that many
+    // consecutive frames. Opt-in with no default, because a RESIDENT kernel
+    // legitimately runs forever and a warning that always fires is one nobody
+    // reads. Only the caller knows whether its kernel is per-frame.
+    if let Some(n) = flag_val(args, "--watchdog").map(parse_u32).transpose()? {
+        WATCHDOG_FRAMES.store(n, std::sync::atomic::Ordering::Relaxed);
+    }
     let prof = has_flag(args, "--pc-histogram") || has_flag(args, "--profile68k");
     if prof {
         let top = flag_val(args, "--top").map(parse_u32).transpose()?.unwrap_or(25) as usize;
@@ -483,6 +534,7 @@ fn boot_profiled(
     attach_sd(&mut jag);
     jag.gpu.fidelity = fid;
     jag.dsp.fidelity = fid;
+    apply_watchdog(&mut jag);
     // Warmup: run to `start` with the profiler off, so one-time boot/level-load
     // loops don't count as steady-state. A button press scheduled inside the
     // warmup window still fires there; a later one fires in the armed window.
@@ -606,6 +658,7 @@ fn boot_profiled(
             );
         }
     }
+    report_hazard_diagnostics(&jag);
     risc_profile_report("Tom GPU", jag.gpu.prof.as_deref(), gran, top, maps.gpu);
     risc_profile_report("Jerry DSP", jag.dsp.prof.as_deref(), gran, top, maps.dsp);
     if let Some(path) = prof_json {
@@ -1885,7 +1938,7 @@ fn timing_json(t: &TimingStats) -> String {
          \"stall_div_busy\":{},\"jump_refill\":{},\"fetch_external\":{},\"mem_external\":{},\
          \"waw_hazards\":{},\"indexed_store_stale\":{},\"slot_movei\":{},\"slot_jump\":{},\
          \"bigpemu_divergence\":{},\"contention\":{},\"blit\":{},\
-         \"blit_launch\":{},\"blit_transfer\":{},\"blit_wait\":{}}}",
+         \"blit_launch\":{},\"blit_transfer\":{},\"blit_wait\":{},\"div_by_zero\":{}}}",
         t.stall_alu,
         t.stall_load,
         t.stall_div,
@@ -1903,7 +1956,8 @@ fn timing_json(t: &TimingStats) -> String {
         t.blit,
         t.blit_launch,
         t.blit_transfer,
-        t.blit_wait
+        t.blit_wait,
+        t.div_by_zero
     )
 }
 

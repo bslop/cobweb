@@ -1,0 +1,36 @@
+# PARTIAL capture, 2026-07-27 01:56, Jaguar B — transcribed from the console
+# before the capture window was cut short (my error: a 120 s timeout killed the
+# console mid-suite, and the follow-up reflash could not re-handshake).
+# USB was HEALTHY: 50368 bytes in 6699 ms, 7 KB/s, clean start at $4000.
+# Mode A only, and only as far as divext — face/facenb/facebr are past this
+# point and were NOT captured. Kept for the rig-health signal, not as a result.
+Cobweb jsim calibration suite v1
+CAL vcmod    A s=0000020B e=0000020B w=00000000 r=00080000
+CAL null     A s=000000D5 e=0000020A w=00000000 r=00002000
+CAL nop      A s=000001A0 e=0000001D w=00000002 r=00000400
+CAL move     A s=000001D9 e=00000056 w=00000002 r=00000400
+CAL moveq    A s=00000006 e=0000008E w=00000001 r=00000400
+CAL adddep   A s=0000003E e=00000126 w=00000002 r=00000400
+CAL addind   A s=00000078 e=00000100 w=00000001 r=00000400
+CAL ldsram   A s=000000B0 e=0000008A w=00000001 r=00000200
+CAL ldidx    A s=000000E9 e=00000088 w=00000002 r=00000200
+CAL lddram   A s=00000122 e=00000057 w=00000003 r=00000200
+CAL lddramc  A s=0000014D e=00000140 w=00000002 r=00000100
+CAL ldstride A s=00000178 e=0000003D w=00000001 r=00000100
+CAL stdram   A s=000001CD e=00000043 w=00000002 r=00000200
+CAL blitsm   A s=000001D4 e=000001F2 w=00000000 r=00000080
+CAL blitbg   A s=00000002 e=000001C5 w=00000000 r=00000080
+CAL blit1    A s=0000003A e=0000004C w=00000000 r=00000080
+CAL blit2    A s=00000073 e=00000087 w=00000000 r=00000080
+CAL blit4    A s=000000AB e=000000C3 w=00000000 r=00000080
+CAL blittex1 A s=000000E6 e=000000A0 w=00000001 r=00000080
+CAL blittexq A s=0000011F e=000000D9 w=00000001 r=00000080
+CAL blitrmw  A s=00000157 e=00000024 w=00000001 r=00000080
+CAL ldunderb A s=000001C6 e=00000182 w=00000007 r=00000080
+CAL dens2    A s=000001DD e=000000F0 w=00000001 r=00000100
+CAL dens6    A s=00000026 e=00000144 w=00000000 r=00000100
+CAL dens14   A s=00000096 e=000001BB w=00000000 r=00000080
+CAL dens30   A s=000000CE e=000001FE w=00000000 r=00000080
+CAL ldcunder A s=000000C8 e=000001EE w=00000000 r=00000080
+CAL fib      A s=0000012E e=0000000E w=00000001 r=00000080
+CAL divext   A s=00000157 e=00000165 w=00000001 r=00000080
