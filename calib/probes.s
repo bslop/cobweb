@@ -894,6 +894,89 @@ _p_divlat_s:
 _p_divlat_e:
 
 
+; ── p_divround: does Tom's DIV truncate or ROUND? ──────────────────────────
+; COBWEB_BUG_jagemu_runs_code_that_hangs_silicon.md ask 3, and the last open
+; piece of that report. OpenLara's backface cull is a signed area over INTEGER
+; pixel coords whose sx/sy come from `div` (vc_sxp/vc_syp), so a rounding
+; difference changes WHICH SUB-PIXEL FACES SURVIVE — that is their A1 (Lara's
+; head: faces dropped on silicon, 0 dropped in jagemu). They inferred rounding
+; but explicitly could not test it: "we have no way to compare the two
+; dividers directly." This is that comparison.
+;
+; jsim truncates (isa.rs: `d / s`, unsigned). Each pair below is chosen so
+; truncate and round give DIFFERENT answers, with exact-quotient controls that
+; must agree either way (a control that disagrees means the probe itself is
+; wrong, not the divider).
+;
+; Every div is followed by 20 nops — well past the ~18-cycle latency — so this
+; measures the VALUE only and cannot be confounded by the read-too-early
+; question p_divlat already settled.
+;
+;   slot  case            trunc       half-up     half-even
+;   [0]   7/2             00000003    00000004    00000004
+;   [4]   5/2             00000002    00000003    00000002   <- splits the two roundings
+;   [8]   8/3             00000002    00000003    00000003
+;   [12]  7/3             00000002    00000002    00000002   <- CONTROL (exact-ish, agrees)
+;   [16]  1/2             00000000    00000001    00000000
+;   [20]  FFFFFFFF/2      7FFFFFFF    80000000    80000000   <- top-of-range edge
+;   then DIV_OFFSET (16.16) mode, the mode the perspective divide actually uses:
+;   [24]  2/3  16.16      0000AAAA    0000AAAB    0000AAAB   <- the one that matters
+;   [28]  1/3  16.16      00005555    00005555    00005555   <- CONTROL
+;   [32]  1/2  16.16      00008000    00008000    00008000   <- CONTROL (exact)
+;   magic at [36].
+;
+; DECODE: all six discriminating slots match the trunc column => jsim's divider
+; is faithful and A1 is NOT a rounding difference (look elsewhere: the cull's
+; integer coords, or the projection feeding them). Any slot matching a round
+; column => silicon rounds, jsim must match it, and the cull-sign disagreement
+; they simulated (9.4 of 85 faces/frame at LOWRES) becomes the explanation.
+	.macro	DIVR	num, den
+	movei	#\num,r5
+	movei	#\den,r6
+	div	r6,r5
+	.rept	20
+	nop
+	.endr
+	move	r5,r0
+	store	r0,(r18)
+	addqt	#4,r18
+	.endm
+
+	.even
+	.globl	_p_divround_s
+	.globl	_p_divround_e
+_p_divround_s:
+	.gpu
+	movei	#PRMRESULT,r16
+	load	(r16),r18		; result block base
+	movei	#$F0211C,r7		; G_DIVCTRL
+	moveq	#0,r8
+	store	r8,(r7)			; integer mode for the first six
+	DIVR	7,2
+	DIVR	5,2
+	DIVR	8,3
+	DIVR	7,3
+	DIVR	1,2
+	DIVR	$FFFFFFFF,2
+	moveq	#1,r8
+	store	r8,(r7)			; DIV_OFFSET = 1 (16.16)
+	DIVR	2,3
+	DIVR	1,3
+	DIVR	1,2
+	moveq	#0,r8
+	store	r8,(r7)			; restore integer mode for later probes
+	movei	#MAGICD,r26
+	store	r26,(r18)		; magic LAST — proves every slot landed
+	movei	#GCTRL,r27
+	moveq	#0,r28
+	store	r28,(r27)		; stop self
+	nop
+	nop
+	.68000
+	.data
+_p_divround_e:
+
+
 ; ── p_ldjump: load consumed across a TAKEN JUMP — scoreboard held or dropped? ──
 ; OpenLara round 5.2: a load in flight, then a taken jump, then the consume at
 ; the target. jsim (Silicon) scoreboards -> stalls -> correct value. Hardware
