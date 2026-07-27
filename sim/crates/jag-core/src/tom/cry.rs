@@ -73,13 +73,34 @@ const CRY_BLUE: [[u8; 16]; 16] = [
 ];
 
 /// Decode a 16-bit CRY pixel to 8-bit RGB.
+///
+/// The chroma index is the WHOLE HIGH BYTE, used flat: `base[(px >> 8) & 0xFF]`.
+/// The tables above are that same 256-entry `tga2cry` array written as 16x16,
+/// so the row is the high nibble and the column is the low nibble — the
+/// opposite order to the one this used to apply, which read the transpose.
+///
+/// Two bugs, both silicon-adjudicated against a bubsy3d capture
+/// (`COBWEB_BUG_cry16_decode.md`, four authored face colours):
+///
+///  1. Index order. `[low][high]` reads the transposed entry, and it is silent
+///     because the transpose of a plausible colour is another plausible colour
+///     — a cube rendered every face wrong still looks like a shaded cube. It
+///     survived earlier verification because the anchors used ($0Fyy, $F0yy)
+///     are symmetric-looking corners that were themselves derived from the
+///     wrong convention rather than from silicon.
+///  2. Intensity scale is `>> 8`, not `/ 255`. Off by at most one count, so it
+///     hides completely behind bug 1 and cannot be found by eye.
+///
+/// The base table itself was never wrong: it is byte-for-byte the authentic
+/// Atari `tga2cry` array (verified 256/256 against `crypal_tables.h`). The
+/// filed report guessed the table and it was the one part that was correct.
 #[inline]
 pub fn cry16_to_rgb(px: u16) -> (u8, u8, u8) {
-    let cy = ((px >> 12) & 0xF) as usize; // cyan nibble (column)
-    let cr = ((px >> 8) & 0xF) as usize; // red nibble (row)
+    let hi = ((px >> 12) & 0xF) as usize; // chroma index, high nibble = row
+    let lo = ((px >> 8) & 0xF) as usize; // chroma index, low nibble = column
     let y = (px & 0xFF) as u32;
-    let scale = |m: u8| ((m as u32 * y) / 255) as u8;
-    (scale(CRY_RED[cr][cy]), scale(CRY_GREEN[cr][cy]), scale(CRY_BLUE[cr][cy]))
+    let scale = |m: u8| (((m as u32) * y) >> 8) as u8;
+    (scale(CRY_RED[hi][lo]), scale(CRY_GREEN[hi][lo]), scale(CRY_BLUE[hi][lo]))
 }
 
 #[cfg(test)]
@@ -92,15 +113,29 @@ mod tests {
         assert_eq!(cry16_to_rgb(0xFF00), (0, 0, 0)); // y=0, any chroma
     }
 
+    /// Corners, read off the `tga2cry` table by its flat high-byte index.
+    ///
+    /// These previously asserted the TRANSPOSED colours — $0FFF as pure red —
+    /// because they were written from the same wrong convention as the decoder,
+    /// so they confirmed it instead of catching it. `cry_base_rgb[0x0F]` is
+    /// `(0,255,255)`: $0FFF is CYAN. Full intensity is 254, not 255, because
+    /// the scale is `(m * 255) >> 8`.
     #[test]
     fn cry_primary_corners() {
-        // $0FFF: cyan=0, red=15, y=255 → pure red.
-        assert_eq!(cry16_to_rgb(0x0FFF), (255, 0, 0));
-        // $F0FF: cyan=15, red=0, y=255 → cyan.
-        assert_eq!(cry16_to_rgb(0xF0FF), (0, 255, 255));
-        // $00FF: no chroma, y=255 → blue corner of the CRY cube.
-        assert_eq!(cry16_to_rgb(0x00FF), (0, 0, 255));
-        // $88FF: centre chroma, full intensity ≈ white.
-        assert_eq!(cry16_to_rgb(0x88FF), (247, 255, 230));
+        assert_eq!(cry16_to_rgb(0x0FFF), (0, 254, 254)); // base[0x0F] = cyan
+        assert_eq!(cry16_to_rgb(0xF0FF), (254, 0, 0)); // base[0xF0] = red
+        assert_eq!(cry16_to_rgb(0x00FF), (0, 0, 254)); // base[0x00] = blue
+    }
+
+    /// The adjudicating case: four authored face colours from bubsy3d, read off
+    /// real silicon through a capture card. These are interior chroma values,
+    /// not corners — the whole point, since a transposed table passes at the
+    /// corners and fails everywhere a real renderer actually lives.
+    #[test]
+    fn cry_matches_silicon_bubsy3d_faces() {
+        assert_eq!(cry16_to_rgb(0x1DDD), (29, 215, 220)); // top, cyan
+        assert_eq!(cry16_to_rgb(0xECF2), (241, 218, 32)); // right, yellow
+        assert_eq!(cry16_to_rgb(0x7ECA), (25, 201, 38)); // back, green
+        assert_eq!(cry16_to_rgb(0xE2E3), (226, 33, 30)); // front, red
     }
 }
