@@ -319,38 +319,58 @@ impl Pipeline {
         now: u64,
         fidelity: Fidelity,
     ) -> u64 {
+        // Only the BINDING operand is charged. The instruction stalls once, for
+        // the longest wait among its operands; attributing every pending
+        // operand's wait made the stall counters sum past the core's own cycle
+        // count (a two-source instruction whose registers were both in flight
+        // was billed twice for one stall). Cost was always the max — this is a
+        // counter fix, not a timing change.
         let mut stall = 0u64;
+        let mut kind: Option<PendKind> = None;
         for r in access.reads.iter().flatten() {
             let b = if access.read_alt_bank { 1 - bank } else { bank };
             let id = (b * 32) as u8 + r;
-            stall = stall.max(self.read_stall(id, now, fidelity));
+            if let Some((wait, k)) = self.read_stall(id, now, fidelity) {
+                if wait > stall {
+                    stall = wait;
+                    kind = Some(k);
+                }
+            }
         }
+        let mut flags_bound = false;
         if access.uses_flags && self.flags_ready > now {
             let wait = self.flags_ready - now;
-            self.stats.stall_flags += wait;
-            stall = stall.max(wait);
+            if wait > stall {
+                stall = wait;
+                flags_bound = true;
+            }
+        }
+        if flags_bound {
+            self.stats.stall_flags += stall;
+        } else if let Some(k) = kind {
+            match k {
+                PendKind::Alu => self.stats.stall_alu += stall,
+                PendKind::Load | PendKind::ExtLoad => self.stats.stall_load += stall,
+                PendKind::Div => self.stats.stall_div += stall,
+            }
         }
         stall
     }
 
-    fn read_stall(&mut self, reg: u8, now: u64, fidelity: Fidelity) -> u64 {
-        let Some(p) = self.pend.iter().find(|p| p.reg == reg) else {
-            return 0;
-        };
+    /// How long a read of `reg` must wait, and what it is waiting on. Pure with
+    /// respect to the tick counters — the caller commits only the binding one.
+    fn read_stall(&mut self, reg: u8, now: u64, fidelity: Fidelity) -> Option<(u64, PendKind)> {
+        let p = self.pend.iter().find(|p| p.reg == reg)?;
         if p.ready_at <= now {
-            return 0;
+            return None;
         }
         if fidelity == Fidelity::BigPEmu && p.kind == PendKind::ExtLoad && p.jumped {
+            // An event count, not a tick count: every divergence SITE is a real
+            // observation regardless of which operand ends up binding.
             self.stats.bigpemu_divergence += 1;
-            return 0;
+            return None;
         }
-        let wait = p.ready_at - now;
-        match p.kind {
-            PendKind::Alu => self.stats.stall_alu += wait,
-            PendKind::Load | PendKind::ExtLoad => self.stats.stall_load += wait,
-            PendKind::Div => self.stats.stall_div += wait,
-        }
-        wait
+        Some((p.ready_at - now, p.kind))
     }
 
     /// Stall issuing a DIV while the divider is still busy (TRM bug 25 class).
