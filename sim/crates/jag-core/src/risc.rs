@@ -112,6 +112,9 @@ pub struct Risc {
     /// Set to the breakpoint PC when `run` stopped on one; the run loop above
     /// (`Jaguar::run_to_frame`) drains it into a stop reason.
     pub bp_hit: Option<u32>,
+    /// Exact per-PC cycle/stall profiler. `None` = off (zero hot-loop cost:
+    /// the stats snapshot below is only taken when this is armed).
+    pub prof: Option<Box<crate::debug::RiscProfile>>,
 }
 
 impl Risc {
@@ -143,7 +146,16 @@ impl Risc {
             granted: 0,
             breakpoints: std::collections::HashSet::new(),
             bp_hit: None,
+            prof: None,
         }
+    }
+
+    /// Arm the per-PC profiler for this core (see `debug::RiscProfile`).
+    pub fn arm_profiler(&mut self) {
+        self.prof = Some(Box::new(crate::debug::RiscProfile::new(
+            self.kind.sram_base(),
+            self.kind.sram_size(),
+        )));
     }
 
     pub fn reset(&mut self) {
@@ -450,6 +462,11 @@ impl Risc {
     fn step_one(&mut self, bus: &mut Bus) -> u32 {
         let was_pending = self.pending_jump.take();
         let in_slot = self.prev_was_jump;
+        // Profiler: remember the PC that ISSUES this instruction (not the PC
+        // after it) and the stall counters before it runs, so the deltas below
+        // attribute every stalled tick to the instruction that paid for it.
+        let pc0 = self.pc;
+        let stats0 = self.prof.as_ref().map(|_| self.pipe.stats.clone());
         let mut cost = if self.fidelity == Fidelity::Functional {
             let iw = self.fetch16(bus);
             self.prev_was_jump = matches!((iw >> 10) & 0x3F, 52 | 53);
@@ -469,7 +486,40 @@ impl Risc {
             }
         }
         self.cycles += cost as u64;
+        if let Some(s0) = stats0 {
+            // Refill is charged here, on the delay slot, because that is where
+            // the ticks are actually spent — the slot instruction runs and then
+            // the pipe refills. The jump that caused it is the preceding
+            // instruction (slot PC - 2, or -6 when the jump was a MOVEI-formed
+            // absolute), which is how a `jump_refill` row should be read.
+            let d = Self::prof_delta(&s0, &self.pipe.stats, cost);
+            if let Some(p) = self.prof.as_mut() {
+                p.record(pc0, &d);
+            }
+        }
         cost
+    }
+
+    /// Per-instruction slice of the core's stall counters.
+    fn prof_delta(
+        a: &timing::TimingStats,
+        b: &timing::TimingStats,
+        cost: u32,
+    ) -> crate::debug::RiscRow {
+        crate::debug::RiscRow {
+            cycles: cost as u64,
+            instrs: 1,
+            stall_alu: b.stall_alu - a.stall_alu,
+            stall_load: b.stall_load - a.stall_load,
+            stall_div: b.stall_div - a.stall_div,
+            stall_flags: b.stall_flags - a.stall_flags,
+            stall_div_busy: b.stall_div_busy - a.stall_div_busy,
+            jump_refill: b.jump_refill - a.jump_refill,
+            fetch_external: b.fetch_external - a.fetch_external,
+            mem_external: b.mem_external - a.mem_external,
+            blit_wait: b.blit_wait - a.blit_wait,
+            contention: b.contention - a.contention,
+        }
     }
 
     /// The timed step: scoreboard stalls, hazard modeling, memory costs.
@@ -1105,5 +1155,121 @@ mod tests {
         assert_eq!(gpu.cycles, gpu.instret);
         assert_eq!(gpu.pipe.stats.total_stall(), 0);
         assert_eq!(gpu.regs[0][3], 6);
+    }
+
+    // ── JRISC per-PC profiler ───────────────────────────────────────────────
+
+    /// Run `words` with the per-PC profiler armed.
+    fn run_profiled(words: &[u16], budget: u32, fid: Fidelity) -> Risc {
+        let mut bus = Bus::new();
+        for (i, &w) in words.iter().enumerate() {
+            bus.write16(mem::G_RAM + (i as u32) * 2, w);
+        }
+        bus.write32(mem::G_PC, mem::G_RAM);
+        bus.write32(mem::G_CTRL, mem::RISCGO);
+        let mut gpu = Risc::new(RiscKind::Gpu);
+        gpu.fidelity = fid;
+        gpu.arm_profiler();
+        gpu.run(&mut bus, budget);
+        gpu
+    }
+
+    /// The profile is a partition of the core's own cycle count: every tick the
+    /// core charged itself lands on exactly one PC, and every instruction is
+    /// counted once. If this drifts, a histogram silently under- or
+    /// over-reports and the hot spot it names is not the real one.
+    #[test]
+    fn profile_totals_match_core() {
+        let prog = with_stop(&[
+            enc(35, 20, 2), // moveq #20,r2
+            enc(35, 3, 1),  // moveq #3,r1
+            enc(21, 1, 2),  // div r1,r2   ← 17-tick shadow
+            enc(34, 2, 3),  // move r2,r3  ← consumer stalls
+        ]);
+        let gpu = run_profiled(&prog, 500, Fidelity::Silicon);
+        let p = gpu.prof.as_ref().unwrap();
+        assert_eq!(p.total.cycles, gpu.cycles, "profiled ticks must equal core cycles");
+        assert_eq!(p.total.instrs, gpu.instret, "profiled instrs must equal instret");
+        assert_eq!(p.total.stall_div, gpu.pipe.stats.stall_div);
+        // The DIV consumer is the instruction that pays the shadow, and the
+        // profiler must name IT — not the DIV that opened the shadow.
+        let consumer = mem::G_RAM + 3 * 2;
+        let row = p.all().into_iter().find(|(pc, _)| *pc == consumer).unwrap().1;
+        assert!(row.stall_div > 0, "the stall belongs to the consuming PC");
+    }
+
+    /// Attributed stalls can never exceed the cycles the core actually charged.
+    /// They did: an instruction reading two in-flight registers stalls ONCE for
+    /// the longer wait, but both waits were being added to the counters, so a
+    /// load-heavy kernel reported `stall_load` above 100% of its own cycles.
+    #[test]
+    fn stall_counters_do_not_double_count_operands() {
+        // r2 and r3 both land late (two DIVs), then one instruction reads both.
+        let prog = with_stop(&[
+            enc(35, 3, 1),  // moveq #3,r1
+            enc(35, 20, 2), // moveq #20,r2
+            enc(35, 40, 3), // moveq #40,r3
+            enc(21, 1, 2),  // div r1,r2
+            enc(21, 1, 3),  // div r1,r3
+            enc(0, 2, 3),   // add r2,r3   ← reads BOTH pending results
+        ]);
+        let gpu = run_profiled(&prog, 500, Fidelity::Silicon);
+        let s = &gpu.pipe.stats;
+        assert!(
+            s.total_stall() <= gpu.cycles,
+            "attributed stalls {} exceed core cycles {}",
+            s.total_stall(),
+            gpu.cycles
+        );
+        let p = gpu.prof.as_ref().unwrap();
+        for (pc, r) in p.all() {
+            assert!(
+                r.total_stall() <= r.cycles,
+                "pc {pc:#010X}: stalls {} exceed its own cycles {}",
+                r.total_stall(),
+                r.cycles
+            );
+        }
+    }
+
+    /// Refill is charged to the delay slot — that is where the ticks are spent.
+    /// This is the counter a kernel author chases when a branchy loop is slow,
+    /// and it was previously only available as a core-wide total.
+    #[test]
+    fn profile_attributes_jump_refill_per_pc() {
+        // jr always to +2 words, delay slot, then the stop epilogue.
+        let prog = with_stop(&[
+            enc(35, 0, 1),                    // 0: moveq #0,r1
+            enc(53, 2 & 0x1F, 0x00),          // 1: jr T,(+2 words)
+            enc(57, 0, 0),                    // 2: nop   ← delay slot
+            enc(57, 0, 0),                    // 3: nop   (skipped)
+            enc(57, 0, 0),                    // 4: nop   (target)
+        ]);
+        let gpu = run_profiled(&prog, 500, Fidelity::Silicon);
+        let p = gpu.prof.as_ref().unwrap();
+        let slot = mem::G_RAM + 2 * 2;
+        let row = p.all().into_iter().find(|(pc, _)| *pc == slot).unwrap().1;
+        assert_eq!(
+            row.jump_refill,
+            timing::Lat::JUMP_REFILL as u64,
+            "the taken jump's refill lands on its delay slot"
+        );
+        assert_eq!(p.total.jump_refill, gpu.pipe.stats.jump_refill);
+    }
+
+    /// A DSP kernel running from local SRAM and a GPU kernel running from DRAM
+    /// must not share a histogram slot. Masking a JRISC PC into one flat 2 MB
+    /// window (what the 68k profiler does) aliases `$F03000` onto `$103000`.
+    #[test]
+    fn profile_separates_sram_from_dram_addresses() {
+        use crate::debug::{RiscProfile, RiscRow};
+        let mut p = RiscProfile::new(mem::G_RAM, 0x1000);
+        let one = RiscRow { cycles: 7, instrs: 1, ..Default::default() };
+        p.record(mem::G_RAM, &one); // $F03000, local SRAM
+        p.record(mem::G_RAM & 0x1FFFFF, &one); // $103000, DRAM — the alias
+        let rows = p.all();
+        assert_eq!(rows.len(), 2, "SRAM and its DRAM alias must be distinct rows");
+        assert!(rows.iter().all(|(_, r)| r.cycles == 7));
+        assert_eq!(p.total.cycles, 14);
     }
 }
