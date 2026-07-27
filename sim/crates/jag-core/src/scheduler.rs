@@ -117,6 +117,9 @@ impl Scheduler {
                 self.frame += 1;
                 bus.frame_mirror = self.frame;
                 self.vi_fired_this_frame = false;
+                // Liveness: a core still running here has not stopped all field.
+                gpu.note_frame();
+                dsp.note_frame();
                 // The field just completed: snapshot the fully composited canvas
                 // as the presented frame BEFORE the next field clears `fb`. This
                 // is what `capture_frame` returns, so a capture is always a whole

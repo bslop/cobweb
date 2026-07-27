@@ -6,6 +6,32 @@ assigned at release.
 
 ## Unreleased
 
+### 2026-07-27 — jsim: divide-by-zero counter + GPU/DSP liveness watchdog
+
+Both from `COBWEB_BUG_jagemu_runs_code_that_hangs_silicon.md`, OpenLara's top
+blocker: four kernel changes rendered fine in jagemu and black-screened a real
+Jaguar in one session, each costing a 195-second flash plus a power-cycle.
+
+- **`div_by_zero` counter** (`gpu.timing`/`dsp.timing`, plus an unconditional
+  stderr warning). `isa.rs` answered `0xFFFFFFFF` on a zero divisor and carried
+  on, which is exactly why the `KEEPDEGEN` case — dropping a degenerate-face
+  cull, letting a zero-area face reach the edge walker with `dy = 0` — rendered
+  a normal frame here and hung silicon. **Counted, not modelled**: the reporter
+  observed silicon "hangs, or produces a value that makes the y-walk never
+  terminate", and which of those it is has not been measured. Guessing would
+  make jsim confidently wrong in a new way. The benign value is unchanged, so
+  no timing or calibration constant moves.
+- **`--watchdog N`**: warn when a core runs N consecutive frames without ever
+  clearing RISCGO. Frame-anchored, not instruction-anchored — a resident kernel
+  (OpenLara's DSP poll loop) legitimately runs forever, so "N million
+  instructions without stopping" would fire every run and be ignored within a
+  day. Opt-in, because only the caller knows whether its kernel is per-frame.
+- Found immediately on a shipped probe ROM: `probes/RP_jpose.cof` executes
+  **888 GPU divide-by-zeros in 120 frames**.
+
+Also closes ask 4 of that report (a GPU PC histogram) — shipped earlier today.
+Ask 3, divide ROUNDING vs silicon, still needs a bench.
+
 ### 2026-07-27 — jsim: CRY16 scan-out read the transposed chroma entry
 
 - **`cry16_to_rgb` indexed the base table backwards.** The chroma index is the

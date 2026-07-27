@@ -246,6 +246,19 @@ pub struct TimingStats {
     /// the bwait spin, measured (not modeled) at the same granularity the
     /// kernel polls on hardware.
     pub blit_wait: u64,
+    /// DIVs issued with a ZERO divisor. jsim returns `0xFFFFFFFF` and carries
+    /// on; silicon does something else — a kernel that divided by zero
+    /// black-screened a real Jaguar while jsim rendered a normal frame
+    /// (COBWEB_BUG_jagemu_runs_code_that_hangs_silicon.md, the `KEEPDEGEN`
+    /// case: dropping a degenerate-face cull let a zero-area face reach the
+    /// edge walker with dy = 0).
+    ///
+    /// This is a COUNTER, not a model. The reporter observed silicon "hangs, or
+    /// produces a value that makes the y-walk never terminate" — which of those
+    /// it is has not been measured, and guessing would make jsim confidently
+    /// wrong in a new way. Counting it is enough to convert a 195-second flash
+    /// plus a power-cycle into a line of output.
+    pub div_by_zero: u64,
 }
 
 impl TimingStats {

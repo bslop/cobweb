@@ -172,6 +172,12 @@ pub(super) fn execute(core: &mut Risc, bus: &mut Bus, iw: u16) {
         21 => {
             // DIV (unsigned; 16.16 if div_offset)
             if s == 0 {
+                // Counted, not modelled: silicon's divide-by-zero behaviour is
+                // unmeasured (see TimingStats::div_by_zero). `0xFFFFFFFF` is
+                // jsim's long-standing benign answer and stays, so timing and
+                // every calibration constant are unaffected — but the event is
+                // now visible instead of silent.
+                core.pipe.stats.div_by_zero += 1;
                 core.set_reg(b, r2, 0xFFFF_FFFF);
                 core.div_remainder = d;
             } else if core.div_offset {

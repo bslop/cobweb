@@ -115,6 +115,29 @@ pub struct Risc {
     /// Exact per-PC cycle/stall profiler. `None` = off (zero hot-loop cost:
     /// the stats snapshot below is only taken when this is armed).
     pub prof: Option<Box<crate::debug::RiscProfile>>,
+    /// Consecutive whole frames this core has been running WITHOUT ever
+    /// clearing RISCGO. Reset the moment it stops.
+    ///
+    /// A liveness signal for the "renders in jagemu, black-screens silicon"
+    /// class: a per-frame kernel that stops reaching its done flag hangs on
+    /// hardware but looks fine here, because jsim happily runs an infinite loop
+    /// forever (COBWEB_BUG_jagemu_runs_code_that_hangs_silicon.md).
+    ///
+    /// Frame-anchored deliberately, not instruction-anchored. A RESIDENT kernel
+    /// — OpenLara's DSP poll loop is one — legitimately runs for the whole
+    /// program, so "N million instructions without stopping" would fire on it
+    /// every run and be ignored within a day. "Still running K frames later"
+    /// separates a per-frame kernel that hung from a resident one that is
+    /// working as designed, and only the caller knows which it has: hence
+    /// `stuck_after_frames`, off unless set.
+    pub frames_running: u32,
+    /// Warn once when `frames_running` reaches this. `None` = disabled.
+    pub stuck_after_frames: Option<u32>,
+    /// Set when the threshold was crossed: `(pc, frames)`, captured AT THE
+    /// MOMENT it fired. Not read back off `frames_running` later — the core may
+    /// have stopped by then, which resets the streak to zero and made an early
+    /// version of this report "never cleared RISCGO for 0 consecutive frames".
+    pub stuck_at: Option<(u32, u32)>,
 }
 
 impl Risc {
@@ -147,6 +170,31 @@ impl Risc {
             breakpoints: std::collections::HashSet::new(),
             bp_hit: None,
             prof: None,
+            frames_running: 0,
+            stuck_after_frames: None,
+            stuck_at: None,
+        }
+    }
+
+    /// Called at each frame boundary. Counts consecutive frames spent running
+    /// and reports the first crossing of `stuck_after_frames`.
+    pub fn note_frame(&mut self) {
+        if !self.running {
+            self.frames_running = 0;
+            return;
+        }
+        self.frames_running += 1;
+        if let Some(limit) = self.stuck_after_frames {
+            if self.frames_running == limit && self.stuck_at.is_none() {
+                self.stuck_at = Some((self.pc, self.frames_running));
+                eprintln!(
+                    "jagemu: WARNING — {:?} has been running for {} consecutive frames \
+                     without clearing RISCGO (pc={:#010X}). A per-frame kernel that never \
+                     reaches its done flag hangs on real silicon; jsim will spin here \
+                     forever. Ignore this if the kernel is resident by design.",
+                    self.kind, self.frames_running, self.pc
+                );
+            }
         }
     }
 
@@ -1255,6 +1303,79 @@ mod tests {
             "the taken jump's refill lands on its delay slot"
         );
         assert_eq!(p.total.jump_refill, gpu.pipe.stats.jump_refill);
+    }
+
+    /// A zero divisor must be COUNTED. jsim answers 0xFFFFFFFF and continues,
+    /// which is why a kernel that dropped its degenerate-face cull rendered a
+    /// normal frame here and black-screened a real Jaguar
+    /// (COBWEB_BUG_jagemu_runs_code_that_hangs_silicon.md). The count is the
+    /// whole point: silicon's behaviour is unmeasured, so the event is reported
+    /// rather than modelled.
+    #[test]
+    fn div_by_zero_is_counted_not_silent() {
+        let prog = with_stop(&[
+            enc(35, 7, 2),  // moveq #7,r2   (dividend)
+            enc(35, 0, 1),  // moveq #0,r1   (divisor = 0)
+            enc(21, 1, 2),  // div r1,r2
+        ]);
+        let (_, gpu) = run_fid(&prog, mem::G_RAM, 500, Fidelity::Silicon, &[]);
+        assert_eq!(gpu.pipe.stats.div_by_zero, 1, "a zero divisor must be counted");
+        // The benign value is deliberately unchanged — this is a counter, not a
+        // behaviour change, so no existing timing or result moves.
+        assert_eq!(gpu.regs[0][2], 0xFFFF_FFFF);
+
+        // And a normal divide must not trip it.
+        let ok = with_stop(&[
+            enc(35, 20, 2),
+            enc(35, 4, 1),
+            enc(21, 1, 2),
+        ]);
+        let (_, gpu) = run_fid(&ok, mem::G_RAM, 500, Fidelity::Silicon, &[]);
+        assert_eq!(gpu.pipe.stats.div_by_zero, 0);
+        assert_eq!(gpu.regs[0][2], 5);
+    }
+
+    /// The liveness watchdog counts CONSECUTIVE frames spent running and fires
+    /// once. Frame-anchored rather than instruction-anchored so a resident
+    /// kernel (OpenLara's DSP poll loop) does not trip it every run — a warning
+    /// that always fires is one nobody reads.
+    #[test]
+    fn watchdog_counts_frames_and_resets_on_stop() {
+        let mut gpu = Risc::new(RiscKind::Gpu);
+        gpu.stuck_after_frames = Some(3);
+        gpu.running = true;
+        gpu.pc = 0x00F0_3010;
+        for _ in 0..2 {
+            gpu.note_frame();
+        }
+        assert_eq!(gpu.frames_running, 2);
+        assert!(gpu.stuck_at.is_none(), "must not fire before the threshold");
+
+        gpu.note_frame();
+        assert_eq!(
+            gpu.stuck_at,
+            Some((0x00F0_3010, 3)),
+            "fires at the threshold, capturing pc AND the frame count"
+        );
+
+        // The captured count must survive the core stopping (it reset the live
+        // streak to 0 and used to be reported as "0 consecutive frames").
+        gpu.running = false;
+        gpu.note_frame();
+        assert_eq!(gpu.stuck_at, Some((0x00F0_3010, 3)), "captured count must not decay");
+
+        // Stopping clears the streak.
+        gpu.running = false;
+        gpu.note_frame();
+        assert_eq!(gpu.frames_running, 0);
+
+        // A core that never runs never trips it.
+        let mut idle = Risc::new(RiscKind::Dsp);
+        idle.stuck_after_frames = Some(1);
+        for _ in 0..10 {
+            idle.note_frame();
+        }
+        assert!(idle.stuck_at.is_none());
     }
 
     /// A DSP kernel running from local SRAM and a GPU kernel running from DRAM
