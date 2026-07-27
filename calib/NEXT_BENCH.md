@@ -1045,3 +1045,45 @@ arithmetic: bug 25 (DIV re-issued while the divider is busy) and bug 13 (WAW
 into a pending load/div). Both are counted per-core (`stall_div_busy`,
 `waw_hazards`) and, as of 2026-07-27, attributable to a specific PC via
 `--pc-histogram --core gpu`.
+
+---
+
+## 2026-07-27 SILICON: p_facend / p_facenl — BOTH candidates refuted; the gap is FIXED, not per-instruction
+
+`bench_facebis_20260727_154105.log`, mode B (quiet bus):
+
+| probe | silicon | jsim | jsim fast by |
+|---|---|---|---|
+| face (1 br/px) | 69 | 69 | **0** |
+| facebr (3 br/px) | 89 | 88 | 1 |
+| facenb (0 br) | 65 | 59 | **6** |
+| facend (0 br, divides -> ALU) | 62 | 57 | **5** |
+| facenl (0 br, loads -> ALU) | 32 | 25 | **7** |
+
+**Neither swap closed the gap.** Removing the 2 divides left it at 8.8%;
+removing the 16 DRAM loads made it proportionally WORSE (+28%). So the residual
+is neither the DIV shadow nor external load latency — the two overlap
+mechanisms this bisection was built to separate. Both are eliminated.
+
+**The gap is ~6 ticks ABSOLUTE across probes spanning 25-65 ticks.** It does not
+scale with length, divides, or loads. That is the signature of a FIXED
+per-probe cost jsim under-charges, not an overlap error — which was the
+framing this probe pair was designed under, and it was wrong.
+
+It also splits cleanly on one axis: **all three branchless arms are ~6 ticks
+fast; both branchy arms match.** The pre-registered decode rule for this
+outcome ("both stay fast => it is the plain ALU stream, and adddep/addind
+disagree with that, so suspect the probe") is hereby honoured — this is being
+recorded as a narrowing, not a diagnosis.
+
+LEADING HYPOTHESIS, UNPROVEN: jsim under-charges GPU START-UP (the GO write to
+the first instruction retiring) by ~6 ticks, and in the branchy arms that is
+cancelled by jump_refill being slightly over-charged (the compensating-errors
+pattern seen twice already this session).
+
+NEXT PROBE (small, one flash): a LENGTH SWEEP — the identical branchless body at
+1x / 2x / 4x repeats. A fixed start-up cost stays ~6 ticks at every length; an
+overlap error grows with length. That distinguishes them in one capture and
+needs no new mechanism. Do NOT touch a timing constant until it runs: the two
+already-known errors (over-broad mode-A contention tax, branch-free compute
+under-charge) partly cancel, and this would be a third term in the same sum.
