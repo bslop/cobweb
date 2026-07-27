@@ -6,6 +6,23 @@ assigned at release.
 
 ## Unreleased
 
+### 2026-07-27 — silicon: JRISC DIV truncates (jsim faithful)
+
+- **`calib` `p_divround`**, authored and flashed same day. Six cases where
+  truncate and round disagree, plus three exact controls, in BOTH integer and
+  `DIV_OFFSET` 16.16 mode. **Silicon truncates in every one** (7/2=3, 5/2=2,
+  8/3=2, 1/2=0, FFFFFFFF/2=7FFFFFFF, 2/3 16.16=0000AAAA); all controls agree.
+  jsim's `d / s` is bit-faithful — no change needed.
+- Closes ask 3 of `COBWEB_BUG_jagemu_runs_code_that_hangs_silicon.md`. That
+  report is now fully answered bar silicon's divide-by-zero behaviour, which
+  stays counted-not-modelled until someone measures it.
+- **Refutes the rounding hypothesis behind OpenLara's A1** (Lara's head loses
+  faces on silicon, none in jagemu). The two dividers agree bit for bit, so a
+  rounding difference cannot be changing which sub-pixel faces survive the
+  backface cull. Remaining candidates are hazards, not arithmetic: bug 25
+  (DIV while the divider is busy) and bug 13 (WAW) — both counted, and now
+  attributable to a PC via `--pc-histogram --core gpu`.
+
 ### 2026-07-27 — jsim: divide-by-zero counter + GPU/DSP liveness watchdog
 
 Both from `COBWEB_BUG_jagemu_runs_code_that_hangs_silicon.md`, OpenLara's top

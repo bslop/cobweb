@@ -1007,3 +1007,41 @@ is well-formed and the witness discriminates: val=0, valw=D50D50D6.)
 timeout sized for the full suite, and it distinguishes "did not connect" from
 "wedged" from "ended early". Two captures were lost tonight to a short timeout
 killing the console mid-suite and a retry overwriting the log.
+
+---
+
+## 2026-07-27 SILICON: p_divround — Tom TRUNCATES. jsim faithful; A1's rounding hypothesis REFUTED.
+
+`bench_divround_20260727_131039.log`, clean line, `calibdl_skunk`:
+
+    CAL DIVROUND 00000003 00000002 00000002 00000002 00000000 7FFFFFFF 0000AAAA 00005555 00008000
+
+| case | silicon | trunc | round | |
+|---|---|---|---|---|
+| 7/2 | 00000003 | 00000003 | 00000004 | TRUNCATES |
+| 5/2 | 00000002 | 00000002 | 00000003 | TRUNCATES |
+| 8/3 | 00000002 | 00000002 | 00000003 | TRUNCATES |
+| 7/3 | 00000002 | — | — | control ok |
+| 1/2 | 00000000 | 00000000 | 00000001 | TRUNCATES |
+| FFFFFFFF/2 | 7FFFFFFF | 7FFFFFFF | 80000000 | TRUNCATES |
+| 2/3 16.16 | 0000AAAA | 0000AAAA | 0000AAAB | TRUNCATES |
+| 1/3 16.16 | 00005555 | — | — | control ok |
+| 1/2 16.16 | 00008000 | — | — | control ok |
+
+**Six discriminating cases, all truncate; three controls agree. Both integer
+and DIV_OFFSET 16.16 mode — the mode the perspective divide actually uses.**
+jsim's `isa.rs` (`d / s`, unsigned) is bit-faithful and needs no change.
+
+Closes ask 3 of `COBWEB_BUG_jagemu_runs_code_that_hangs_silicon` — the whole
+report is now answered except modelling silicon's divide-by-zero behaviour,
+which is deliberately left counted-not-modelled.
+
+**Consequence for OpenLara A1** (Lara's head: faces dropped on silicon, none in
+jagemu): the divide-rounding hypothesis is REFUTED. Their own caveat was right
+— the 9.4-of-85 cull-sign disagreement they simulated was integer-vs-exact, not
+silicon-vs-jagemu, and now that the two dividers are known to agree bit for bit
+it cannot be the explanation. Remaining candidates are hazards rather than
+arithmetic: bug 25 (DIV re-issued while the divider is busy) and bug 13 (WAW
+into a pending load/div). Both are counted per-core (`stall_div_busy`,
+`waw_hazards`) and, as of 2026-07-27, attributable to a specific PC via
+`--pc-histogram --core gpu`.

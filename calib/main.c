@@ -80,6 +80,7 @@ extern char p_divext_s[], p_divext_e[];
 extern char p_divoff_s[], p_divoff_e[];
 extern char p_ldcunderb_s[], p_ldcunderb_e[];
 extern char p_divlat_s[], p_divlat_e[];
+extern char p_divround_s[], p_divround_e[];
 extern char p_ldjump_s[], p_ldjump_e[];
 extern char p_ldjumprn_s[], p_ldjumprn_e[];
 extern char p_mmult_s[], p_mmult_e[];
@@ -645,6 +646,36 @@ void cal_main(void)
             *d = 0;
             say(line);
         }
+    }
+
+    {   /* p_divround: does Tom's DIV truncate or ROUND?
+         * COBWEB_BUG_jagemu_runs_code_that_hangs_silicon.md ask 3 — the last
+         * open piece of that report, and the discriminator for their A1 (faces
+         * dropped on silicon, none in jagemu). The backface cull is a signed
+         * area over integer coords fed by div, so rounding decides which
+         * sub-pixel faces survive. jsim TRUNCATES; each printed slot is chosen
+         * so truncate and round disagree, with exact controls that must agree.
+         * Prints one line; decode table is in probes.s above p_divround. */
+        u32 DRRES = 0x00102200UL;
+        u32 guard = 60000000UL;
+        char *d;
+        int i;
+        R32(DRRES + 36) = 0;
+        copy16(G_RAM, p_divround_s, p_divround_e);
+        R32(PARAM_RESULT) = DRRES;
+        R32(G_PC) = G_RAM;
+        R32(G_CTRL) = 1;
+        while (R32(DRRES + 36) != MAGIC_DONE && --guard)
+            ;
+        d = line;
+        d = put(d, "CAL DIVROUND");
+        for (i = 0; i < 9; i++) {
+            d = put(d, " ");
+            d = puth(d, R32(DRRES + (u32)i * 4));
+        }
+        d = put(d, "\n");
+        *d = 0;
+        say(line);
     }
 
     {   /* p_mm bisection ladder: WHICH ingredient of MMULT wedges real Tom.
