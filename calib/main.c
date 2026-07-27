@@ -106,6 +106,7 @@ extern char p_bcmdidle_s[], p_bcmdidle_e[];
 extern char p_bcmdbusy_s[], p_bcmdbusy_e[];
 extern char p_ldunderb_s[], p_ldunderb_e[];
 extern char p_dsphammer_s[], p_dsphammer_e[];
+extern char p_dsphammerw_s[], p_dsphammerw_e[];
 extern char p_divhot_s[], p_divhot_e[];
 extern char p_divsh_s[], p_divsh_e[];
 extern char p_jr_s[], p_jr_e[];
@@ -206,8 +207,25 @@ static const struct probe probes[] = {
     { "fib     ", p_fib_s, p_fib_e, 0, 0, 128, DRAM_BUF },
     { "divext  ", p_divext_s, p_divext_e, 0, 0, 128, DRAM_BUF },
     { "divoff  ", p_divoff_s, p_divoff_e, 0, 0, 128, DRAM_BUF },
+    /* mmultw/mmulta are OPT-IN (-DRUN_MMULTW) because p_mmultw HARD-WEDGES real
+     * Tom: it is `.rept 256 { mmult r2,r4 }`, i.e. 256 back-to-back MMULTs —
+     * the exact zero-gap hazard proven to wedge (bug 23, bus held) and now
+     * rejected by jas. Back-to-back MMULT throughput is simply not measurable
+     * on silicon; jsim's ~4.04 cyc/MMULT is a lower bound that never occurs.
+     *
+     * They were previously flagged "DO NOT FLASH" in a comment but LEFT IN THE
+     * DEFAULT TABLE, which does not stop the suite from running them — and this
+     * row sits at the table's midpoint. The cost was not one probe: the wedge
+     * holds the bus, so the console dies and EVERY LATER PROBE BECOMES
+     * UNREACHABLE (face/facenb/facebr, ovlap/serial, bcmdidle/bcmdbusy, the
+     * m68k benches, divhot/divsh/jr, mainmov/mainnop) and mode B never runs at
+     * all. Four separate sessions (2026-07-24, and twice on 2026-07-27) each
+     * lost the back half of the table and a physical power-cycle to this.
+     * A comment cannot gate a flash; the #ifdef can. */
+#ifdef RUN_MMULTW
     { "mmultw  ", p_mmultw_s, p_mmultw_e, 0, 0, 256, DRAM_BUF },
     { "mmulta  ", p_mmulta_s, p_mmulta_e, 0, 0, 256, DRAM_BUF },
+#endif
     { "face    ", p_face_s, p_face_e, 0, 0, 128, DRAM_BUF },
     { "facenb  ", p_facenb_s, p_facenb_e, 0, 0, 128, DRAM_BUF },
     { "facebr  ", p_facebr_s, p_facebr_e, 0, 0, 128, DRAM_BUF },
@@ -239,6 +257,29 @@ static const struct probe probes[] = {
      * need a power-cycle (red boot screen). Re-enable deliberately, never as
      * part of a routine bench.
      * { "lddramj ", p_lddram_s, p_lddram_e, 0, 0, 512, DRAM_BUF, p_dsphammer_s, p_dsphammer_e }, */
+    /* lddramjw — the WRITE-side twin of lddramj, and the one measurement that
+     * would settle COBWEB_GAP_jerrypose_fps_overprediction. lddramj proved
+     * Jerry's DRAM READS do not slow Tom (656 vs 656), which is why jsim models
+     * no Tom<->Jerry arbitration. It says nothing about WRITES, and writes are
+     * exactly what OpenLara's Jerry-side vertex pose produces: posed vertices
+     * streamed back to DRAM every frame. Reads and writes are not symmetric on
+     * this bus (stores are buffered — silicon stdram measured mode A == mode B
+     * where the load probe did not), so the read-null does not carry over.
+     *
+     * Decode: Tom's stream still ~656 with Jerry write-hammering => the null
+     * holds for writes too, jsim is right to charge nothing, and the jerrypose
+     * over-prediction lives somewhere else. Measurably slower => Jerry's write
+     * traffic IS a real cost jsim charges at zero, and the coefficient comes
+     * straight off this delta.
+     *
+     * RETIRED FROM THE DEFAULT RUN for the same reason as lddramj: saturating
+     * the shared bus from Jerry has hard-wedged this console (power-cycle, red
+     * boot screen). Build with -DRUN_DSPHAMMERW to enable — a compile-time gate
+     * rather than a commented row, so the ROM that gets flashed is the ROM the
+     * tree reproduces (`make dsphw`). Run it alone, never in a routine bench. */
+#ifdef RUN_DSPHAMMERW
+    { "lddramjw", p_lddram_s, p_lddram_e, 0, 0, 512, DRAM_BUF, p_dsphammerw_s, p_dsphammerw_e },
+#endif
     { "divhot  ", p_divhot_s, p_divhot_e, 0, 0, 512, 0 },
     { "divsh   ", p_divsh_s, p_divsh_e, 0, 0, 512, 0 },
     { "jr      ", p_jr_s, p_jr_e, 0, 0, 256, 0 },
@@ -465,7 +506,8 @@ void cal_main(void)
     R16(INT1) = 1;
     irq_on();
 
-    R32(0x001B0000UL) = 0; /* clear the DSP-hammer witness before the suite */
+    R32(0x001B0000UL) = 0; /* clear the DSP read-hammer witness  ($D50D50D5) */
+    R32(0x001B0004UL) = 0; /* clear the DSP write-hammer witness ($D50D50D6) */
     /* Park the OP on a bare STOP so every baseline probe runs against a known,
      * minimal scan-out load; only lddramop swaps in the full-screen bitmap.
      * (OLP only — VMODE and the VI are left exactly as booted.) */
@@ -479,6 +521,23 @@ void cal_main(void)
 #endif
 #ifdef OVLAP_ONLY
         if (probes[i].ks != p_ovlap_s && probes[i].ks != p_serial_s)
+            continue;
+#endif
+#ifdef DSPHW_ONLY
+        /* The Jerry write-hammer AND its control, and nothing else.
+         *
+         * Both arms in ONE flash on purpose: the result is a DIFFERENTIAL
+         * (Tom's stream alone vs the same stream with Jerry write-hammering),
+         * and comparing against a tick count from a different session would
+         * fold in whatever else differed that day — this rig has already shown
+         * a same-session thermal fault that moved numbers with no reflash.
+         * lddram runs FIRST so the control is captured before the hammer gets a
+         * chance to wedge the console.
+         *
+         * Nothing else is included: saturating the shared bus from Jerry can
+         * hard-wedge this board, so no other probe's data is put at risk, and a
+         * short ROM fits a marginal USB window. */
+        if (probes[i].ks != p_lddram_s)
             continue;
 #endif
 #ifdef CPUBENCH_ONLY
@@ -506,6 +565,23 @@ void cal_main(void)
         if (probes[i].ks != p_ovlap_s && probes[i].ks != p_serial_s)
             continue;
 #endif
+#ifdef DSPHW_ONLY
+        /* The Jerry write-hammer AND its control, and nothing else.
+         *
+         * Both arms in ONE flash on purpose: the result is a DIFFERENTIAL
+         * (Tom's stream alone vs the same stream with Jerry write-hammering),
+         * and comparing against a tick count from a different session would
+         * fold in whatever else differed that day — this rig has already shown
+         * a same-session thermal fault that moved numbers with no reflash.
+         * lddram runs FIRST so the control is captured before the hammer gets a
+         * chance to wedge the console.
+         *
+         * Nothing else is included: saturating the shared bus from Jerry can
+         * hard-wedge this board, so no other probe's data is put at risk, and a
+         * short ROM fits a marginal USB window. */
+        if (probes[i].ks != p_lddram_s)
+            continue;
+#endif
 #ifdef CPUBENCH_ONLY
         if (!probes[i].cpubench)
             continue;
@@ -520,6 +596,26 @@ void cal_main(void)
         if (!ok)
             goto wedged;
     }
+
+#ifdef DSPHW_ONLY
+    {   /* Witness FIRST, before the ldjump/MMBIS ladders.
+         *
+         * The 2026-07-27 dsphw flash produced a clean null (lddram B 658 vs
+         * lddramjw B 657) that had to be thrown away: the DSPMARK print lives
+         * after those ladders, the capture timed out before reaching it, and a
+         * "Jerry didn't slow Tom" result is worthless without proof Jerry was
+         * running. The differential is this build's whole point, so its witness
+         * prints the moment the probes are done. */
+        char *d = line;
+        d = put(d, "CAL DSPMARK val=");
+        d = puth(d, R32(0x001B0000UL));
+        d = put(d, " valw=");
+        d = puth(d, R32(0x001B0004UL));
+        d = put(d, "   (valw=D50D50D6 => the WRITE hammer ran)\n");
+        *d = 0;
+        say(line);
+    }
+#endif
 
 #endif /* DIVLAT_ONLY */
 
@@ -714,6 +810,8 @@ void cal_main(void)
         char *d = line;
         d = put(d, "CAL DSPMARK val=");
         d = puth(d, R32(0x001B0000UL));
+        d = put(d, " valw=");
+        d = puth(d, R32(0x001B0004UL));
         d = put(d, "\n");
         *d = 0;
         say(line);
