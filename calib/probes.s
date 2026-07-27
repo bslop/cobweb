@@ -4189,6 +4189,83 @@ dh_loop:
 	.data
 _p_dsphammer_e:
 
+; ── p_dsphammerw: resident DSP DRAM WRITE-hammer (the untested half) ────────
+; p_dsphammer (above) settled Jerry↔Tom contention for READS: Tom's stream
+; measured 656 ticks alone and 656 with Jerry hammering, twice, with DSPMARK
+; proving the DSP ran. That null is why jsim does not model Tom↔Jerry
+; arbitration, and it is the right call FOR READS.
+;
+; It does not cover WRITES, and writes are the traffic that matters for the one
+; open case: OpenLara's Jerry-side vertex pose streams POSED VERTICES BACK TO
+; DRAM every frame. Reads and writes are not symmetric on this bus — writes are
+; buffered (jsim's own store path charges no result latency, and the silicon
+; stdram probe measured mode A == mode B where the load probe did not), so a
+; read-null does not imply a write-null. Until this runs, "Jerry's DRAM traffic
+; does not slow Tom" is a claim about half the traffic.
+;
+; Identical to p_dsphammer except `load (r2),rN` -> `store rN,(r2)`: same dense
+; 8-access unrolled body, same bounded pass count, same self-stop. Writes a
+; constant, so nothing else in the suite can be corrupted by what lands.
+; SAME WEDGE WARNING as p_dsphammer: saturating the shared bus from Jerry has
+; hard-wedged this console before. Run deliberately, never in a routine bench.
+; Loop-top address once staged in D_RAM, same fixed-address trick as
+; p_dsphammer (the body is far past jr's ±16-word reach). Setup is p_dsphammer's
+; plus one movei for the payload register, so $28 + 6 = $2E. VERIFY after any
+; edit to the setup — an address landing mid-instruction jumps a resident DSP
+; into garbage on real silicon, and the assembler will not warn:
+;   rmac -fb -i. -l/tmp/l.lst -o /tmp/probes.o probes.s
+;   grep -A 12 _p_dsphammerw_s: /tmp/l.lst   # dhw_loop - _p_dsphammerw_s = $2E
+; (A label-difference expression is NOT usable here: dhw_loop is a forward
+; reference and rmac emits an unresolved relocation instead of a constant.)
+DHW_LOOPPC	equ	$F1B02E
+DHAMMERW_MARK	equ	$001B0004	; distinct from DHAMMER_MARK
+	.even
+	.globl	_p_dsphammerw_s
+	.globl	_p_dsphammerw_e
+_p_dsphammerw_s:
+	.dsp
+	movei	#DHAMMERW_MARK,r8	; prove we started (main.c prints this)
+	movei	#$D50D50D6,r9
+	store	r9,(r8)
+	movei	#DHAMMER_BUF,r1
+	movei	#DHAMMER_END,r3
+	movei	#DHAMMER_PASSES,r5
+	movei	#DHW_LOOPPC,r10		; unrolled body outruns jr's ±16 words
+	movei	#$5A5A5A5A,r11		; the payload — value is irrelevant
+	move	r1,r2
+dhw_loop:
+	store	r11,(r2)
+	addqt	#4,r2
+	store	r11,(r2)
+	addqt	#4,r2
+	store	r11,(r2)
+	addqt	#4,r2
+	store	r11,(r2)
+	addqt	#4,r2
+	store	r11,(r2)
+	addqt	#4,r2
+	store	r11,(r2)
+	addqt	#4,r2
+	store	r11,(r2)
+	addqt	#4,r2
+	store	r11,(r2)
+	addqt	#4,r2
+	cmp	r3,r2			; r2 - r3
+	jump	cs,(r10)		; borrow ⇒ r2 < end ⇒ keep hammering
+	nop
+	move	r1,r2			; wrap to buffer start
+	subq	#1,r5			; one pass done
+	jump	ne,(r10)
+	nop
+	movei	#D_CTRL_R,r6		; passes exhausted — stop self
+	moveq	#0,r7
+	store	r7,(r6)
+	nop
+	nop
+	.68000
+	.data
+_p_dsphammerw_e:
+
 ; ── p_lddramc: CONSUMED sequential DRAM loads — full load-to-use latency ────
 ; (Session 2: pins DRAM_LAT_HIT, which session 1 could not measure.)
 

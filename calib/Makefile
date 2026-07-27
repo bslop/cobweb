@@ -26,7 +26,7 @@ CFLAGS := -m68000 -ffreestanding -nostdlib -O2 -Wall
 COMMON := $(BUILD)/bootstub.o $(BUILD)/probes.o
 LAST   := $(BUILD)/lastobj.o
 
-.PHONY: all clean sim hwq cpu
+.PHONY: all clean sim hwq cpu dsphw
 all: $(BUILD)/calib_skunk.cof $(BUILD)/calib_sim.cof
 hwq: $(BUILD)/hwq_skunk.cof $(BUILD)/hwq_sim.cof
 # `make cpu` — 68k bus-contention bench ONLY. The full suite outruns a single
@@ -34,6 +34,13 @@ hwq: $(BUILD)/hwq_skunk.cof $(BUILD)/hwq_sim.cof
 # (jcp -r does not reliably clear a running ROM), so a probe near the end of the
 # table is expensive to reach. This variant completes in seconds.
 cpu: $(BUILD)/calibcpu_skunk.cof $(BUILD)/calibcpu_sim.cof
+# `make dsphw` — the Jerry DRAM WRITE-hammer vs Tom's stream, and nothing else.
+# lddramj settled the READ side (656 vs 656); writes were never probed, and they
+# are what a Jerry-side vertex transform actually produces. Isolated on purpose:
+# saturating the shared bus from Jerry has hard-wedged this console, so it must
+# not be able to rob any other probe's data, and a short ROM fits a marginal USB
+# window. Expect to power-cycle afterwards.
+dsphw: $(BUILD)/calibdsphw_skunk.cof $(BUILD)/calibdsphw_sim.cof
 
 sim: $(BUILD)/calib_sim.cof
 
@@ -96,6 +103,18 @@ $(BUILD)/mainface_sim.o: main.c | $(BUILD)
 
 $(BUILD)/calibface_sim.cof: $(COMMON) $(BUILD)/mainface_sim.o $(LAST)
 	$(RLN) -e -rq -a 4000 x x -o $@ $(BUILD)/bootstub.o $(BUILD)/mainface_sim.o $(BUILD)/probes.o $(LAST)
+
+$(BUILD)/maindsphw_skunk.o: main.c | $(BUILD)
+	$(CC68) $(CFLAGS) -DUSE_SKUNK_CONSOLE -DRUN_DSPHAMMERW -DDSPHW_ONLY -c -o $@ $<
+
+$(BUILD)/calibdsphw_skunk.cof: $(COMMON) $(BUILD)/maindsphw_skunk.o $(BUILD)/skunkglue.o $(BUILD)/skunk.o $(LAST)
+	$(RLN) -e -rq -a 4000 x x -o $@ $(BUILD)/bootstub.o $(BUILD)/maindsphw_skunk.o $(BUILD)/probes.o $(BUILD)/skunkglue.o $(BUILD)/skunk.o $(LAST)
+
+$(BUILD)/maindsphw_sim.o: main.c | $(BUILD)
+	$(CC68) $(CFLAGS) -DRUN_DSPHAMMERW -DDSPHW_ONLY -c -o $@ $<
+
+$(BUILD)/calibdsphw_sim.cof: $(COMMON) $(BUILD)/maindsphw_sim.o $(LAST)
+	$(RLN) -e -rq -a 4000 x x -o $@ $(BUILD)/bootstub.o $(BUILD)/maindsphw_sim.o $(BUILD)/probes.o $(LAST)
 
 $(BUILD)/mainovlap_skunk.o: main.c | $(BUILD)
 	$(CC68) $(CFLAGS) -DUSE_SKUNK_CONSOLE -DOVLAP_ONLY -c -o $@ $<
