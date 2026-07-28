@@ -62,6 +62,8 @@ PROBES = [
     ("facenl", 82, "facenb, 16 DRAM loads swapped for ALU (identical instr count)"),
     ("facenn", 82, "facenb shape, BOTH swaps: pure ALU, no long-latency op"),
     ("facenn4", 322, "the facenn body at 4x length (fixed-cost vs scaling test)"),
+    ("facennb1", 114, "facenn body + 1 taken jr per unit (compensator sweep N=1)"),
+    ("facennb3", 178, "facenn body + 3 taken jr per unit (compensator sweep N=3)"),
     ("ovlap", 740, "launch + compute + bwait (overlap possible)"),
     ("serial", 740, "launch + bwait + compute (serialized)"),
     ("bcmdidle", 256, "B_CMD register-read poll stream, Blitter idle (bwait baseline)"),
@@ -132,7 +134,11 @@ LINE_RE = re.compile(
 def parse_console(path):
     results = {}
     done = False
-    for line in open(path):
+    # errors="ignore": a Skunkboard console capture over a marginal USB link
+    # contains raw junk bytes (a 0xFA killed a whole session's parse once). The
+    # CAL lines are plain ASCII, so dropping undecodable bytes never loses data
+    # — but refusing to open the file loses the entire capture.
+    for line in open(path, errors="ignore"):
         m = LINE_RE.search(line)
         if m:
             name, mode, s, e, wr, _ = m.groups()
@@ -147,7 +153,7 @@ def reps_of(name):
         "vcmod": 0x80000, "null": 8192, "nop": 1024, "move": 1024,
         "moveq": 1024, "adddep": 1024, "addind": 1024, "ldsram": 512,
         "ldidx": 512, "lddram": 512, "lddramc": 256, "ldstride": 256, "stdram": 512,
-        "blitsm": 128, "blitbg": 128, "blit1": 128, "blit2": 128, "blit4": 128, "blittex1": 128, "blittexq": 128, "blitrmw": 128, "ldunderb": 128, "ldcunder": 128, "fib": 128, "divext": 128, "divoff": 128, "mmultw": 256, "mmulta": 256, "face": 128, "ovlap": 64, "serial": 64, "facenb": 128, "facebr": 128, "facend": 128, "facenl": 128, "facenn": 128, "facenn4": 128, "bcmdidle": 128, "bcmdbusy": 128, "dens2": 256, "dens6": 256, "dens14": 128, "dens30": 128, "m68kbus": 30, "m68kreg": 30, "m68kcpy": 30, "lddramj": 512, "lddramjw": 512, "lddramop": 512,
+        "blitsm": 128, "blitbg": 128, "blit1": 128, "blit2": 128, "blit4": 128, "blittex1": 128, "blittexq": 128, "blitrmw": 128, "ldunderb": 128, "ldcunder": 128, "fib": 128, "divext": 128, "divoff": 128, "mmultw": 256, "mmulta": 256, "face": 128, "ovlap": 64, "serial": 64, "facenb": 128, "facebr": 128, "facend": 128, "facenl": 128, "facenn": 128, "facenn4": 128, "facennb1": 128, "facennb3": 128, "bcmdidle": 128, "bcmdbusy": 128, "dens2": 256, "dens6": 256, "dens14": 128, "dens30": 128, "m68kbus": 30, "m68kreg": 30, "m68kcpy": 30, "lddramj": 512, "lddramjw": 512, "lddramop": 512,
         "divhot": 512, "divsh": 512, "jr": 256, "mainmov": 128,
         "mainnop": 128,
     }[name]

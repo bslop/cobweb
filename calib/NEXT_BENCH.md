@@ -1140,3 +1140,62 @@ The next probe is the compensator: the facenn body with N taken branches
 interleaved, N swept. If the gap closes as N rises, refill is over-charged by
 roughly the mixed-ALU under-charge, and the pair can be fixed together with the
 anchor ladder as the check.
+
+---
+
+## 2026-07-27 SILICON: p_facennb1/b3 — refill is CORRECT. The compensator is the LOAD over-charge.
+
+`bench_compsweep_20260727_182728.log`, mode B:
+
+| N taken branches | probe | silicon | jsim | gap |
+|---|---|---|---|---|
+| 0 | facenn | 31 | 23 | 8 |
+| 16 | facennb1 | 44 | 37 | 7 |
+| 48 | facennb3 | 69 | 61 | 8 |
+
+**The gap is FLAT in branch count.** Marginal per-branch cost: silicon
+0.81 / 0.78, jsim 0.875 / 0.75 — essentially identical. **jump_refill is
+modelled correctly and must NOT be touched.** (Second branch of the decode rule
+pre-registered in probes.s.)
+
+**So the compensator is the DRAM LOAD over-charge.** Sorting every arm by
+whether it contains loads makes it obvious:
+
+| arm | loads? | gap |
+|---|---|---|
+| facenn, facenl, facennb1, facennb3 | no | 7-8 |
+| facend, facenb | yes | 5 |
+| face | yes + divides | 1 |
+
+Isolated: facend - facenn is the identical body with 16 DRAM loads swapped in
+for ALU. Silicon +31 ticks, jsim **+34**. jsim over-charges those loads ~10%,
+which cancels part of the ALU under-charge: 8 - 3 = 5. The arithmetic closes.
+
+### THE COMPLETE PICTURE (per-face investigation, closed)
+
+Three terms, all measured, two of them errors of OPPOSITE sign:
+
+  * **mixed independent/dependent ALU: UNDER-charged.** Marginal 1.53x
+    (facenn/facenn4). Invisible to pure-pattern probes — addind 1.01 both,
+    adddep 2.00 both — because it needs the interleave.
+  * **DRAM loads: OVER-charged ~10%** in the quiet-bus case (facend-facenn),
+    and much more in mode A where the contention tax is over-broad (stdram,
+    ldstride, ldcunder all silicon 1.00x vs jsim 1.4-2.0x).
+  * **jump_refill: CORRECT.** Flat across N=0/16/48.
+
+They cancel in real kernels, which is why `face` matches EXACTLY (70 vs 69) and
+whole-program fps has always looked close while per-cause attribution was
+wrong. This is the mechanism behind the standing "+11% fast overall".
+
+### What a fix looks like now
+
+Both terms are named and quantified, so the paired fix is finally a real piece
+of work rather than a guess: raise the mixed-ALU cost, lower the load charge
+(and narrow the mode-A tax to sequential loads only), then re-validate against
+the anchors that are currently exact — ALLCULL 9.55, face 70/69, ovlap/serial
+117/227, bcmdbusy 3493, divhot 6.69, jr 2.34. Any fix that breaks those is
+wrong no matter how good the mechanism sounds.
+
+**Still not applied.** Doing it needs the whole-program ladder re-measured
+(TC/v4b/NOFILL) to confirm the net, and that is an OpenLara flash session, not
+a calib one.

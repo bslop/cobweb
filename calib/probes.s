@@ -2449,6 +2449,433 @@ _p_facenl_s:
 	.data
 _p_facenl_e:
 
+; ── p_facennb1 / p_facennb3: the COMPENSATOR sweep ──────────────────────────
+; 2026-07-27, the last unknown in the cancelling sum. facenn established that
+; jsim under-charges a MIXED independent/dependent ALU stream by 1.53x on the
+; marginal body. But face (1 branch/px) matches silicon EXACTLY while containing
+; that same ALU — so the branchy arms carry a compensating term, and until it is
+; named the mixed-ALU fix cannot be applied without breaking an arm that is
+; currently right.
+;
+; Same facenn body (pure ALU, no divide, no load — those were both eliminated),
+; with N TAKEN branches interleaved per unit. `or r1,r1` leaves NE true because
+; r1 accumulates, so every jr is taken and pays a full refill.
+;
+;   p_facennb1  1 taken jr per unit (16 total)
+;   p_facennb3  3 taken jr per unit (48 total)
+;   (p_facenn itself is the N=0 point, already measured: jsim 7 ticks FAST)
+;
+; DECODE, tracking gap = silicon - jsim across N = 0, 1, 3:
+;   gap shrinks toward 0 as N rises => jump_refill is OVER-charged, and it is
+;     the compensator. The per-branch over-charge is the slope, and the pair
+;     (mixed-ALU under-charge + refill over-charge) can then be fixed TOGETHER
+;     with the anchor ladder (ALLCULL 9.55, TC 3.75) as the check.
+;   gap stays ~7 regardless of N => refill is fine and the compensator is
+;     something else in face (its divides or loads interacting with branches);
+;     do not touch refill.
+;   gap GROWS with N => refill is under-charged too, both errors have the same
+;     sign, and the whole-program +11% needs a different explanation entirely.
+
+	.even
+	.globl	_p_facennb1_s
+	.globl	_p_facennb1_e
+_p_facennb1_s:
+	.gpu
+	PROBE_PRO
+	move	r19,r12
+	movei	#$10001,r5
+	movei	#$7FFFFFF0,r7
+	movei	#3,r16
+	moveq	#1,r8
+	moveq	#1,r10
+	moveq	#0,r9
+	moveq	#0,r11
+	movei	#8,r13
+	add	r16,r5
+	add	r16,r7
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	jr	NE,.facennb1_0_0
+	nop
+.facennb1_0_0:
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	jr	NE,.facennb1_1_0
+	nop
+.facennb1_1_0:
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	jr	NE,.facennb1_2_0
+	nop
+.facennb1_2_0:
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	jr	NE,.facennb1_3_0
+	nop
+.facennb1_3_0:
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	jr	NE,.facennb1_4_0
+	nop
+.facennb1_4_0:
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	jr	NE,.facennb1_5_0
+	nop
+.facennb1_5_0:
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	jr	NE,.facennb1_6_0
+	nop
+.facennb1_6_0:
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	jr	NE,.facennb1_7_0
+	nop
+.facennb1_7_0:
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	jr	NE,.facennb1_8_0
+	nop
+.facennb1_8_0:
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	jr	NE,.facennb1_9_0
+	nop
+.facennb1_9_0:
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	jr	NE,.facennb1_10_0
+	nop
+.facennb1_10_0:
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	jr	NE,.facennb1_11_0
+	nop
+.facennb1_11_0:
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	jr	NE,.facennb1_12_0
+	nop
+.facennb1_12_0:
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	jr	NE,.facennb1_13_0
+	nop
+.facennb1_13_0:
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	jr	NE,.facennb1_14_0
+	nop
+.facennb1_14_0:
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	jr	NE,.facennb1_15_0
+	nop
+.facennb1_15_0:
+	or	r5,r5
+	or	r7,r7
+	PROBE_EPI
+	.68000
+	.data
+_p_facennb1_e:
+
+	.even
+	.globl	_p_facennb3_s
+	.globl	_p_facennb3_e
+_p_facennb3_s:
+	.gpu
+	PROBE_PRO
+	move	r19,r12
+	movei	#$10001,r5
+	movei	#$7FFFFFF0,r7
+	movei	#3,r16
+	moveq	#1,r8
+	moveq	#1,r10
+	moveq	#0,r9
+	moveq	#0,r11
+	movei	#8,r13
+	add	r16,r5
+	add	r16,r7
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	jr	NE,.facennb3_0_0
+	nop
+.facennb3_0_0:
+	jr	NE,.facennb3_0_1
+	nop
+.facennb3_0_1:
+	jr	NE,.facennb3_0_2
+	nop
+.facennb3_0_2:
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	jr	NE,.facennb3_1_0
+	nop
+.facennb3_1_0:
+	jr	NE,.facennb3_1_1
+	nop
+.facennb3_1_1:
+	jr	NE,.facennb3_1_2
+	nop
+.facennb3_1_2:
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	jr	NE,.facennb3_2_0
+	nop
+.facennb3_2_0:
+	jr	NE,.facennb3_2_1
+	nop
+.facennb3_2_1:
+	jr	NE,.facennb3_2_2
+	nop
+.facennb3_2_2:
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	jr	NE,.facennb3_3_0
+	nop
+.facennb3_3_0:
+	jr	NE,.facennb3_3_1
+	nop
+.facennb3_3_1:
+	jr	NE,.facennb3_3_2
+	nop
+.facennb3_3_2:
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	jr	NE,.facennb3_4_0
+	nop
+.facennb3_4_0:
+	jr	NE,.facennb3_4_1
+	nop
+.facennb3_4_1:
+	jr	NE,.facennb3_4_2
+	nop
+.facennb3_4_2:
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	jr	NE,.facennb3_5_0
+	nop
+.facennb3_5_0:
+	jr	NE,.facennb3_5_1
+	nop
+.facennb3_5_1:
+	jr	NE,.facennb3_5_2
+	nop
+.facennb3_5_2:
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	jr	NE,.facennb3_6_0
+	nop
+.facennb3_6_0:
+	jr	NE,.facennb3_6_1
+	nop
+.facennb3_6_1:
+	jr	NE,.facennb3_6_2
+	nop
+.facennb3_6_2:
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	jr	NE,.facennb3_7_0
+	nop
+.facennb3_7_0:
+	jr	NE,.facennb3_7_1
+	nop
+.facennb3_7_1:
+	jr	NE,.facennb3_7_2
+	nop
+.facennb3_7_2:
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	jr	NE,.facennb3_8_0
+	nop
+.facennb3_8_0:
+	jr	NE,.facennb3_8_1
+	nop
+.facennb3_8_1:
+	jr	NE,.facennb3_8_2
+	nop
+.facennb3_8_2:
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	jr	NE,.facennb3_9_0
+	nop
+.facennb3_9_0:
+	jr	NE,.facennb3_9_1
+	nop
+.facennb3_9_1:
+	jr	NE,.facennb3_9_2
+	nop
+.facennb3_9_2:
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	jr	NE,.facennb3_10_0
+	nop
+.facennb3_10_0:
+	jr	NE,.facennb3_10_1
+	nop
+.facennb3_10_1:
+	jr	NE,.facennb3_10_2
+	nop
+.facennb3_10_2:
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	jr	NE,.facennb3_11_0
+	nop
+.facennb3_11_0:
+	jr	NE,.facennb3_11_1
+	nop
+.facennb3_11_1:
+	jr	NE,.facennb3_11_2
+	nop
+.facennb3_11_2:
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	jr	NE,.facennb3_12_0
+	nop
+.facennb3_12_0:
+	jr	NE,.facennb3_12_1
+	nop
+.facennb3_12_1:
+	jr	NE,.facennb3_12_2
+	nop
+.facennb3_12_2:
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	jr	NE,.facennb3_13_0
+	nop
+.facennb3_13_0:
+	jr	NE,.facennb3_13_1
+	nop
+.facennb3_13_1:
+	jr	NE,.facennb3_13_2
+	nop
+.facennb3_13_2:
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	jr	NE,.facennb3_14_0
+	nop
+.facennb3_14_0:
+	jr	NE,.facennb3_14_1
+	nop
+.facennb3_14_1:
+	jr	NE,.facennb3_14_2
+	nop
+.facennb3_14_2:
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	jr	NE,.facennb3_15_0
+	nop
+.facennb3_15_0:
+	jr	NE,.facennb3_15_1
+	nop
+.facennb3_15_1:
+	jr	NE,.facennb3_15_2
+	nop
+.facennb3_15_2:
+	or	r5,r5
+	or	r7,r7
+	PROBE_EPI
+	.68000
+	.data
+_p_facennb3_e:
+
 ; ── p_facenn / p_facenn4: is the branch-free residual FIXED or SCALING? ─────
 ; 2026-07-27, after facend/facenl both FAILED to close the gap. Two facts that
 ; together rule out the hypotheses tried so far:

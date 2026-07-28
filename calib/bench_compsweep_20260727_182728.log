@@ -1,0 +1,75 @@
+Script started on 2026-07-27 18:27:28-06:00 [COMMAND="jcp -c build/calibface_skunk.cof" <not executed on terminal>]
+jcp v02.04.02 built on Jul  6 2026
+
+COFF File:  Skip 168 bytes, base addr is $4000, length is 54208 bytes
+Sending...|/-\|/-\.|/-\| 
+/-Jag accepted start request at $00004000.
+ 
+Finished in 7213 millis, 7KB/second.
+ 
+Starting console...
+Cobweb jsim calibration suite v1
+CAL face     A s=000000D3 e=00000124 w=00000000 r=00000080
+CAL facenb   A s=00000133 e=0000017F w=00000000 r=00000080
+CAL facebr   A s=0000017C e=000001E2 w=00000000 r=00000080
+CAL facend   A s=000001A5 e=000001EE w=00000000 r=00000080
+CAL facenl   A s=000001DE e=000001FF w=00000000 r=00000080
+CAL facenn   A s=0000000A e=00000029 w=00000000 r=00000080
+CAL facenn4  A s=0000005D e=000000BD w=00000000 r=00000080
+CAL facennb1 A s=00000080 e=000000AC w=00000000 r=00000080
+CAL facennb3 A s=000000BF e=00000105 w=00000000 r=00000080
+CAL face     B s=00000115 e=0000015B w=00000000 r=00000080
+CAL facenb   B s=00000126 e=00000167 w=00000000 r=00000080
+CAL facebr   B s=0000016E e=000001C7 w=00000000 r=00000080
+CAL facend   B s=00000198 e=000001D7 w=00000000 r=00000080
+CAL facenl   B s=000001D0 e=000001F1 w=00000000 r=00000080
+CAL facenn   B s=0000020A e=0000001C w=00000001 r=00000080
+CAL facenn4  B s=00000050 e=000000B0 w=00000000 r=00000080
+CAL facennb1 B s=00000073 e=0000009F w=00000000 r=00000080
+CAL facennb3 B s=000000B3 e=000000F8 w=00000000 r=00000080
+CAL DIVLAT k=00000000 sm=00000055 lg=2AAAAAA5
+CAL DIVLAT k=00000001 sm=00000055 lg=2AAAAAA5
+CAL DIVLAT k=00000002 sm=00000055 lg=2AAAAAA5
+CAL DIVLAT k=00000003 sm=00000055 lg=2AAAAAA5
+CAL DIVLAT k=00000004 sm=00000055 lg=2AAAAAA5
+CAL DIVLAT k=00000005 sm=00000055 lg=2AAAAAA5
+CAL DIVLAT k=00000006 sm=00000055 lg=2AAAAAA5
+CAL DIVLAT k=00000007 sm=00000055 lg=2AAAAAA5
+CAL DIVLAT k=00000008 sm=00000055 lg=2AAAAAA5
+CAL DIVLAT k=00000009 sm=00000055 lg=2AAAAAA5
+CAL DIVLAT k=0000000A sm=00000055 lg=2AAAAAA5
+CAL DIVLAT k=0000000B sm=00000055 lg=2AAAAAA5
+CAL DIVLAT k=0000000C sm=00000055 lg=2AAAAAA5
+CAL DIVLAT k=0000000D sm=00000055 lg=2AAAAAA5
+CAL DIVLAT k=0000000E sm=00000055 lg=2AAAAAA5
+CAL DIVLAT k=0000000F sm=00000055 lg=2AAAAAA5
+CAL DIVROUND 00000003 00000002 00000002 00000002 00000000 7FFFFFFF 0000AAAA 00005555 00008000
+CAL MMBIS nov v0=000000A0 v1=00000000
+CAL MMBIS w1 v0=00000000 v1=00000000
+CAL MMBIS w3 v0=00000000 v1=00000000
+CAL MMBIS w3s v0=00000000 v1=00000000
+CAL MMBIS mmhi v0=00000000 v1=00000000
+CAL MMBIS mmlo v0=00000020 v1=00000000
+CAL MMBIS mrd v0=00010000 v1=00000000
+CAL MMBIS mmovf v0=FFFE0000 v1=00000000
+CAL MMBIS mmrow v0=00000020 v1=FFFE0000
+CAL MMBIS mm2s v0=00000020 v1=00000140
+CAL MMBIS mm3s v0=00000140 v1=00000C80
+Waiting to handshake with 68k (control-c to abort)
+˙W //F"*P2‘2‘2î2‘2‘P*í+*‘3*“2‘2‘2‘;2‘3;33*‘*R"P"N"Ã"P∆*P*P*P*P*P*P*P*P**R*P""**"*R"*P!Œ"**P""""P"P""""P"*P"P"""!Œ!Œ""""""!Œ!Œ!Œ!Œ!Œ!Œ!Œ!Œ"!Œ!Œ!Œ!Œ!Œ"!Œ!Œ!ŒNNŒNPNŒŒåååÃ"P3PŒ*í*R*R2‘*î*í2‘2‘ŒŒŒ*î*‘*î"R*‘*‘2‘3:÷"R"P"""PÜåååååääää	H	""""*P"P"P"*P"P"*P*P""P"P"""P"P"P"P"N"N"P""""P"P"P"P	 "P*P*P""N"ÃäÃ	äää	ä	H	àHäHHHäÃÃÃÃN	 ÃÃŒNPP"P"í*í*í"êRRPN*í2í*í*í*R***"P"DåÃÃÃÃÃ"Ã!ŒÃåäåÃÃÃ	JåÃ	ääååÃÃÃÃåäåÃÃ	å	Ã	Ã	äÃÃŒÃÃÃåäää	HJJJJä∆	∆	∆	Ü	ÜÜWaiting to handshake with 68k (control-c to abort)
+Lå
+	àJ
+
+"N"é"é"é"é"é"éN"é"–"éé"é"é"é"é"é"é"N"éLL"éLLLLLL"Œ#"Œ"–"Œ"éN"é"éLLLéLLLLLLL L 
+ 
+
+
+   					F	FF	àà 	à	àFDD	CKöKöKöK‹KöCöCöCöCöCöK‹K‹Cö;X;XKöK‹K‹K‹S‹S‹K‹K‹K‹K‹Cö3;XCöC⁄;ò3V+*‘3"P	äàHŒ+ŒH"2îé≥Øyß{ØˇØΩß{∑yÖÌ2‘HäH
+
+  »ààààà	Hà	H	F			F	D		ƒƒƒƒŒŒÃÃÃåååå!Œ!Œå!Œ!ÃåÃå!Ã!å!åÃåääJJääääH∆∆∆∆∆ÜÑÑÑƒƒƒCX;:‘:‘:î:îB‘B‘BîBî:î2R:î2î*R2îKXSZ2‘*P"ÃŒ";KXKKKXC*í2‘**"""****P*2P**P2P*N**N*****""""***"!Œ!Œ!Œ!–"!Œ"!Ã!Ãå!Ã!Ã!Ã!Ã*!Ã!Ã!Ã!Ã!Ã!Ãåå!å!å!åååååååååääääääääääJJJäääJJJHHH	HH∆∆	∆∆∆ÜÑÑÑ∆∆∆∆∆∆	∆HHƒÑFBÑ∆	∆	∆	ÜDö<ö4<X<Z#‘###“,DöD⁄<Z<ZD⁄D⁄<ö<öL‹<Xå!ŒÃ""åÃ!ŒåäJH∆∆∆Waiting to handshake with 68k (control-c to abort)
+;;;X;X;X;X;XCX;X;X;;XCX;;CX;X;;;;;:‘:‘:÷:÷:‘:‘:‘:‘:‘2î2í2‘2í2í2í2í2R2R2R2R*R*P*R*P*P*P*P******2P*******P*R*P"P*í*R2í2í*P*P*í*ê*P*P*R*P*R*R*R*R*í*íååÃŒ!Œ**P*í*R"Ãä∆ƒåŒÃÃÃååŒååÃåÃÃåååååäääääJJJJJJJJ∆	∆∆	∆∆∆∆∆∆∆H		∆∆∆	∆∆∆∆∆∆∆∆∆∆∆	»
+
+JŒ#å
+D	!Ã*í*P*Œä	ÜBÑ	∆ƒÇBB!Œ!Œ****)Œ)Œ)Œ*******"**P***********"!Œ!Œ!Œ)Œ)Œ)Œ*)Œ)Œ*)Œ*******)Œ)–Jä!å!åJJåJJJJ»»»»»»»∆∆∆∆∆∆∆∆	∆∆∆∆∆∆∆∆Ñ∆∆∆∆∆∆ÜÜ*í*P*í2î*í*í2‘2‘2î2î2î2î:÷:÷:÷C2÷;:÷CXKZCC:÷CC:÷CCCXSúKZC:÷;KZKö;:‘;;CX;:÷C:‘2‘2‘2î:‘2‘2‘*R*í2î:‘:‘2R2í2î2î2î:÷*R2î2î**P2R*P*P2P**R*P*P*P*R*P*R2R2R*P*R2í*R2í2‘2í2‘2î*í*R*P*R2í2í2î2í*P"**P**P*!Œå!Ã!ÃåÃåJJJJJJJHJåäJJJäJJ∆∆∆∆∆Waiting to handshake with 68k (control-c to abort)
+
+Script done on 2026-07-27 18:32:30-06:00 [COMMAND_EXIT_CODE="0"]
