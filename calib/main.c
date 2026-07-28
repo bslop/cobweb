@@ -105,6 +105,8 @@ extern char p_facend_s[], p_facend_e[];
 extern char p_facenl_s[], p_facenl_e[];
 extern char p_facenn_s[], p_facenn_e[];
 extern char p_facenn4_s[], p_facenn4_e[];
+extern char p_facennb1_s[], p_facennb1_e[];
+extern char p_facennb3_s[], p_facennb3_e[];
 extern char p_ovlap_s[], p_ovlap_e[];
 extern char p_serial_s[], p_serial_e[];
 extern char p_bcmdidle_s[], p_bcmdidle_e[];
@@ -241,6 +243,8 @@ static const struct probe probes[] = {
     { "facenl  ", p_facenl_s, p_facenl_e, 0, 0, 128, DRAM_BUF },
     { "facenn  ", p_facenn_s, p_facenn_e, 0, 0, 128, DRAM_BUF },
     { "facenn4 ", p_facenn4_s, p_facenn4_e, 0, 0, 128, DRAM_BUF },
+    { "facennb1", p_facennb1_s, p_facennb1_e, 0, 0, 128, DRAM_BUF },
+    { "facennb3", p_facennb3_s, p_facennb3_e, 0, 0, 128, DRAM_BUF },
     { "ovlap   ", p_ovlap_s, p_ovlap_e, 0, 0, 64, DRAM_BUF },
     { "serial  ", p_serial_s, p_serial_e, 0, 0, 64, DRAM_BUF },
     { "bcmdidle", p_bcmdidle_s, p_bcmdidle_e, 0, 0, 128, DRAM_BUF },
@@ -531,7 +535,8 @@ void cal_main(void)
         if (probes[i].ks != p_face_s && probes[i].ks != p_facenb_s
             && probes[i].ks != p_facebr_s && probes[i].ks != p_facend_s
             && probes[i].ks != p_facenl_s && probes[i].ks != p_facenn_s
-            && probes[i].ks != p_facenn4_s)
+            && probes[i].ks != p_facenn4_s && probes[i].ks != p_facennb1_s
+            && probes[i].ks != p_facennb3_s)
             continue;
 #endif
 #ifdef OVLAP_ONLY
@@ -576,7 +581,8 @@ void cal_main(void)
         if (probes[i].ks != p_face_s && probes[i].ks != p_facenb_s
             && probes[i].ks != p_facebr_s && probes[i].ks != p_facend_s
             && probes[i].ks != p_facenl_s && probes[i].ks != p_facenn_s
-            && probes[i].ks != p_facenn4_s)
+            && probes[i].ks != p_facenn4_s && probes[i].ks != p_facennb1_s
+            && probes[i].ks != p_facennb3_s)
             continue;
 #endif
 #ifdef OVLAP_ONLY
