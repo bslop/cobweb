@@ -2449,6 +2449,481 @@ _p_facenl_s:
 	.data
 _p_facenl_e:
 
+; ── p_facenn / p_facenn4: is the branch-free residual FIXED or SCALING? ─────
+; 2026-07-27, after facend/facenl both FAILED to close the gap. Two facts that
+; together rule out the hypotheses tried so far:
+;
+;  1. The LONG branchless probes are already silicon-exact: nop 2, move 2,
+;     addind 2, moveq 0, ldsram 0, ldidx 1, divhot 1, jr 3 ticks of gap on
+;     probes 485-1341 ticks long. So there is NO universal fixed start-up cost
+;     of ~6 ticks — it would show there too. Baseline gap is ~2.
+;  2. face* (25-89 ticks) shows 5-7. So face* carries ~4 ticks ABOVE baseline.
+;
+; And the bisection had a hole: facend dropped the divides but KEPT the loads;
+; facenl dropped the loads but KEPT the divides. Neither arm had NEITHER, so
+; "one long-latency op is enough to manifest it" was never tested.
+;
+;   p_facenn   facenb shape and instruction count, BOTH swaps: pure ALU.
+;   p_facenn4  the same body at 4x length.
+;
+; DECODE:
+;   facenn gap ~2 (baseline)  => the extra ~4 needs a long-latency op PRESENT,
+;                                and either one alone suffices. Back to an
+;                                overlap story, but a narrower one.
+;   facenn gap ~6             => neither divides nor loads matter; it is the
+;                                probe scaffolding or the short length itself.
+;   facenn4 gap ~= facenn gap => FIXED cost (percentage falls with length).
+;   facenn4 gap ~= 4x         => SCALING; a real per-instruction error that the
+;                                long probes somehow escape.
+
+	.even
+	.globl	_p_facenn_s
+	.globl	_p_facenn_e
+_p_facenn_s:
+	.gpu
+	PROBE_PRO
+	move	r19,r12
+	movei	#$10001,r5
+	movei	#$7FFFFFF0,r7
+	movei	#3,r16
+	moveq	#1,r8
+	moveq	#1,r10
+	moveq	#0,r9
+	moveq	#0,r11
+	movei	#8,r13
+	add	r16,r5
+	add	r16,r7
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	or	r5,r5
+	or	r7,r7
+	PROBE_EPI
+	.68000
+	.data
+_p_facenn_e:
+
+	.even
+	.globl	_p_facenn4_s
+	.globl	_p_facenn4_e
+_p_facenn4_s:
+	.gpu
+	PROBE_PRO
+	move	r19,r12
+	movei	#$10001,r5
+	movei	#$7FFFFFF0,r7
+	movei	#3,r16
+	moveq	#1,r8
+	moveq	#1,r10
+	moveq	#0,r9
+	moveq	#0,r11
+	movei	#8,r13
+	add	r16,r5
+	add	r16,r7
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	add	r8,r9
+	add	r10,r11
+	move	r12,r14
+	add	r8,r1
+	or	r1,r1
+	or	r5,r5
+	or	r7,r7
+	PROBE_EPI
+	.68000
+	.data
+_p_facenn4_e:
+
 ; ── p_facenb / p_facebr: branch-density bisection of p_face ──────────────
 	.even
 	.globl	_p_facenb_s
