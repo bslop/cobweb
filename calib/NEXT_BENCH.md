@@ -1087,3 +1087,56 @@ overlap error grows with length. That distinguishes them in one capture and
 needs no new mechanism. Do NOT touch a timing constant until it runs: the two
 already-known errors (over-broad mode-A contention tax, branch-free compute
 under-charge) partly cancel, and this would be a third term in the same sum.
+
+---
+
+## 2026-07-27 SILICON: p_facenn / p_facenn4 — FOUND IT. Mixed-ALU streams are under-charged 1.53x.
+
+`bench_facenn_20260727_180517.log`, mode B:
+
+| probe | silicon | jsim | gap |
+|---|---|---|---|
+| facenn (pure ALU, 16 units) | 30 | 23 | 7 |
+| facenn4 (same body, 64 units) | 96 | 66 | **30** |
+
+**Two hypotheses died and one mechanism is left.**
+
+1. **Long-latency ops are irrelevant.** facenn removes BOTH the divides and the
+   DRAM loads — the hole in the facend/facenl bisection, neither of which had
+   removed both — and the gap is still 7. Not the DIV shadow, not load latency.
+2. **It is NOT a fixed cost.** 7 -> 30 for a 4x body (~4.3x). The
+   fixed-start-up hypothesis from the previous entry is refuted; it was already
+   in trouble because the long branchless probes sit at 0-3 ticks of gap
+   (nop 2, addind 2, moveq 0, ldsram 0) where a universal ~6 would have shown.
+
+**MARGINAL cost, which cancels every fixed overhead:**
+
+    silicon  96 - 30 = 66 ticks   for 48 extra units/rep
+    jsim     66 - 23 = 43 ticks
+    => jsim under-charges the marginal ALU body by 66/43 = 1.53x
+
+The unit is `add r8,r9 / add r10,r11 / move r12,r14 / add r8,r1 / or r1,r1`:
+four independent ops plus one dependent on its immediate predecessor. jsim
+prices it 4x1 + 1x2 = 6 cycles (measured 5.9); silicon charges ~9.
+
+**Why every ingredient measured exact in isolation:** addind (pure independent)
+is 1.01 both; adddep (pure dependent chain) is 2.00 both. The error appears
+only when independent and dependent ALU ops INTERLEAVE — the model's bypass is
+too generous in a mixed stream, and no pure-pattern probe can see it. This is
+the same shape as the round-4 conclusion ("the miss is in the MIXED stream, not
+any one instruction") except the mixing that matters is ALU dependency
+structure, not branches.
+
+**STILL DO NOT FIX IT ALONE.** face (1 branch/px) matches silicon EXACTLY while
+containing this same mixed ALU, so the branchy arms have a compensating term.
+That is now the THIRD confirmed error in one cancelling sum:
+
+  * mode-A contention tax, over-broad        -> jsim slow
+  * mixed-ALU bypass too generous (this)     -> jsim fast
+  * whatever cancels it in branchy code      -> unidentified
+  * net whole-program                        -> jsim ~11% fast
+
+The next probe is the compensator: the facenn body with N taken branches
+interleaved, N swept. If the gap closes as N rises, refill is over-charged by
+roughly the mixed-ALU under-charge, and the pair can be fixed together with the
+anchor ladder as the check.

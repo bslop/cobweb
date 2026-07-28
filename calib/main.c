@@ -103,6 +103,8 @@ extern char p_facenb_s[], p_facenb_e[];
 extern char p_facebr_s[], p_facebr_e[];
 extern char p_facend_s[], p_facend_e[];
 extern char p_facenl_s[], p_facenl_e[];
+extern char p_facenn_s[], p_facenn_e[];
+extern char p_facenn4_s[], p_facenn4_e[];
 extern char p_ovlap_s[], p_ovlap_e[];
 extern char p_serial_s[], p_serial_e[];
 extern char p_bcmdidle_s[], p_bcmdidle_e[];
@@ -237,6 +239,8 @@ static const struct probe probes[] = {
      * these must sit in the same place in parse_results.py's PROBES list. */
     { "facend  ", p_facend_s, p_facend_e, 0, 0, 128, DRAM_BUF },
     { "facenl  ", p_facenl_s, p_facenl_e, 0, 0, 128, DRAM_BUF },
+    { "facenn  ", p_facenn_s, p_facenn_e, 0, 0, 128, DRAM_BUF },
+    { "facenn4 ", p_facenn4_s, p_facenn4_e, 0, 0, 128, DRAM_BUF },
     { "ovlap   ", p_ovlap_s, p_ovlap_e, 0, 0, 64, DRAM_BUF },
     { "serial  ", p_serial_s, p_serial_e, 0, 0, 64, DRAM_BUF },
     { "bcmdidle", p_bcmdidle_s, p_bcmdidle_e, 0, 0, 128, DRAM_BUF },
@@ -526,7 +530,8 @@ void cal_main(void)
 #ifdef FACE_ONLY
         if (probes[i].ks != p_face_s && probes[i].ks != p_facenb_s
             && probes[i].ks != p_facebr_s && probes[i].ks != p_facend_s
-            && probes[i].ks != p_facenl_s)
+            && probes[i].ks != p_facenl_s && probes[i].ks != p_facenn_s
+            && probes[i].ks != p_facenn4_s)
             continue;
 #endif
 #ifdef OVLAP_ONLY
@@ -570,7 +575,8 @@ void cal_main(void)
 #ifdef FACE_ONLY
         if (probes[i].ks != p_face_s && probes[i].ks != p_facenb_s
             && probes[i].ks != p_facebr_s && probes[i].ks != p_facend_s
-            && probes[i].ks != p_facenl_s)
+            && probes[i].ks != p_facenl_s && probes[i].ks != p_facenn_s
+            && probes[i].ks != p_facenn4_s)
             continue;
 #endif
 #ifdef OVLAP_ONLY
