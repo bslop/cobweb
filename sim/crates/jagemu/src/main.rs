@@ -8,7 +8,7 @@
 //!   jagemu info <rom>                         describe a program
 //!   jagemu run <rom> [--frames N]             boot, run N frames, dump state
 //!   jagemu screenshot <rom> [--frames N] [-o p.png]   true-OP PNG capture
-//!   jagemu disasm <rom> --at ADDR [--count N] [--frames N]
+//!   jagemu disasm <rom> --at ADDR [--count N] [--frames N] [--gpu|--dsp]
 //!   jagemu instances [--prune]                list/prune isolated instances
 //!   jagemu version
 
@@ -78,7 +78,8 @@ fn usage() {
          \x20 jagemu video <rom> [--count N] [--every K] [--start S] [--cols C] [--dir D] -o film.png\n\
          \x20 jagemu audio <rom> [--frames N] [--press a] -o out.wav\n\
          \x20 jagemu audiocheck <wav|rom> [--against <wav|rom>] [--frames N] [--press a]\n\
-         \x20 jagemu disasm <rom> --at 0xADDR [--count N] [--frames N]\n\
+         \x20 jagemu disasm <rom> --at 0xADDR [--count N] [--frames N] [--gpu|--dsp]\n\
+         \x20     --gpu / --dsp disassemble JRISC; without one the bytes are read as 68000\n\
          \x20 jagemu peek <rom> --at 0xADDR [--len N] [--frames N] [--press a]\n\
          \x20 jagemu dump <rom> --at 0xADDR --len N -o file.bin   # full-region export, no cap\n\
          \x20 jagemu break <rom> --at 0xADDR [--frames N] [--press a]\n\
