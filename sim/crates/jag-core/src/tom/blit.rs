@@ -373,6 +373,46 @@ pub fn run(bus: &mut Bus, cmd: u32) {
     // exactly, and keeps a single code path. Seeding pixel mode from B_SRCZ1/2
     // instead would leave three of every four pixels reading a stale lane — and
     // would render Atari's own kernel as garbage.
+    // ---- Gouraud intensity (spec §4.3) --------------------------------
+    // 16-bit pixel mode. B_PATD holds four 16-bit "intensity integer + colour"
+    // lanes - the actual pixel values written - and B_SRCD the four intensity
+    // FRACTIONS. B_IINC is an 8.16 increment. Per inner pass the fraction is
+    // added, then the integer with carry, and the intensity SATURATES rather
+    // than wrapping. Carry is blocked from intensity into colour unless
+    // TOPBEN/TOPNEN, which must stay clear for CRY.
+    //
+    // Pixel mode seeds from B_I3 alone, for exactly the reason the Z path does:
+    // Atari's N3D `gour` kernel stages B_I3 (start intensity) per scanline and
+    // never touches B_I2..B_I0; only the phrase variant pre-steps four. See the
+    // B_Z3 note below - same kernel, same evidence, same trap.
+    let gour_active = gourd && gens[dst].bpp == 16;
+    let (iinc, i3) = {
+        let w = &bus.tom.win;
+        (w.r32(mem::B_IINC) as i32, w.r32(mem::B_I3))
+    };
+    let topben = cmd & (mem::BC_TOPBEN | mem::BC_TOPNEN) != 0;
+    // COLOUR IS KEPT OUT OF THE ACCUMULATOR. The spec blocks carry from
+    // intensity into colour unless TOPBEN/TOPNEN, so the cleanest model is to
+    // hold the chroma byte aside and let only intensity.fraction accumulate -
+    // then a saturating clamp cannot reach the colour at all. (Folding colour
+    // into the accumulator and masking afterwards silently WRAPS instead of
+    // saturating, and leaks the carry into chroma; that was the first cut.)
+    let mut iacc: [i64; 4] = [0; 4];   // intensity.fraction, 8.16
+    let mut icol: [u32; 4] = [0; 4];   // chroma byte, constant along the span
+    if gour_active {
+        if pixel_mode {
+            iacc = [(i3 as i64) & 0xFF_FFFF; 4];
+            icol = [(i3 >> 24) & 0xFF; 4];
+        } else {
+            for l in 0..4 {
+                let int = lane(patd, 16, l as u32);          // colour<<8 | intensity
+                let frac = lane(srcd, 16, l as u32) as i64;
+                iacc[l] = (((int & 0xFF) as i64) << 16) | frac;
+                icol[l] = (int >> 8) & 0xFF;
+            }
+        }
+    }
+
     let mut zacc: [i64; 4] = [0; 4];
     if pixel_mode {
         zacc = [z3 as i64; 4];
@@ -424,8 +464,11 @@ pub fn run(bus: &mut Bus, cmd: u32) {
             // 2. Destination read (for LFU/compare/inhibit restore).
             let d = if need_dst { gens[dst].read_at(bus, da, dbit) } else { 0 };
             // 3. Write data select (spec §4.2).
-            let wd = if patdsel || gourd {
-                lane(patd, dbpp, lane_idx) // GOURD: static B_PATD (computation deferred)
+            let wd = if gour_active {
+                let l = (lane_idx % 4) as usize;
+                (icol[l] << 8) | ((iacc[l] >> 16) & 0xFF) as u32
+            } else if patdsel || gourd {
+                lane(patd, dbpp, lane_idx)
             } else if adddsel {
                 sat_add16(s, d)
             } else {
@@ -504,6 +547,21 @@ pub fn run(bus: &mut Bus, cmd: u32) {
                     *z = (*z + zinc as i64).clamp(0, 0xFFFF_FFFF);
                 }
             }
+            // Gouraud: add B_IINC, then SATURATE the intensity byte. Without
+            // TOPBEN/TOPNEN the carry must not reach the colour byte, so clamp
+            // the intensity in place instead of letting it ripple upward - that
+            // is what keeps CRY chroma stable along a shaded span.
+            if gour_active {
+                // B_IINC is 8.16; its top byte is colour and the spec says leave
+                // it 0, so only the low 24 bits step the intensity.
+                let step = ((iinc << 8) >> 8) as i64;   // sign-extended 24-bit
+                for a in iacc.iter_mut() {
+                    // SATURATE, do not wrap - and because colour is not in here,
+                    // the clamp physically cannot disturb the chroma.
+                    *a = (*a + step).clamp(0, 0xFF_FFFF);
+                }
+            }
+            let _ = topben;
             // 6. Advance inner pointers.
             gens[dst].step_inner();
             if srcen {
@@ -909,6 +967,52 @@ mod tests {
                 "Z at pixel {n} should be the ramped value"
             );
         }
+    }
+
+    /// GOURD ramps the CRY intensity (low byte) along the span from B_I3 by
+    /// B_IINC, and must leave the CHROMA (high byte) alone - carry from
+    /// intensity into colour is blocked unless TOPBEN/TOPNEN, which stay clear
+    /// for CRY. Before this was modelled, jsim sourced a static B_PATD and a
+    /// CRY-Gouraud fill came out flat (and, with the Y bytes masked, BLACK).
+    #[test]
+    fn gourd_ramps_cry_intensity_and_leaves_chroma_alone() {
+        let mut bus = Bus::new();
+        let base = 0x16_0000u32;
+        let flags = mem::AF_XADDPIX | 0x0000_4200 | (4 << mem::AF_PIXEL_SHIFT);
+        bus.tom.win.w32(mem::A1_BASE, base);
+        bus.tom.win.w32(mem::A1_FLAGS, flags);
+        bus.tom.win.w32(mem::A1_PIXEL, 0);
+        // B_I3: colour 0x7E in 31..24, intensity 0x10 in 23..16, no fraction.
+        bus.tom.win.w32(mem::B_I3, 0x7E_10_0000);
+        bus.tom.win.w32(mem::B_IINC, 0x0001_0000); // +1 intensity per pixel
+        bus.tom.win.w32(mem::B_COUNT, (1 << 16) | 6);
+        bus.write32(mem::B_CMD, mem::BC_PATDSEL | mem::BC_GOURD);
+        for n in 0..6u32 {
+            let px = bus.read16(base + n * 2);
+            assert_eq!(px >> 8, 0x7E, "chroma must not drift at pixel {n}");
+            assert_eq!(px & 0xFF, 0x10 + n as u16, "intensity ramp at pixel {n}");
+        }
+    }
+
+    /// Intensity SATURATES, it does not wrap into the chroma byte.
+    #[test]
+    fn gourd_intensity_saturates_without_touching_chroma() {
+        let mut bus = Bus::new();
+        let base = 0x18_0000u32;
+        let flags = mem::AF_XADDPIX | 0x0000_4200 | (4 << mem::AF_PIXEL_SHIFT);
+        bus.tom.win.w32(mem::A1_BASE, base);
+        bus.tom.win.w32(mem::A1_FLAGS, flags);
+        bus.tom.win.w32(mem::A1_PIXEL, 0);
+        bus.tom.win.w32(mem::B_I3, 0x33_FC_0000);  // chroma 0x33, intensity 252
+        bus.tom.win.w32(mem::B_IINC, 0x0002_0000); // +2 per pixel -> 254,256,...
+        bus.tom.win.w32(mem::B_COUNT, (1 << 16) | 5);
+        bus.write32(mem::B_CMD, mem::BC_PATDSEL | mem::BC_GOURD);
+        let got: Vec<u16> = (0..5).map(|n| bus.read16(base + n * 2)).collect();
+        for (n, px) in got.iter().enumerate() {
+            assert_eq!(px >> 8, 0x33, "chroma must survive saturation at {n}");
+            assert!(px & 0xFF <= 0xFF);
+        }
+        assert_eq!(got[4] & 0xFF, 0xFF, "must clamp at 255, not wrap");
     }
 
     /// A fractional B_ZINC must carry into the integer half rather than being
