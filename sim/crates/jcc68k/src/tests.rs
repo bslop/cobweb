@@ -821,3 +821,265 @@ fn address_taken_local_stays_in_memory() {
                for(i=0;i<10;i++) *p = *p + 1; return x; }";
     assert_eq!(run(src), 15);
 }
+
+// ─── address-register allocation, EA folding, copy folding ──────────────────
+// These cover the paths added when pointers moved into A2-A4 and field offsets
+// started folding into the instruction. Every one is an execution test: a
+// wrong displacement or a mis-folded copy shows up as a wrong number, not a
+// diff against expected assembly.
+
+#[test]
+fn struct_ptr_dot_product() {
+    let src = "struct V { int x, y, z; };\
+               int dot(struct V *a, struct V *b){ return a->x*b->x + a->y*b->y + a->z*b->z; }\
+               int main(){ struct V p, q; p.x=1; p.y=2; p.z=3; q.x=4; q.y=5; q.z=6;\
+                           return dot(&p,&q); }";
+    assert_eq!(run(src), 32); // 4 + 10 + 18
+}
+
+#[test]
+fn three_pointer_params_cross_product() {
+    // Exercises all three address registers live at once, with stores through
+    // the third while the first two are still being read.
+    let src = "struct V { int x, y, z; };\
+               void cross(struct V*a, struct V*b, struct V*o){\
+                 o->x = a->y*b->z - a->z*b->y;\
+                 o->y = a->z*b->x - a->x*b->z;\
+                 o->z = a->x*b->y - a->y*b->x; }\
+               int main(){ struct V a,b,o; a.x=1;a.y=0;a.z=0; b.x=0;b.y=1;b.z=0;\
+                           cross(&a,&b,&o); return o.x*100 + o.y*10 + o.z; }";
+    assert_eq!(run(src), 1); // (1,0,0) x (0,1,0) = (0,0,1)
+}
+
+#[test]
+fn more_pointers_than_address_registers() {
+    // Five pointer params: the surplus must fall back correctly.
+    let src = "int f(int*a,int*b,int*c,int*d,int*e){ return *a + *b*2 + *c*3 + *d*4 + *e*5; }\
+               int main(){ int v1=1,v2=1,v3=1,v4=1,v5=1; return f(&v1,&v2,&v3,&v4,&v5); }";
+    assert_eq!(run(src), 15);
+}
+
+#[test]
+fn pointer_post_increment_walk() {
+    // `*p++` on a register-allocated pointer goes through the ADDA path.
+    let src = "int main(){ int t[4]; t[0]=1;t[1]=2;t[2]=3;t[3]=4;\
+                int *p=t; int s=0; int i; for(i=0;i<4;i++) s += *p++; return s; }";
+    assert_eq!(run(src), 10);
+}
+
+#[test]
+fn byte_and_short_through_pointers() {
+    // Sub-word loads must keep their own width when the base is an A-register.
+    let src = "int main(){ short s[2]; s[0]=1000; s[1]=-500; short *p=s;\
+                return p[0] + p[1]; }";
+    assert_eq!(run(src), 500);
+}
+
+#[test]
+fn unsigned_char_zero_extends_through_pointer() {
+    let src = "int main(){ unsigned char b[2]; b[0]=200; b[1]=100;\
+                unsigned char *p=b; return p[0] + p[1]; }";
+    assert_eq!(run(src), 300);
+}
+
+#[test]
+fn signed_char_sign_extends_through_pointer() {
+    let src = "int main(){ signed char b[2]; b[0]=-5; b[1]=-10;\
+                signed char *p=b; return p[0] + p[1] + 100; }";
+    assert_eq!(run(src), 85);
+}
+
+#[test]
+fn logical_ops_on_pointer_loaded_values() {
+    // AND/OR reject an address register as source; the operands here come from
+    // A-register-based loads, so the fallback path has to be taken.
+    let src = "struct S { int a, b; };\
+               int f(struct S*p){ return (p->a & 0xF0) | (p->b & 0x0F); }\
+               int main(){ struct S s; s.a=0xAB; s.b=0xCD; return f(&s); }";
+    assert_eq!(run(src), 0xAD);
+}
+
+#[test]
+fn null_pointer_compare() {
+    let src = "int f(int*p){ if (p == 0) return 7; return *p; }\
+               int main(){ int v=9; return f(0)*10 + f(&v); }";
+    assert_eq!(run(src), 79);
+}
+
+#[test]
+fn function_pointer_call() {
+    // A function pointer is a pointer local — it must not be allocated somewhere
+    // that breaks the indirect `jsr`.
+    let src = "int add(int a,int b){ return a+b; }\
+               int main(){ int (*fp)(int,int) = add; return fp(3,4); }";
+    assert_eq!(run(src), 7);
+}
+
+#[test]
+fn nested_member_chain_through_pointer() {
+    let src = "struct In { int v; }; struct Out { struct In i; int w; };\
+               int main(){ struct Out o; o.i.v=11; o.w=22;\
+                           struct Out *p=&o; return p->i.v + p->w; }";
+    assert_eq!(run(src), 33);
+}
+
+#[test]
+fn store_through_pointer_then_read_alias() {
+    // Two pointers to the same object: a fold that dropped the store would
+    // return the stale value.
+    let src = "int main(){ int v=1; int *p=&v; int *q=&v; *p = 5; return *q; }";
+    assert_eq!(run(src), 5);
+}
+
+#[test]
+fn assignment_rhs_uses_the_destination_pointer() {
+    let src = "struct V { int x, y; };\
+               int main(){ struct V a; struct V *p=&a; p->x = 3; p->y = p->x * 7;\
+                           return p->y; }";
+    assert_eq!(run(src), 21);
+}
+
+#[test]
+fn global_array_constant_index_folds() {
+    let src = "int g[4] = {5,6,7,8};\
+               int main(){ return g[0] + g[3]; }";
+    assert_eq!(run(src), 13);
+}
+
+#[test]
+fn copy_fold_across_calls_respects_caller_saved() {
+    // D0/D1 die at a `jsr`; the fold's liveness rule must not carry a value
+    // across one.
+    let src = "int id(int x){ return x; }\
+               int main(){ int a=3, b=4; return id(a) + id(b)*2; }";
+    assert_eq!(run(src), 11);
+}
+
+#[test]
+fn matrix_transform_fixed_point() {
+    // The shape the whole exercise is aimed at: pointer-heavy fixed-point math.
+    let src = "struct V { int x, y, z; }; struct M { int m[9]; };\
+               void xf(struct M*m, struct V*v, struct V*o){\
+                 o->x = (m->m[0]*v->x + m->m[1]*v->y + m->m[2]*v->z) >> 8;\
+                 o->y = (m->m[3]*v->x + m->m[4]*v->y + m->m[5]*v->z) >> 8;\
+                 o->z = (m->m[6]*v->x + m->m[7]*v->y + m->m[8]*v->z) >> 8; }\
+               int main(){ struct M m; struct V v, o; int i;\
+                 for(i=0;i<9;i++) m.m[i]=0;\
+                 m.m[0]=256; m.m[4]=256; m.m[8]=256;\
+                 v.x=7; v.y=8; v.z=9; xf(&m,&v,&o);\
+                 return o.x*100 + o.y*10 + o.z; }";
+    assert_eq!(run(src), 789); // identity matrix in 24.8 fixed point
+}
+
+#[test]
+fn multiply_by_constant_strength_reduction_is_exact() {
+    // Constants the shift/add decomposition accepts (sums and differences of
+    // two powers of two), plus ones it must reject and hand to __mulsi3.
+    // Both paths have to produce the exact 32-bit product, for negative
+    // multiplicands as well as positive ones.
+    let consts: &[i64] = &[
+        // sum-of-two-powers
+        3, 5, 6, 9, 10, 12, 17, 18, 20, 24, 33, 36, 40, 48, 66, 72, 96, 132, 160, 264, 320,
+        // difference-of-two-powers
+        7, 14, 15, 28, 30, 31, 56, 60, 62, 63, 112, 124, 127, 224, 254, 255,
+        // must fall back to the helper (three or more set bits)
+        11, 13, 19, 21, 23, 100, 1000, 12345,
+        // powers of two and identities still handled by the original path
+        1, 2, 4, 8, 256, 1024,
+    ];
+    let vals: &[i64] = &[0, 1, 3, -3, 1234, -1234, 32767, -32768, 65535];
+    for &n in consts {
+        for &x in vals {
+            let src = format!("int main(){{ int x = {x}; return x * {n}; }}");
+            let got = run(&src) as i32;
+            let want = (x as i32).wrapping_mul(n as i32);
+            assert_eq!(got, want, "wrong product for {x} * {n}");
+        }
+    }
+}
+
+#[test]
+fn struct_array_index_walk() {
+    // `p[i].field` on a 12-byte struct is the case that made index scaling a
+    // __mulsi3 call; the values must survive the strength reduction.
+    let src = "struct V { int x, y, z; };\
+               int walk(struct V *p, int n){ int acc=0; int i;\
+                 for(i=0;i<n;i++) acc += p[i].x + p[i].z; return acc; }\
+               int main(){ struct V a[3];\
+                 a[0].x=1; a[0].y=99; a[0].z=2;\
+                 a[1].x=3; a[1].y=99; a[1].z=4;\
+                 a[2].x=5; a[2].y=99; a[2].z=6;\
+                 return walk(a,3); }";
+    assert_eq!(run(src), 21); // (1+2)+(3+4)+(5+6)
+}
+
+#[test]
+fn constant_shift_counts_are_exact() {
+    // Counts above 8 are now split into successive immediate shifts; every
+    // count must still match C semantics for signed (arithmetic) and unsigned
+    // (logical) operands, including negative values.
+    for n in 1..=31i64 {
+        for &x in &[1i64, -1, 0x1234_5678, -0x1234_5678, 0x7FFF_FFFF] {
+            let s = format!("int main(){{ int x = {x}; return x >> {n}; }}");
+            assert_eq!(run(&s) as i32, (x as i32) >> n, "signed {x} >> {n}");
+            let s = format!("int main(){{ int x = {x}; return x << {n}; }}");
+            assert_eq!(run(&s) as i32, (x as i32).wrapping_shl(n as u32), "{x} << {n}");
+            let s = format!("int main(){{ unsigned x = {}u; return x >> {n}; }}",
+                            x as i32 as u32);
+            assert_eq!(run(&s), (x as i32 as u32) >> n, "unsigned {x} >> {n}");
+        }
+    }
+}
+
+#[test]
+fn constant_folding_matches_runtime() {
+    // Folded constant arithmetic must agree with what the unfolded form
+    // computes, including wraparound and the comparison results.
+    let cases: &[(&str, i32)] = &[
+        ("2 + 3 * 4 - 1", 13),
+        ("(7 & 12) | (1 << 5)", 36),
+        ("100 / 7", 14),
+        ("100 % 7", 2),
+        ("(5 > 3) + (2 >= 9)", 1),
+        ("1000000 * 3000", 1000000i32.wrapping_mul(3000)),
+        ("-8 >> 2", -2),
+        ("(3 && 0) + (0 || 4)", 1),
+    ];
+    for (expr, want) in cases {
+        let src = format!("int main(){{ return {expr}; }}");
+        assert_eq!(run(&src) as i32, *want, "constant expression `{expr}`");
+    }
+}
+
+#[test]
+fn constant_index_addressing_still_reads_the_right_slot() {
+    // Constant subscripts now fold into the address; each must land on its own
+    // element, not a neighbour.
+    let src = "struct M { int m[9]; };\
+               int pick(struct M *p){ return p->m[0]*1 + p->m[4]*10 + p->m[8]*100; }\
+               int main(){ struct M m; int i; for(i=0;i<9;i++) m.m[i]=i;\
+                           return pick(&m); }";
+    assert_eq!(run(src), 0 + 4 * 10 + 8 * 100);
+}
+
+#[test]
+fn store_target_pointer_reassigned_by_its_own_rhs() {
+    // The destination address must be the value `p` had *before* the RHS ran.
+    // This is the case that stops a pointer local's register from being treated
+    // as a stable base for the store.
+    let src = "struct V { int x, y; };\
+               int main(){ struct V a, b; struct V *p = &a; struct V *q = &b;\
+                 a.x = 0; a.y = 11; b.x = 0; b.y = 22;\
+                 p->x = (p = q)->y;\
+                 return a.x*100 + b.x; }";
+    // `p->x` resolves against &a, while the RHS reads b.y (22) after p=q.
+    assert_eq!(run(src), 2200);
+}
+
+#[test]
+fn store_through_pointer_incremented_in_rhs() {
+    let src = "int main(){ int t[3]; t[0]=0; t[1]=0; t[2]=0;\
+                 int *p = t; *p = (int)(p++ , 7);\
+                 return t[0]*10 + t[1]; }";
+    assert_eq!(run(src), 70); // the store lands on t[0], not t[1]
+}

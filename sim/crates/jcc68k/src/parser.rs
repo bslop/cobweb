@@ -1589,6 +1589,15 @@ impl Parser {
                 Rc::new(TypeK::Int { size: 4, signed })
             }
         };
+        // Constant-fold two literals. Cheap here, and it feeds the code
+        // generator's address folding: an offset that is still a `Binary` node
+        // at codegen time has to be computed in registers at runtime.
+        if let (ExprK::Num(a), ExprK::Num(b)) = (&lhs.kind, &rhs.kind) {
+            let signed = lt.is_signed() && rt.is_signed();
+            if let Some(v) = fold_const_binary(op, *a, *b, signed) {
+                return Ok(Expr { kind: ExprK::Num(v), ty, line });
+            }
+        }
         Ok(Expr { kind: ExprK::Binary(op, Box::new(lhs), Box::new(rhs)), ty, line })
     }
 
@@ -1603,9 +1612,48 @@ fn scale(e: Expr, sz: u32, line: usize) -> Expr {
     if sz <= 1 {
         return e;
     }
+    // A constant index scales at compile time. Without this, `m->m[2]` emitted
+    // the multiplication `2 * 4` as *runtime* instructions, which also hid the
+    // constant from the code generator's address-folding — seven instructions
+    // for what is one `move.l 8(a2),d0`.
+    if let ExprK::Num(k) = &e.kind {
+        return Expr { kind: ExprK::Num(k.wrapping_mul(sz as i64)), ty: e.ty.clone(), line };
+    }
     let szc = Expr { kind: ExprK::Num(sz as i64), ty: t_int(), line };
     let ty = e.ty.clone();
     Expr { kind: ExprK::Binary(BinOp::Mul, Box::new(e), Box::new(szc)), ty, line }
+}
+
+/// Evaluate `a op b` at compile time when it is safe to do so.
+///
+/// Only operations whose result is independent of signedness are folded
+/// unconditionally; division, remainder, right shift and the comparisons
+/// depend on it, so those fold only when both operands are signed. Values are
+/// kept as `i64` and truncated by the code generator exactly as a runtime
+/// 32-bit computation would wrap.
+fn fold_const_binary(op: BinOp, a: i64, b: i64, signed: bool) -> Option<i64> {
+    let r = match op {
+        BinOp::Add => a.wrapping_add(b),
+        BinOp::Sub => a.wrapping_sub(b),
+        BinOp::Mul => a.wrapping_mul(b),
+        BinOp::And => a & b,
+        BinOp::Or => a | b,
+        BinOp::Xor => a ^ b,
+        BinOp::Shl if (0..32).contains(&b) => a.wrapping_shl(b as u32),
+        BinOp::Shr if signed && (0..32).contains(&b) => a >> b,
+        BinOp::Div if signed && b != 0 => a.wrapping_div(b),
+        BinOp::Mod if signed && b != 0 => a.wrapping_rem(b),
+        BinOp::Eq => (a == b) as i64,
+        BinOp::Ne => (a != b) as i64,
+        BinOp::Lt if signed => (a < b) as i64,
+        BinOp::Le if signed => (a <= b) as i64,
+        BinOp::Gt if signed => (a > b) as i64,
+        BinOp::Ge if signed => (a >= b) as i64,
+        BinOp::LogAnd => ((a != 0) && (b != 0)) as i64,
+        BinOp::LogOr => ((a != 0) || (b != 0)) as i64,
+        _ => return None,
+    };
+    Some(r)
 }
 
 fn ptr_scale(ty: &Type) -> i64 {
