@@ -12,11 +12,20 @@
 //! copies** (`SRCEN` reading through A2, `DSTA2` role swap), fills from `B_SRCD`,
 //! every LFU boolean op, `PATDSEL`/`ADDDSEL` write data, the transparent-copy
 //! data comparator (`DCOMPEN`/`CMPDST`), `CLIP_A1`, `BKGWREN`, and the
-//! `UPDA1`/`UPDA2`/`UPDA1F` outer-step updates. Gouraud (`GOURD`) and Z
-//! (`ZBUFF`/`ZMODE`) — the 16-bit 3D path — have their registers modeled but the
-//! per-pixel computation is deferred (see the markers in `run`); the bit-expand
-//! comparator (`BCOMPEN`) is likewise deferred. Both are flagged, never silently
+//! `UPDA1`/`UPDA2`/`UPDA1F` outer-step updates, and the **Z-buffer path**
+//! (`ZBUFF`/`GOURZ` interpolation, `ZMODE` comparator, `DSTENZ`/`DSTWRZ`,
+//! `ZOFFS` pixel/Z interleave) — see §4.4 and the block in `run`.
+//!
+//! Gouraud (`GOURD`) intensity and the bit-expand comparator (`BCOMPEN`) are
+//! still deferred (see the markers in `run`). Both are flagged, never silently
 //! wrong.
+//!
+//! **Z caveat, read before trusting a result:** the spec's Open Questions mark
+//! `ZMODE` *polarity* UNVERIFIED — `[INC]` documents the bits as selecting the
+//! relation that INHIBITS the write, while a TRM worked example reads as if they
+//! select the relation that PASSES. This implements the `[INC]` inhibit
+//! semantics. A depth test built against it is self-consistent with jsim but not
+//! proven on silicon; confirm on hardware before treating a Z render as correct.
 
 use crate::bus::Bus;
 use crate::mem;
@@ -315,6 +324,53 @@ pub fn run(bus: &mut Bus, cmd: u32) {
         || (!patdsel && !gourd && lfu != mem::LFU_REPLACE && lfu != mem::LFU_CLEAR)
         || (!pixel_mode && (clip_a1 || dcompen));
 
+    // ---- Z-buffer state (spec §4.4) -------------------------------------
+    // 16-bit pixel mode [TRM p.81]. The destination's Z lives ZOFFS phrases
+    // along from its pixel phrase, so pixels and Z interleave inside one A1
+    // window: PITCH sets the phrase stride, ZOFFS picks the Z phrase within it.
+    // Pixel and Z are both 16bpp in the same lane, so the Z byte address is the
+    // pixel byte address plus ZOFFS phrases — nothing else has to be recomputed.
+    //
+    // B_SRCZ1 = four 16-bit Z INTEGERS, B_SRCZ2 = four 16-bit Z FRACTIONS
+    // (B_Z0..B_Z3 are 16.16 views onto the same four lanes). With bit13
+    // (ZBUFF/GOURZ) set, each inner pass adds B_ZINC to the lanes — fraction
+    // first, then integer with carry — and Z SATURATES [TRM p.74, p.81].
+    //
+    // In PIXEL mode one pixel is written per inner pass, so software seeds all
+    // four lanes to the span's starting Z and sets B_ZINC to the per-pixel
+    // delta; pixel n then reads lane (n%4), whose value is Z + n·ZINC. That
+    // falls straight out of the literal spec rule and needs no special case.
+    let zbuff = cmd & mem::BC_ZBUFF != 0;
+    let dstenz = cmd & mem::BC_DSTENZ != 0;
+    let dstwrz = cmd & mem::BC_DSTWRZ != 0;
+    let zmode = cmd & (mem::BC_ZMODELT | mem::BC_ZMODEEQ | mem::BC_ZMODEGT);
+    let z_active = zbuff || dstenz || dstwrz || zmode != 0;
+    let (srcz1, srcz2, zinc, zoffs) = {
+        let w = &bus.tom.win;
+        let dflags = w.r32(if dst == 0 { mem::A1_FLAGS } else { mem::A2_FLAGS });
+        (
+            [w.r32(mem::B_SRCZ1), w.r32(mem::B_SRCZ1 + 4)],
+            [w.r32(mem::B_SRCZ2), w.r32(mem::B_SRCZ2 + 4)],
+            w.r32(mem::B_ZINC) as i32,
+            (dflags >> mem::AF_ZOFFS_SHIFT) & 7,
+        )
+    };
+    let mut zacc: [i64; 4] = [0; 4];
+    for (l, z) in zacc.iter_mut().enumerate() {
+        *z = ((lane(srcz1, 16, l as u32) as i64) << 16) | lane(srcz2, 16, l as u32) as i64;
+    }
+    // ERRATA [TRM]: "Z comparators fail in pixel mode without BKGWREN". The
+    // actual silicon behaviour of that failure is unrecorded, so we do NOT
+    // invent one — inventing it would be worse than the risk it covers. Flag it,
+    // so a kernel that would misbehave on hardware is visible here instead of
+    // being quietly correct in the simulator.
+    if zmode != 0 && pixel_mode && !bkgwren {
+        eprintln!(
+            "BLIT WARNING cmd={cmd:08X}: ZMODE set in pixel mode without BKGWREN — \
+             TRM errata says the Z comparators fail on silicon; jsim compares anyway."
+        );
+    }
+
     let dbpp = gens[dst].bpp;
     let dmask = if dbpp >= 32 { 0xFFFF_FFFF } else { (1u32 << dbpp) - 1 };
 
@@ -368,16 +424,43 @@ pub fn run(bus: &mut Bus, cmd: u32) {
                     inhibit = true;
                 }
             }
+            // 4b. Z comparator (spec §4.4). Source Z is this pixel's lane of the
+            // interpolator; destination Z sits ZOFFS phrases along from the pixel.
+            // The ZMODE bits select the relation that INHIBITS the write and they
+            // OR together [INC:279-281] — so a near-wins depth test (write when
+            // source < destination) is ZMODEEQ|ZMODEGT.
+            let za = da.wrapping_add(zoffs * 8);
+            let src_z = ((zacc[(lane_idx % 4) as usize] >> 16) as u32) & 0xFFFF;
+            if z_active && dbpp == 16 && zmode != 0 {
+                let dst_z = bus.read16(za) as u32;
+                if (zmode & mem::BC_ZMODELT != 0 && src_z < dst_z)
+                    || (zmode & mem::BC_ZMODEEQ != 0 && src_z == dst_z)
+                    || (zmode & mem::BC_ZMODEGT != 0 && src_z > dst_z)
+                {
+                    inhibit = true;
+                }
+            }
             // 5. Write (or background/restore on inhibit, spec §4.5).
             if !inhibit {
                 gens[dst].write_at(bus, da, dbit, wd);
             } else if pixel_mode {
                 if bkgwren {
-                    gens[dst].write_at(bus, da, dbit, lane(dstd, dbpp, lane_idx) & dmask);
+                    // DSTEN is what makes BKGWREN a RESTORE rather than a paint:
+                    // with it the blitter has read this pixel, so the inhibited
+                    // write puts the pixel back unchanged. Without it there is
+                    // nothing to restore and the background register is written,
+                    // which is the "restore inhibited pixels" role the TRM gives
+                    // DSTEN in the Z recipe [TRM p.82].
+                    let bg = if dsten { d } else { lane(dstd, dbpp, lane_idx) };
+                    gens[dst].write_at(bus, da, dbit, bg & dmask);
                 }
             } else {
                 // Phrase mode: an inhibited pixel still writes back the (read) dest.
                 gens[dst].write_at(bus, da, dbit, d & dmask);
+            }
+            // 5b. Destination Z write-back, gated the same way as the pixel.
+            if z_active && dbpp == 16 && dstwrz && !inhibit {
+                bus.write16(za, src_z as u16);
             }
             if let Some(wa) = WATCH_ADDR.get_or_init(|| {
                 std::env::var("JAGEMU_WATCH").ok()
@@ -389,6 +472,14 @@ pub fn run(bus: &mut Bus, cmd: u32) {
                         da, wd, inhibit, cmd, gens[dst].x, gens[dst].y, gens[dst].width_px,
                         gens[dst].pitch_phrases, gens[dst].xadd, outer, inner
                     );
+                }
+            }
+            // 5c. Advance the Z interpolator: every inner pass adds B_ZINC to
+            // all four lanes, fraction then integer with carry (a 16.16 add
+            // does both), and Z SATURATES rather than wrapping [TRM p.74, p.81].
+            if zbuff {
+                for z in zacc.iter_mut() {
+                    *z = (*z + zinc as i64).clamp(0, 0xFFFF_FFFF);
                 }
             }
             // 6. Advance inner pointers.
@@ -695,6 +786,151 @@ mod tests {
                 assert_eq!(px(&mut bus, x), color, "row {y} col {x} should be painted");
             }
             assert_eq!(px(&mut bus, 7), 0, "row {y} col 7 must stay clear");
+        }
+    }
+
+    /// Interleaved pixel/Z window (spec §2.3, §3.3): PITCH=1 gives a 2-phrase
+    /// stride and ZOFFS=1 puts each pixel phrase's Z in the second phrase, so
+    /// 16bpp pixel n sits at `base + (n/4)*16 + (n%4)*2` and its Z 8 bytes on.
+    fn zbuf_flags() -> u32 {
+        mem::AF_XADDPIX
+            | 0x0000_4200
+            | (4 << mem::AF_PIXEL_SHIFT)
+            | (1 << mem::AF_ZOFFS_SHIFT)
+            | 1
+    }
+    fn zpx(n: u32) -> u32 {
+        (n / 4) * 16 + (n % 4) * 2
+    }
+
+    /// The ZMODE comparator selects the relation that INHIBITS the write
+    /// ([INC:279-281]), so a near-wins depth test — "draw only where the new Z
+    /// is closer than what is already there" — is ZMODEEQ|ZMODEGT. Both the
+    /// pixel and its Z must be left alone where the test fails.
+    #[test]
+    fn zmode_near_wins_inhibits_pixel_and_z() {
+        let mut bus = Bus::new();
+        let base = 0x10_0000u32;
+        let dest_z = [50u16, 100, 150, 200];
+        for n in 0..4u32 {
+            bus.write16(base + zpx(n), 0xFFFF); // untouched pixel marker
+            bus.write16(base + zpx(n) + 8, dest_z[n as usize]);
+        }
+        bus.tom.win.w32(mem::A1_BASE, base);
+        bus.tom.win.w32(mem::A1_FLAGS, zbuf_flags());
+        bus.tom.win.w32(mem::A1_PIXEL, 0);
+        bus.tom.win.w32(mem::B_SRCD, 0xAAAA_AAAA);
+        bus.tom.win.w32(mem::B_SRCD + 4, 0xAAAA_AAAA);
+        // Source Z = 100 in all four lanes, no fraction, no ramp.
+        bus.tom.win.w32(mem::B_SRCZ1, 0x0064_0064);
+        bus.tom.win.w32(mem::B_SRCZ1 + 4, 0x0064_0064);
+        bus.tom.win.w32(mem::B_SRCZ2, 0);
+        bus.tom.win.w32(mem::B_SRCZ2 + 4, 0);
+        bus.tom.win.w32(mem::B_ZINC, 0);
+        bus.tom.win.w32(mem::B_COUNT, (1 << 16) | 4);
+        bus.write32(
+            mem::B_CMD,
+            mem::LFU_REPLACE
+                | mem::BC_BKGWREN
+                | mem::BC_DSTEN
+                | mem::BC_DSTENZ
+                | mem::BC_DSTWRZ
+                | mem::BC_ZMODEEQ
+                | mem::BC_ZMODEGT,
+        );
+        // 100 > 50 and 100 == 100 inhibit; 100 < 150 and 100 < 200 draw.
+        assert_eq!(bus.read16(base + zpx(0)), 0xFFFF, "farther src must not draw");
+        assert_eq!(bus.read16(base + zpx(1)), 0xFFFF, "equal src must not draw");
+        assert_eq!(bus.read16(base + zpx(2)), 0xAAAA, "nearer src must draw");
+        assert_eq!(bus.read16(base + zpx(3)), 0xAAAA, "nearer src must draw");
+        assert_eq!(bus.read16(base + zpx(0) + 8), 50, "inhibited Z must survive");
+        assert_eq!(bus.read16(base + zpx(1) + 8), 100, "inhibited Z must survive");
+        assert_eq!(bus.read16(base + zpx(2) + 8), 100, "DSTWRZ updates drawn Z");
+        assert_eq!(bus.read16(base + zpx(3) + 8), 100, "DSTWRZ updates drawn Z");
+    }
+
+    /// ZBUFF/GOURZ ramps Z across the span: every inner pass adds B_ZINC (16.16)
+    /// to the lanes. In PIXEL mode one pixel is written per pass, so seeding all
+    /// four lanes to the span's start Z and setting B_ZINC to the per-pixel delta
+    /// makes pixel n land on Z + n·delta — the contract the Bubsy 3D span kernel
+    /// is built on.
+    #[test]
+    fn gourz_ramps_z_one_zinc_per_pixel() {
+        let mut bus = Bus::new();
+        let base = 0x12_0000u32;
+        for n in 0..6u32 {
+            bus.write16(base + zpx(n), 0x0000);
+            bus.write16(base + zpx(n) + 8, 0xFFFF); // far: everything draws
+        }
+        bus.tom.win.w32(mem::A1_BASE, base);
+        bus.tom.win.w32(mem::A1_FLAGS, zbuf_flags());
+        bus.tom.win.w32(mem::A1_PIXEL, 0);
+        bus.tom.win.w32(mem::B_SRCD, 0x1111_1111);
+        bus.tom.win.w32(mem::B_SRCD + 4, 0x1111_1111);
+        bus.tom.win.w32(mem::B_SRCZ1, 0x0064_0064); // 100 in every lane
+        bus.tom.win.w32(mem::B_SRCZ1 + 4, 0x0064_0064);
+        bus.tom.win.w32(mem::B_SRCZ2, 0);
+        bus.tom.win.w32(mem::B_SRCZ2 + 4, 0);
+        bus.tom.win.w32(mem::B_ZINC, 0x0001_0000); // +1.0 per pixel
+        bus.tom.win.w32(mem::B_COUNT, (1 << 16) | 6);
+        bus.write32(
+            mem::B_CMD,
+            mem::LFU_REPLACE
+                | mem::BC_BKGWREN
+                | mem::BC_DSTEN
+                | mem::BC_ZBUFF
+                | mem::BC_DSTENZ
+                | mem::BC_DSTWRZ
+                | mem::BC_ZMODEEQ
+                | mem::BC_ZMODEGT,
+        );
+        for n in 0..6u32 {
+            assert_eq!(bus.read16(base + zpx(n)), 0x1111, "pixel {n} should draw");
+            assert_eq!(
+                bus.read16(base + zpx(n) + 8),
+                100 + n as u16,
+                "Z at pixel {n} should be the ramped value"
+            );
+        }
+    }
+
+    /// A fractional B_ZINC must carry into the integer half rather than being
+    /// truncated per step: +0.5/pixel advances the stored Z every OTHER pixel.
+    #[test]
+    fn gourz_fractional_zinc_carries() {
+        let mut bus = Bus::new();
+        let base = 0x14_0000u32;
+        for n in 0..4u32 {
+            bus.write16(base + zpx(n) + 8, 0xFFFF);
+        }
+        bus.tom.win.w32(mem::A1_BASE, base);
+        bus.tom.win.w32(mem::A1_FLAGS, zbuf_flags());
+        bus.tom.win.w32(mem::A1_PIXEL, 0);
+        bus.tom.win.w32(mem::B_SRCD, 0x2222_2222);
+        bus.tom.win.w32(mem::B_SRCD + 4, 0x2222_2222);
+        bus.tom.win.w32(mem::B_SRCZ1, 0x000A_000A); // 10
+        bus.tom.win.w32(mem::B_SRCZ1 + 4, 0x000A_000A);
+        bus.tom.win.w32(mem::B_SRCZ2, 0);
+        bus.tom.win.w32(mem::B_SRCZ2 + 4, 0);
+        bus.tom.win.w32(mem::B_ZINC, 0x0000_8000); // +0.5 per pixel
+        bus.tom.win.w32(mem::B_COUNT, (1 << 16) | 4);
+        bus.write32(
+            mem::B_CMD,
+            mem::LFU_REPLACE
+                | mem::BC_BKGWREN
+                | mem::BC_DSTEN
+                | mem::BC_ZBUFF
+                | mem::BC_DSTENZ
+                | mem::BC_DSTWRZ
+                | mem::BC_ZMODEEQ
+                | mem::BC_ZMODEGT,
+        );
+        for (n, exp) in [10u16, 10, 11, 11].iter().enumerate() {
+            assert_eq!(
+                bus.read16(base + zpx(n as u32) + 8),
+                *exp,
+                "Z at pixel {n} (0.5/px ramp from 10)"
+            );
         }
     }
 }
