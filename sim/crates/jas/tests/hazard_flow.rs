@@ -48,3 +48,61 @@ done:
     assert!(out.errors() > 0,
         "a conditional jump must NOT clear the shadow: {:#?}", out.diags);
 }
+
+/// ☠️ A READ DOES NOT ALWAYS SETTLE THE SCOREBOARD — the one hazard in this
+/// corpus that has actually been observed on silicon, and the one jas used to
+/// report as clean.
+///
+/// `div rX,r0` then `neg r0` inside the shadow drew a stray polygon edge on a
+/// Skunkboard (296 px across 7 columns) that no emulator reproduced. `neg`
+/// reads r0, so the read-settles rule cleared the pending divide and nothing
+/// was reported — but the operand of a single-operand op is the DESTINATION
+/// field, which carries no interlock, so the divide's late write discarded the
+/// negate.
+#[test]
+fn warns_on_dst_field_rmw_inside_the_divide_shadow() {
+    let out = assemble(
+        "        .gpu\n\
+         \x20       div r3,r0\n\
+         \x20       nop\n\
+         \x20       nop\n\
+         \x20       neg r0\n",
+        &Options::default(),
+    );
+    assert_eq!(out.errors(), 0, "must stay a WARNING, not an error: {:#?}", out.diags);
+    let msgs: Vec<String> = out.diags.iter().map(|d| format!("{d:?}")).collect();
+    assert!(
+        msgs.iter().any(|m| m.contains("DIVIDE shadow")),
+        "expected the divide-shadow RMW warning, got: {msgs:#?}"
+    );
+}
+
+/// A real source-field read (`move r0,r5`) DOES interlock — that is the fix the
+/// bench confirmed, so it must come back clean.
+#[test]
+fn no_warning_when_the_quotient_is_read_into_a_scratch_first() {
+    let out = assemble(
+        "        .gpu\n\
+         \x20       div r3,r0\n\
+         \x20       move r0,r5\n\
+         \x20       neg r5\n",
+        &Options::default(),
+    );
+    let msgs: Vec<String> = out.diags.iter().map(|d| format!("{d:?}")).collect();
+    assert!(!msgs.iter().any(|m| m.contains("DIVIDE shadow")), "got: {msgs:#?}");
+}
+
+/// Deliberately silent for a LOAD shadow: the silicon evidence is the divide.
+/// Inventing a load case would be the over-reporting the flow rules removed.
+#[test]
+fn no_divide_warning_for_a_load_shadow_rmw() {
+    let out = assemble(
+        "        .gpu\n\
+         \x20       movei #$100000,r3\n\
+         \x20       load (r3),r0\n\
+         \x20       neg r0\n",
+        &Options::default(),
+    );
+    let msgs: Vec<String> = out.diags.iter().map(|d| format!("{d:?}")).collect();
+    assert!(!msgs.iter().any(|m| m.contains("DIVIDE shadow")), "got: {msgs:#?}");
+}
