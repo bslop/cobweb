@@ -83,6 +83,7 @@ extern char p_divlat_s[], p_divlat_e[];
 extern char p_ldjump_s[], p_ldjump_e[];
 extern char p_ldjumprn_s[], p_ldjumprn_e[];
 extern char p_mmult_s[], p_mmult_e[];
+extern char p_mmultd_s[], p_mmultd_e[];
 extern char p_mmultw_s[], p_mmultw_e[];
 extern char p_mmulta_s[], p_mmulta_e[];
 extern char p_face_s[], p_face_e[];
@@ -581,6 +582,38 @@ void cal_main(void)
         d = put(d, "\n");
         *d = 0;
         say(line);
+    }
+
+    {   /* p_mmultd: MMULT drain sweep — the minimum settle a 3-row chained
+         * transform needs on silicon (OpenLara kernel shape). Prints one line
+         * per K (16,12,8,6,4,2); correct = 00000020,00000140,00000C80. The
+         * SMALLEST K with all three correct is what the kernel must use. */
+        u32 MDRES = 0x00104100UL;
+        u32 guard = 60000000UL;
+        static const int ks[6] = { 16, 12, 8, 6, 4, 2 };
+        int i;
+        say("CAL MMDSTART\n");
+        R32(MDRES + 72) = 0;
+        copy16(G_RAM, p_mmultd_s, p_mmultd_e);
+        R32(PARAM_RESULT) = MDRES;
+        R32(G_PC) = G_RAM;
+        R32(G_CTRL) = 1;
+        while (R32(MDRES + 72) != MAGIC_DONE && --guard)
+            ;
+        for (i = 0; i < 6; i++) {
+            char *d = line;
+            d = put(d, "CAL MMD k=");
+            d = puth(d, (u32)ks[i]);
+            d = put(d, " o=");
+            d = puth(d, R32(MDRES + (u32)i * 12));
+            d = put(d, ",");
+            d = puth(d, R32(MDRES + (u32)i * 12 + 4));
+            d = put(d, ",");
+            d = puth(d, R32(MDRES + (u32)i * 12 + 8));
+            d = put(d, "\n");
+            *d = 0;
+            say(line);
+        }
     }
 
     {   /* p_ldjump: load consumed across a taken jump (round 5.2). Prints

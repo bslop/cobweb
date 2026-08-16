@@ -1199,6 +1199,111 @@ _p_mmult_s:
 	.data
 _p_mmult_e:
 
+; ── p_mmultd: MMULT DRAIN SWEEP — how much settle does a 3-row transform need? ─
+; OpenLara 2026-07-24: the MMULT vertex rotate rendered CORRECT in jagemu but
+; produced scattered/garbage vertices on SILICON. jsim models MMULT as
+; instantaneous, so it CANNOT see this class of bug. The kernel chained
+; row0/row1/row2 with only ~4 instructions between MMULTs and 6 nops before
+; reading the results; cobweb's validated p_mmult used ~13 and 8. This sweeps the
+; drain length K to find the MINIMUM SAFE spacing for exactly the kernel's shape:
+;   store MTXA; moveta; moveta; mmult -> (K nops) -> ... x3 -> read all three.
+; Descending K so a wedge at small K still leaves the larger-K results in DRAM.
+; result: 6 slots x 3 longs at $104100 (K=16,12,8,6,4,2), magic at $104148.
+; Correct = 32,320,3200 (=$20,$140,$C80). The smallest K that still yields all
+; three correct is the number the kernel must use.
+	.macro	MMDRAIN k
+	movei	#$A00,r10
+	store	r10,(r9)
+	moveta	r2,r2
+	moveta	r3,r3
+	mmult	r2,r4
+	.rept	\k
+	nop
+	.endr
+	movei	#$A0C,r10
+	store	r10,(r9)
+	moveta	r2,r2
+	moveta	r3,r3
+	mmult	r2,r5
+	.rept	\k
+	nop
+	.endr
+	movei	#$A18,r10
+	store	r10,(r9)
+	moveta	r2,r2
+	moveta	r3,r3
+	mmult	r2,r6
+	.rept	\k
+	nop
+	.endr
+	store	r4,(r12)
+	addq	#4,r12
+	store	r5,(r12)
+	addq	#4,r12
+	store	r6,(r12)
+	addq	#4,r12
+	.endm
+
+	.even
+	.globl	_p_mmultd_s
+	.globl	_p_mmultd_e
+_p_mmultd_s:
+	.gpu
+	; matrix rows [1,2,3] [10,20,30] [100,200,300], BOTH 16-bit halves
+	movei	#$F03A00,r1
+	movei	#$00010001,r0
+	store	r0,(r1)
+	movei	#$F03A04,r1
+	movei	#$00020002,r0
+	store	r0,(r1)
+	movei	#$F03A08,r1
+	movei	#$00030003,r0
+	store	r0,(r1)
+	movei	#$F03A0C,r1
+	movei	#$000A000A,r0
+	store	r0,(r1)
+	movei	#$F03A10,r1
+	movei	#$00140014,r0
+	store	r0,(r1)
+	movei	#$F03A14,r1
+	movei	#$001E001E,r0
+	store	r0,(r1)
+	movei	#$F03A18,r1
+	movei	#$00640064,r0
+	store	r0,(r1)
+	movei	#$F03A1C,r1
+	movei	#$00C800C8,r0
+	store	r0,(r1)
+	movei	#$F03A20,r1
+	movei	#$012C012C,r0
+	store	r0,(r1)
+	movei	#$F02104,r1		; MTXC = 3, by-row
+	moveq	#3,r0
+	store	r0,(r1)
+	movei	#$00050004,r2		; vector elem0=4 (low), elem1=5 (high)
+	moveq	#6,r3			; elem2=6
+	movei	#$F02108,r9		; MTXA reg
+	movei	#$00104100,r12		; result cursor
+	.rept	16
+	nop				; settle the setup stores
+	.endr
+	MMDRAIN	16
+	MMDRAIN	12
+	MMDRAIN	8
+	MMDRAIN	6
+	MMDRAIN	4
+	MMDRAIN	2
+	movei	#MAGICD,r26
+	store	r26,(r12)		; magic at $104148 — written LAST
+	movei	#GCTRL,r27
+	moveq	#0,r28
+	store	r28,(r27)		; stop self
+	nop
+	nop
+	.68000
+	.data
+_p_mmultd_e:
+
 ; ── p_mmultw: width-3 MMULT throughput (timing, COBWEB_REQ item 3) ──────────
 ; Standard VC-timed probe: MTXC=3, MTXA at the safe $A00 region, then a run of
 ; back-to-back width-3 MMULTs. Runs in bank 0 so the vector regs are whatever —

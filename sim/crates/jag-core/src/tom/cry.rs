@@ -3,14 +3,21 @@
 //! from the Technical Reference (TRM p.28). This is the decode the OP/DAC does —
 //! independent of any game-specific palette — so it matches BigPEmu.
 //!
-//! Byte order per the TRM pixel format (C-R-Y, high to low): cyan `px[15:12]`,
-//! red `px[11:8]`, intensity `y = px[7:0]`; `R = CRY_RED[red][cyan] * y / 255`,
-//! likewise G/B. Verified against a CRY framebuffer that renders correctly on
-//! BigPEmu *and* real silicon (the Quake port's E1M1 scene): this order
-//! reproduces it; the swapped order (Y in the high byte, previously claimed
-//! from a Cybermorph eyeball — white text survives either order, so it proved
-//! nothing) renders chroma noise. Sanity anchors: `$0Fyy` = pure red ramp,
-//! `$F0yy` = cyan ramp, `$88FF` ≈ white — all three hold only in this order.
+//! Nibble order, MEASURED on real silicon (jag_ascii, 2026-08-15): **red is the
+//! HIGH nibble** `px[15:12]`, cyan the LOW nibble `px[11:8]`, intensity
+//! `y = px[7:0]`; `R = CRY_RED[red][cyan] * y / 255`, likewise G/B.
+//!
+//! This was the other way round until a 16x16 sweep of all 256 chroma values was
+//! rendered on a Jaguar and captured alongside the same sweep from here. Against
+//! that capture the order below has a median hue error of 3.1 deg (worst 10.8,
+//! which is composite-capture rendition); the previous order had a median of
+//! 94.7 deg. Concrete: $0Fyy is CYAN on hardware, not the "pure red ramp" the
+//! old anchors claimed, and $50yy is violet, not blue.
+//!
+//! The old note cited BigPEmu and the Quake port's E1M1 scene as verification.
+//! Whatever that established, it was not this: an eyeball on a scene whose
+//! palette was itself authored against this decode cannot separate the two
+//! orders, because both render *a* plausible city. Only a sweep can.
 
 #[rustfmt::skip]
 const CRY_RED: [[u8; 16]; 16] = [
@@ -75,8 +82,8 @@ const CRY_BLUE: [[u8; 16]; 16] = [
 /// Decode a 16-bit CRY pixel to 8-bit RGB.
 #[inline]
 pub fn cry16_to_rgb(px: u16) -> (u8, u8, u8) {
-    let cy = ((px >> 12) & 0xF) as usize; // cyan nibble (column)
-    let cr = ((px >> 8) & 0xF) as usize; // red nibble (row)
+    let cr = ((px >> 12) & 0xF) as usize; // RED nibble (row) — the high one
+    let cy = ((px >> 8) & 0xF) as usize; // cyan nibble (column)
     let y = (px & 0xFF) as u32;
     let scale = |m: u8| ((m as u32 * y) / 255) as u8;
     (scale(CRY_RED[cr][cy]), scale(CRY_GREEN[cr][cy]), scale(CRY_BLUE[cr][cy]))
@@ -94,10 +101,11 @@ mod tests {
 
     #[test]
     fn cry_primary_corners() {
-        // $0FFF: cyan=0, red=15, y=255 → pure red.
-        assert_eq!(cry16_to_rgb(0x0FFF), (255, 0, 0));
-        // $F0FF: cyan=15, red=0, y=255 → cyan.
-        assert_eq!(cry16_to_rgb(0xF0FF), (0, 255, 255));
+        // Corners as MEASURED on hardware, not as the TRM prose reads.
+        // $F0FF: red=15, cyan=0, y=255 → pure red.
+        assert_eq!(cry16_to_rgb(0xF0FF), (255, 0, 0));
+        // $0FFF: red=0, cyan=15, y=255 → cyan.
+        assert_eq!(cry16_to_rgb(0x0FFF), (0, 255, 255));
         // $00FF: no chroma, y=255 → blue corner of the CRY cube.
         assert_eq!(cry16_to_rgb(0x00FF), (0, 0, 255));
         // $88FF: centre chroma, full intensity ≈ white.
