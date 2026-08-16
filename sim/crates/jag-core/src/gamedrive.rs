@@ -37,24 +37,65 @@ const HAVE_DATA: u16 = 0x08; // bit 3
 const CMD_HWVERSION: u8 = 12;
 const CMD_GETBIOS: u8 = 0x80;
 
+/// `GD_FSeek` flags (gdbios.h `GD_FSEEK_SET/CUR/END`).
+const SEEK_CUR: u16 = 1;
+const SEEK_END: u16 = 2;
+
 /// Firmware version reported to the probe. `gd_install` requires >= 0x111.
 const FIRMWARE: u16 = 0x0111;
 
-/// Function indices, from the bindings.
+/// Function indices, from the bindings (`JagGD/gdbios_bindings.s`).
 pub const FN_INIT: u8 = 1;
 pub const FN_CARDIN: u8 = 9;
 pub const FN_FOPEN: u8 = 10;
 pub const FN_FCLOSE: u8 = 11;
+pub const FN_FSEEK: u8 = 12;
 pub const FN_FREAD: u8 = 13;
+pub const FN_FTELL: u8 = 15;
 pub const FN_FSIZE: u8 = 16;
+pub const FN_ASYNCPOS: u8 = 17;
+pub const FN_ASYNCWAIT: u8 = 18;
+pub const FN_ASYNCACTIVE: u8 = 19;
 
 /// Size of the GDBIOS block we hand over (must be <= 4096; the bindings reject
 /// anything larger than the caller's buffer).
 const BIOS_BLOCK: usize = 512;
 
-/// TRAP vector used by FN_FSIZE. Function 16 has no `trap #16` (traps are
-/// 0-15), so it is remapped onto the otherwise-unused trap 0.
-pub const TRAP_FOR_FSIZE: u8 = 0;
+/// `(function index, TRAP vector)`.
+///
+/// The thunk for function N lives at block offset `4*N` and must be exactly
+/// four bytes, so it can only be `trap #n ; rts` — and 68000 traps run 0-15
+/// while the GD BIOS numbers functions up to 26. Every function above 15 is
+/// therefore remapped onto a trap the low-numbered functions do not use.
+///
+/// **This table is the single source of truth for both directions**:
+/// `build_bios_block` writes the thunks from it and the 68000 core dispatches
+/// through `fn_of_trap`. Two hand-maintained lists would silently drift, and a
+/// drifted entry means a file call quietly vectors to the wrong operation —
+/// which looks like corrupt data, not like a dispatch bug.
+pub const FN_TRAP: [(u8, u8); 11] = [
+    (FN_INIT, 1),
+    (FN_CARDIN, 9),
+    (FN_FOPEN, 10),
+    (FN_FCLOSE, 11),
+    (FN_FSEEK, 12),
+    (FN_FREAD, 13),
+    (FN_FTELL, 15),
+    (FN_FSIZE, 0),        // 16 > 15: remapped
+    (FN_ASYNCPOS, 2),     // 17 > 15: remapped
+    (FN_ASYNCWAIT, 3),    // 18 > 15: remapped
+    (FN_ASYNCACTIVE, 4),  // 19 > 15: remapped
+];
+
+/// Highest function index we publish; the block's function-count word must
+/// exceed it or the bindings refuse the call.
+const FN_MAX: u8 = FN_ASYNCACTIVE;
+
+/// Which GD BIOS function a TRAP vector stands for, or `None` if the trap is
+/// not ours (the core then takes a real 68000 trap).
+pub fn fn_of_trap(trap: u8) -> Option<u8> {
+    FN_TRAP.iter().find(|(_, t)| *t == trap).map(|(f, _)| *f)
+}
 
 /// Build the synthetic GDBIOS block: a version word, a function count, then a
 /// 4-byte `trap #n ; rts` thunk at offset `4*n` for each supported call.
@@ -65,10 +106,9 @@ fn build_bios_block() -> Vec<u8> {
         b[off + 1] = v as u8;
     };
     put16(&mut b, 0, 0x0111); // version (>= MINVERSION 0x100)
-    put16(&mut b, 2, FN_FSIZE as u16 + 1); // function count must exceed FN_FSIZE
-    for fname in [FN_INIT, FN_CARDIN, FN_FOPEN, FN_FCLOSE, FN_FREAD, FN_FSIZE] {
+    put16(&mut b, 2, FN_MAX as u16 + 1); // count must exceed the highest index
+    for (fname, trap) in FN_TRAP {
         let off = 4 * fname as usize;
-        let trap = if fname == FN_FSIZE { TRAP_FOR_FSIZE } else { fname };
         put16(&mut b, off, 0x4E40 | (trap as u16 & 0xF)); // TRAP #n
         put16(&mut b, off + 2, 0x4E75); // RTS
     }
@@ -102,6 +142,9 @@ pub struct GameDrive {
     /// Open handles.
     files: HashMap<u16, OpenFile>,
     next_handle: u16,
+    /// Destination end of the last read, reported by FN_ASYNCPOS. See
+    /// `async_pos()` for why this is a guess.
+    async_pos: u32,
 }
 
 impl GameDrive {
@@ -117,7 +160,13 @@ impl GameDrive {
             bios: build_bios_block(),
             files: HashMap::new(),
             next_handle: 1,
+            async_pos: 0,
         }
+    }
+
+    /// Record where a completed read finished writing, for FN_ASYNCPOS.
+    pub fn set_async_pos(&mut self, dst_end: u32) {
+        self.async_pos = dst_end;
     }
 
     /// `SPI_STATUS` read: HAVE_DATA in bit 3; never busy (bit 15), no stale
@@ -200,17 +249,42 @@ impl GameDrive {
     /// `-1` (as u32) if the file is missing. Matching is case-insensitive
     /// because the SD side is FAT.
     pub fn fopen(&mut self, name: &str) -> u32 {
-        let want = name.trim_end_matches('\0').trim().to_ascii_uppercase();
+        // A LEADING SLASH IS CARD-ABSOLUTE, NOT HOST-ABSOLUTE. `PathBuf::join`
+        // throws the root away when the argument starts with '/', so the naive
+        // form opened `/MUSIC.PCM` on the HOST filesystem. ROMs routinely try
+        // both spellings (OpenLara's `gd_fopen(mi ? "/MUSIC.PCM" : "MUSIC.PCM")`
+        // exists precisely because the card accepts both), so the slashed form
+        // must resolve inside the attached directory like every other path.
+        let want = name
+            .trim_end_matches('\0')
+            .trim()
+            .replace('\\', "/")
+            .trim_start_matches('/')
+            .to_ascii_uppercase();
         let mut path = self.root.join(&want);
         if !path.exists() {
-            // case-insensitive fallback
-            if let Ok(rd) = std::fs::read_dir(&self.root) {
-                for e in rd.flatten() {
-                    if e.file_name().to_string_lossy().to_ascii_uppercase() == want {
-                        path = e.path();
-                        break;
+            // Case-insensitive resolve, one component at a time so
+            // subdirectories work (`/DATA/PACK.BIN`): FAT is case-insensitive
+            // and the host is not.
+            let mut p = self.root.clone();
+            let mut ok = true;
+            for comp in want.split('/').filter(|c| !c.is_empty()) {
+                let mut hit = None;
+                if let Ok(rd) = std::fs::read_dir(&p) {
+                    for e in rd.flatten() {
+                        if e.file_name().to_string_lossy().to_ascii_uppercase() == comp {
+                            hit = Some(e.path());
+                            break;
+                        }
                     }
                 }
+                match hit {
+                    Some(h) => p = h,
+                    None => { ok = false; break; }
+                }
+            }
+            if ok {
+                path = p;
             }
         }
         if std::env::var_os("JAGEMU_GD_DEBUG").is_some() {
@@ -236,10 +310,61 @@ impl GameDrive {
         self.files.get(&handle).map(|f| f.data.len() as u32).unwrap_or(u32::MAX)
     }
 
+    /// FN_FSEEK — `flags` is 0 SET / 1 CUR / 2 END, `offset` is signed.
+    /// Returns 0 on success, `-1` on a bad handle.
+    ///
+    /// Seeking past the end is CLAMPED rather than refused: FatFs allows it and
+    /// the following read then returns nothing, which is the behaviour a
+    /// streaming loader must survive anyway.
+    pub fn fseek(&mut self, handle: u16, flags: u16, offset: i32) -> u32 {
+        let Some(f) = self.files.get_mut(&handle) else {
+            return u32::MAX;
+        };
+        let base = match flags {
+            SEEK_CUR => f.pos as i64,
+            SEEK_END => f.data.len() as i64,
+            _ => 0,
+        };
+        f.pos = (base + offset as i64).clamp(0, f.data.len() as i64) as usize;
+        if std::env::var_os("JAGEMU_GD_DEBUG").is_some() {
+            eprintln!("GD fseek h={handle} flags={flags} off={offset} -> pos {}", f.pos);
+        }
+        0
+    }
+
+    /// FN_FTELL — current file position, or `-1` on a bad handle.
+    pub fn ftell(&self, handle: u16) -> u32 {
+        self.files.get(&handle).map(|f| f.pos as u32).unwrap_or(u32::MAX)
+    }
+
+    /// FN_ASYNCACTIVE — always 0 (idle).
+    ///
+    /// ⚠️ **The async path is modelled as INSTANT, so this emulator validates
+    /// the LOGIC of a streaming loader and tells you NOTHING about its
+    /// latency.** A real `GD_FREAD_GPU_ASYNC` runs on the GPU interrupt over
+    /// many frames; here the bytes are already in the buffer by the time the
+    /// call returns. A double buffer therefore never actually overlaps, and a
+    /// loader that deadlocks waiting on real transfer time will still pass.
+    /// Timing is a hardware question.
+    pub fn async_active(&self) -> u32 {
+        0
+    }
+
+    /// FN_ASYNCPOS — how far the async read has got.
+    ///
+    /// ⚠️ The vendor bindings document this only as "current async GPU read
+    /// position" and do not say whether that is a FILE offset or a DESTINATION
+    /// address. We return the destination end (`dst + n` of the last read),
+    /// which is what a double-buffer consumer compares against — but this is a
+    /// GUESS, unverified on silicon. **Prefer `GD_FAsyncActive`/`GD_FAsyncWait`
+    /// in ROM code**, whose meaning is unambiguous either way.
+    pub fn async_pos(&self) -> u32 {
+        self.async_pos
+    }
+
     /// FN_FREAD — copy `n` bytes into the caller's buffer. Returns **0 on
     /// success** (the upstream convention the porting notes flag as a past
-    /// source of bugs), `-1` on a bad handle. There is no seek: position
-    /// advances, and a caller loops by reopening.
+    /// source of bugs), `-1` on a bad handle.
     pub fn fread(&mut self, handle: u16, n: u32) -> Option<Vec<u8>> {
         let f = self.files.get_mut(&handle)?;
         let start = f.pos.min(f.data.len());
@@ -262,18 +387,73 @@ mod tests {
     #[test]
     fn bios_block_has_trap_thunks_at_the_dispatch_offsets() {
         let b = build_bios_block();
-        // header: version >= 0x100, function count > FN_FSIZE
+        // header: version >= 0x100, function count above the highest index
         assert_eq!(u16::from_be_bytes([b[0], b[1]]), 0x0111);
-        assert!(u16::from_be_bytes([b[2], b[3]]) > FN_FSIZE as u16);
-        // `jsr (4*N)(%a6)` lands on `trap #n ; rts`
-        for fname in [FN_INIT, FN_CARDIN, FN_FOPEN, FN_FCLOSE, FN_FREAD] {
+        assert!(u16::from_be_bytes([b[2], b[3]]) > FN_MAX as u16);
+        // `jsr (4*N)(%a6)` lands on `trap #n ; rts` for EVERY published call,
+        // and the trap it lands on dispatches back to that same function.
+        for (fname, trap) in FN_TRAP {
             let off = 4 * fname as usize;
-            assert_eq!(u16::from_be_bytes([b[off], b[off + 1]]), 0x4E40 | fname as u16);
+            assert_eq!(
+                u16::from_be_bytes([b[off], b[off + 1]]),
+                0x4E40 | trap as u16,
+                "fn {fname} thunk"
+            );
             assert_eq!(u16::from_be_bytes([b[off + 2], b[off + 3]]), 0x4E75);
+            assert_eq!(fn_of_trap(trap), Some(fname), "fn {fname} round-trip");
         }
-        // FN_FSIZE (16) has no trap #16 — remapped onto trap 0
-        let off = 4 * FN_FSIZE as usize;
-        assert_eq!(u16::from_be_bytes([b[off], b[off + 1]]), 0x4E40);
+    }
+
+    /// Two functions sharing a TRAP would make one of them silently execute the
+    /// other — corrupt data, with no error anywhere. Cheap to assert, so assert.
+    #[test]
+    fn every_function_owns_a_distinct_trap() {
+        let mut traps: Vec<u8> = FN_TRAP.iter().map(|(_, t)| *t).collect();
+        traps.sort_unstable();
+        let n = traps.len();
+        traps.dedup();
+        assert_eq!(traps.len(), n, "duplicate TRAP vector in FN_TRAP");
+        assert!(traps.iter().all(|t| *t <= 15), "68000 traps are 0-15");
+    }
+
+    #[test]
+    fn seek_moves_the_read_position() {
+        let dir = std::env::temp_dir().join("jagemu_gd_seek_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("PACK.SD"), b"0123456789").unwrap();
+        let mut gd = GameDrive::new(&dir);
+
+        let h = gd.fopen("PACK.SD") as u16;
+        assert_eq!(gd.fseek(h, 0, 4), 0); // SET
+        assert_eq!(gd.ftell(h), 4);
+        assert_eq!(&gd.fread(h, 3).unwrap(), b"456");
+        assert_eq!(gd.fseek(h, SEEK_CUR, -2), 0);
+        assert_eq!(&gd.fread(h, 2).unwrap(), b"56");
+        assert_eq!(gd.fseek(h, SEEK_END, 0), 0);
+        assert_eq!(gd.ftell(h), 10);
+        // past the end is clamped, and the read that follows is empty-padded
+        assert_eq!(gd.fseek(h, 0, 999), 0);
+        assert_eq!(gd.ftell(h), 10);
+        assert_eq!(gd.fread(h, 4).unwrap(), vec![0, 0, 0, 0]);
+        assert_eq!(gd.fseek(9999, 0, 0), u32::MAX); // bad handle
+    }
+
+    /// A leading '/' is card-absolute. `PathBuf::join` would discard the
+    /// attached directory and reach for the HOST root — so this guards a path
+    /// escape as much as a lookup failure.
+    #[test]
+    fn card_absolute_paths_resolve_inside_the_attached_directory() {
+        let dir = std::env::temp_dir().join("jagemu_gd_path_test");
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        std::fs::write(dir.join("data").join("pack.bin"), b"hello").unwrap();
+        let mut gd = GameDrive::new(&dir);
+
+        for name in ["/DATA/PACK.BIN", "DATA/PACK.BIN", "/data/pack.bin"] {
+            let h = gd.fopen(name);
+            assert_ne!(h, u32::MAX, "{name} should open");
+            assert_eq!(gd.fsize(h as u16), 5, "{name}");
+        }
+        assert_eq!(gd.fopen("/NOPE.BIN"), u32::MAX);
     }
 
     #[test]

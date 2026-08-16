@@ -555,8 +555,17 @@ impl M68k {
     /// | CARDIN | 9  | —                                   | 1 = card present |
     /// | FOPEN  | 10 | a0=name, d0.w=mode                  | handle, or -1 |
     /// | FCLOSE | 11 | d0.w=handle                         | 0 |
+    /// | FSEEK  | 12 | d0=(flags<<16)|handle, d1=offset    | 0, or -1 |
     /// | FREAD  | 13 | d0=(flags<<16)|handle, a0=buf, d1=n | **0 = success** |
+    /// | FTELL  | 15 | d0.w=handle                         | position |
     /// | FSIZE  | 0  | d0.w=handle                         | size |
+    /// | ASYNCPOS    | 2 | —                              | dst end (a guess) |
+    /// | ASYNCWAIT   | 3 | —                              | 0 (already done) |
+    /// | ASYNCACTIVE | 4 | —                              | 0 (never busy) |
+    ///
+    /// The trap numbers above are NOT the function indices for anything over
+    /// 15 — see `gamedrive::FN_TRAP`, which owns the mapping in both
+    /// directions. Dispatch is on the FUNCTION, resolved through it.
     ///
     /// Returns `None` for a trap we don't own, so it takes the normal path.
     fn gamedrive_trap(&mut self, bus: &mut Bus, trap: u8) -> Option<u32> {
@@ -565,7 +574,7 @@ impl M68k {
         if std::env::var_os("JAGEMU_GD_DEBUG").is_some() {
             eprintln!("GDTRAP #{trap} d0={d0:#010X} d1={d1:#010X} a0={a0:#010X}");
         }
-        let result = match trap {
+        let result = match gd::fn_of_trap(trap)? {
             gd::FN_INIT => 0,
             gd::FN_CARDIN => bus.gamedrive.as_ref()?.card_in(),
             gd::FN_FOPEN => {
@@ -585,11 +594,26 @@ impl M68k {
                     for (i, b) in data.iter().enumerate() {
                         bus.write8(a0.wrapping_add(i as u32), *b);
                     }
+                    // The GPU-async modes land the same bytes, instantly — see
+                    // GameDrive::async_active for why that models logic only.
+                    bus.gamedrive.as_mut()?.set_async_pos(a0.wrapping_add(d1));
                     0 // upstream convention: 0 means SUCCESS, not a byte count
                 }
                 None => u32::MAX,
             },
-            gd::TRAP_FOR_FSIZE => bus.gamedrive.as_ref()?.fsize(d0 as u16),
+            gd::FN_FSIZE => bus.gamedrive.as_ref()?.fsize(d0 as u16),
+            // FSEEK packs the flags into the high half of d0, like FREAD does.
+            gd::FN_FSEEK => {
+                bus.gamedrive
+                    .as_mut()?
+                    .fseek(d0 as u16, (d0 >> 16) as u16, d1 as i32)
+            }
+            gd::FN_FTELL => bus.gamedrive.as_ref()?.ftell(d0 as u16),
+            gd::FN_ASYNCPOS => bus.gamedrive.as_ref()?.async_pos(),
+            // Reads complete synchronously here, so a wait is a no-op and the
+            // engine is never busy.
+            gd::FN_ASYNCWAIT => 0,
+            gd::FN_ASYNCACTIVE => bus.gamedrive.as_ref()?.async_active(),
             _ => return None,
         };
         self.d[0] = result;
