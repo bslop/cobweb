@@ -1083,3 +1083,76 @@ fn store_through_pointer_incremented_in_rhs() {
                  return t[0]*10 + t[1]; }";
     assert_eq!(run(src), 70); // the store lands on t[0], not t[1]
 }
+
+// ─── string-literal initializers, and directives inside parentheses ─────────
+
+#[test]
+fn string_literal_in_static_initializer() {
+    // The address of a string-pool entry is a link-time constant. const_eval
+    // works in i64 and cannot represent one, so these used to be rejected as
+    // "non-constant expression in initializer".
+    let src = "static const char *s = \"Hi\";\
+               int main(){ return s[0] + s[1]; }";
+    assert_eq!(run(src), ('H' as u32) + ('i' as u32));
+}
+
+#[test]
+fn string_literal_table_initializer() {
+    let src = "static const char *const T[2] = { \"AB\", \"CD\" };\
+               int main(){ return T[0][0] + T[1][1]*2; }";
+    assert_eq!(run(src), ('A' as u32) + ('D' as u32) * 2);
+}
+
+#[test]
+fn char_array_initializer_still_copies_bytes() {
+    // A `char[]` destination copies the string; only a pointer takes its
+    // address. This must not have been changed by the pointer case.
+    let src = "static char buf[8] = \"Hi\";\
+               int main(){ return buf[0] + buf[1] + buf[2]; }";
+    assert_eq!(run(src), ('H' as u32) + ('i' as u32)); // buf[2] is the NUL
+}
+
+#[test]
+fn directive_inside_parenthesized_expression() {
+    // An unbalanced '(' used to make the preprocessor swallow the next line as
+    // function-macro argument text, leaving the '#' in the token stream and
+    // macro-expanding the condition's own name.
+    let src = "int g(int x){ return x; }\n\
+               int main(void){\n\
+                 int a=0,b=0;\n\
+                 if (g(1)\n\
+               #ifdef FEAT\n\
+                     && g(0)\n\
+               #endif\n\
+                    ) a=1;\n\
+                 if (g(1)\n\
+               #ifndef FEAT\n\
+                     && g(0)\n\
+               #endif\n\
+                    ) b=1;\n\
+                 return a*10 + b;\n\
+               }\n";
+    assert_eq!(run_pp(src), 10); // FEAT undefined: a=1, b=0
+}
+
+#[test]
+fn directive_inside_call_arguments() {
+    let src = "int h(int a,int b){ return a*10+b; }\n\
+               int main(void){ return h(1,\n\
+               #ifdef FEAT\n\
+                 2\n\
+               #else\n\
+                 3\n\
+               #endif\n\
+                 ); }\n";
+    assert_eq!(run_pp(src), 13);
+}
+
+#[test]
+fn multiline_macro_call_still_gathers_lines() {
+    // The directive guard must not break the reason line-gathering exists.
+    let src = "#define ADD(a,b) ((a)+(b))\n\
+               int main(void){ return ADD(20,\n\
+                 3); }\n";
+    assert_eq!(run_pp(src), 23);
+}

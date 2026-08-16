@@ -486,6 +486,20 @@ impl Parser {
         // Scalar. Try a symbol address first (pointer initializers), else a
         // constant expression.
         let sz = ty.size().max(1);
+        // `const char *s = "…"` — the initializer is the *address* of a string
+        // pool entry, which is a link-time constant. `const_eval` works in i64
+        // and so can never represent one; without this, every table of string
+        // literals was rejected as a non-constant initializer. (A `char[]`
+        // destination copies the bytes instead, and is handled above.)
+        if matches!(&**ty, TypeK::Ptr(_)) {
+            if let Tok::Str(bytes) = self.peek().clone() {
+                self.pos += 1;
+                let idx = self.strings.len();
+                self.strings.push(bytes);
+                out.push(InitByte::Str(idx));
+                return Ok(());
+            }
+        }
         if ty.is_ptr() {
             if let Some((sym, addend)) = self.try_global_addr()? {
                 out.push(InitByte::Addr(sym, addend));
