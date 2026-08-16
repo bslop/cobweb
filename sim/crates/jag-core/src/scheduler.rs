@@ -201,6 +201,7 @@ impl Scheduler {
         // completes and every B_CMD poll spins forever.
         if !gpu.running {
             bus.tom.blit_busy = bus.tom.blit_busy.saturating_sub(risc_ticks.max(0) as u64);
+            bus.tom.blit_settle = bus.tom.blit_settle.saturating_sub(risc_ticks.max(0) as u64);
         }
         dsp.run(bus, budget);
     }

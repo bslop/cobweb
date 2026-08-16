@@ -44,6 +44,10 @@ pub const BLIT_IDLE: u32 = 0x0000_0001;
 /// Accesses are counted in phrases: pixel-mode (XADDPIX/XADDINC) touches one
 /// phrase per pixel; phrase-mode (XADDPHR) packs 64/bpp pixels per phrase.
 const BLIT_LAUNCH_TICKS: u64 = 16;
+/// Ticks after the `B_CMD` store before BUSY is observable on silicon. A poll
+/// inside this window reads a stale IDLE — see `Tom::blit_settle`. Counted,
+/// not yet emulated.
+const BLIT_SETTLE_TICKS: u64 = 6;
 /// Ticks per DRAM phrase access ×10 (5.6), kept integer for exactness.
 const BLIT_ACCESS_TICKS_X10: u64 = 56;
 
@@ -566,6 +570,7 @@ pub fn run(bus: &mut Bus, cmd: u32) {
     bus.tom.last_blit_launch = BLIT_LAUNCH_TICKS;
     bus.tom.last_blit_ticks = BLIT_LAUNCH_TICKS + transfer;
     bus.tom.blit_busy += BLIT_LAUNCH_TICKS + transfer; // asynchronous: drains as wall time passes
+    bus.tom.blit_settle = BLIT_SETTLE_TICKS; // silicon needs this long to show BUSY
 }
 
 #[cfg(test)]

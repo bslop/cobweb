@@ -494,6 +494,7 @@ impl Risc {
             // at double speed.)
             if self.kind == RiscKind::Gpu {
                 bus.tom.blit_busy = bus.tom.blit_busy.saturating_sub(c as u64);
+            bus.tom.blit_settle = bus.tom.blit_settle.saturating_sub(c as u64);
             }
             spent += c;
             // The core can stop itself by clearing RISCGO via a STORE.
