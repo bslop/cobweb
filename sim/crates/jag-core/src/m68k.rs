@@ -575,7 +575,10 @@ impl M68k {
             eprintln!("GDTRAP #{trap} d0={d0:#010X} d1={d1:#010X} a0={a0:#010X}");
         }
         let result = match gd::fn_of_trap(trap)? {
-            gd::FN_INIT => 0,
+            // INIT and InitGPURead have no host-side state to set up; the point
+            // of publishing InitGPURead is that the hardware-correct call
+            // sequence must not fault here. See gamedrive::FN_TRAP.
+            gd::FN_INIT | gd::FN_INITGPUREAD => 0,
             gd::FN_CARDIN => bus.gamedrive.as_ref()?.card_in(),
             gd::FN_FOPEN => {
                 let mut name = String::new();
@@ -589,13 +592,25 @@ impl M68k {
                 bus.gamedrive.as_mut()?.fopen(&name)
             }
             gd::FN_FCLOSE => bus.gamedrive.as_mut()?.fclose(d0 as u16),
+            // GD_FREAD_GPU_ASYNC (flags 2) is METERED when --sd-rate is set:
+            // the bytes arrive a frame at a time, so a loader's wait loop is
+            // genuinely exercised instead of finding the buffer already full.
+            // Every other mode — and rate 0, the default — completes here.
+            gd::FN_FREAD
+                if (d0 >> 16) == gd::FREAD_GPU_ASYNC as u32
+                    && bus.gamedrive.as_ref().is_some_and(|g| g.rate() > 0) =>
+            {
+                if bus.gamedrive.as_mut()?.fread_async_start(d0 as u16, a0, d1) {
+                    0
+                } else {
+                    u32::MAX
+                }
+            }
             gd::FN_FREAD => match bus.gamedrive.as_mut()?.fread(d0 as u16, d1) {
                 Some(data) => {
                     for (i, b) in data.iter().enumerate() {
                         bus.write8(a0.wrapping_add(i as u32), *b);
                     }
-                    // The GPU-async modes land the same bytes, instantly — see
-                    // GameDrive::async_active for why that models logic only.
                     bus.gamedrive.as_mut()?.set_async_pos(a0.wrapping_add(d1));
                     0 // upstream convention: 0 means SUCCESS, not a byte count
                 }
@@ -610,9 +625,12 @@ impl M68k {
             }
             gd::FN_FTELL => bus.gamedrive.as_ref()?.ftell(d0 as u16),
             gd::FN_ASYNCPOS => bus.gamedrive.as_ref()?.async_pos(),
-            // Reads complete synchronously here, so a wait is a no-op and the
-            // engine is never busy.
-            gd::FN_ASYNCWAIT => 0,
+            // Blocking wait: deliver everything still outstanding at once. With
+            // no rate set nothing is ever outstanding, so this is a no-op.
+            gd::FN_ASYNCWAIT => {
+                gd::finish_async(bus);
+                0
+            }
             gd::FN_ASYNCACTIVE => bus.gamedrive.as_ref()?.async_active(),
             _ => return None,
         };

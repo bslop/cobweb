@@ -28,6 +28,9 @@ fn main() -> ExitCode {
     let cmd = args[0].as_str();
     let rest = &args[1..];
     let _ = SD_DIR.set(flag_val(rest, "--sd").map(|s| s.to_string()));
+    if let Some(r) = flag_val(rest, "--sd-rate").and_then(|s| s.parse::<u32>().ok()) {
+        SD_RATE.store(r, std::sync::atomic::Ordering::Relaxed);
+    }
     let result = match cmd {
         "info" => cmd_info(rest),
         "run" => cmd_run(rest),
@@ -94,7 +97,15 @@ fn usage() {
          \x20   cmds: ping state run N step N frame f.png video f.png audio f.wav\n\
          \x20         peek A [--len N] poke A b,b,b input a,up release break A continue N reset disasm A stop\n\
          \n\
-         Input: --press <a,b,c,up,down,left,right,option,start>  --press-after <frame>"
+         Input: --press <a,b,c,up,down,left,right,option,start>  --press-after <frame>\n\
+         \n\
+         GameDrive SD (any command that boots a ROM):\n\
+         \x20 --sd <dir>          serve <dir> as the SD card; the ROM's own GDBIOS\n\
+         \x20                     bindings drive it (fopen/fseek/fread/...)\n\
+         \x20 --sd-rate <bytes>   bytes an ASYNC read delivers per frame. Default 0\n\
+         \x20                     = complete instantly, which exercises a loader's\n\
+         \x20                     logic but NOT its waiting. Set it to make a\n\
+         \x20                     GD_FREAD_GPU_ASYNC transfer actually take time."
     );
 }
 
@@ -202,12 +213,17 @@ fn fidelity_arg(args: &[String]) -> Result<Fidelity, String> {
 /// in `main` so every boot path picks it up.
 static SD_DIR: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
 
+/// `--sd-rate <bytes>`: bytes an async read delivers per frame. 0 = instant.
+static SD_RATE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// Attach the emulated GameDrive if `--sd` was given. Without it the SPI window
 /// floats and `gd_install` fails its bounded waits — i.e. "no GameDrive", which
 /// is exactly the state a ROM must already handle.
 fn attach_sd(jag: &mut Jaguar) {
     if let Some(Some(dir)) = SD_DIR.get() {
-        jag.bus.gamedrive = Some(jag_core::gamedrive::GameDrive::new(dir));
+        let mut gd = jag_core::gamedrive::GameDrive::new(dir);
+        gd.set_rate(SD_RATE.load(std::sync::atomic::Ordering::Relaxed));
+        jag.bus.gamedrive = Some(gd);
     }
 }
 
@@ -1093,7 +1109,7 @@ fn audio_source(path: &str, args: &[String]) -> Result<(u32, u16, Vec<i16>), Str
 fn cmd_audiocheck(args: &[String]) -> Result<(), String> {
     // first true positional: skip flags AND their values
     const VALUE_FLAGS: &[&str] =
-        &["--against", "--frames", "--press", "--press-after", "--sd", "-o", "--out"];
+        &["--against", "--frames", "--press", "--press-after", "--sd", "--sd-rate", "-o", "--out"];
     let mut target = None;
     let mut i = 0;
     while i < args.len() {
