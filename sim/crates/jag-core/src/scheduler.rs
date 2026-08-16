@@ -117,6 +117,12 @@ impl Scheduler {
                 self.frame += 1;
                 bus.frame_mirror = self.frame;
                 self.vi_fired_this_frame = false;
+                // A GameDrive async read delivers its next slice. On hardware
+                // this rides the GPU interrupt during the field; the field
+                // boundary is the coarsest granularity at which a loader's
+                // wait loop still behaves the same, and it keeps the model
+                // deterministic. No-op unless --sd-rate is set.
+                crate::gamedrive::tick_frame(bus);
                 // Liveness: a core still running here has not stopped all field.
                 gpu.note_frame();
                 dsp.note_frame();

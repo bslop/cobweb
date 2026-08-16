@@ -26,6 +26,40 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+/// Advance the metered async transfer by one frame's worth and write those bytes
+/// into memory. Call at the field boundary.
+///
+/// A free function rather than a method because the device lives inside the bus
+/// it has to write to: `advance_frame` hands back owned bytes so the borrow on
+/// `bus.gamedrive` ends before `bus.write8` begins.
+pub fn tick_frame(bus: &mut crate::bus::Bus) {
+    let Some(gd) = bus.gamedrive.as_mut() else {
+        return;
+    };
+    if gd.rate() == 0 {
+        return;
+    }
+    let Some((at, chunk)) = gd.advance_frame() else {
+        return;
+    };
+    for (i, b) in chunk.iter().enumerate() {
+        bus.write8(at.wrapping_add(i as u32), *b);
+    }
+}
+
+/// Drain whatever is left of the transfer in flight, immediately (FN_ASYNCWAIT).
+pub fn finish_async(bus: &mut crate::bus::Bus) {
+    let Some(gd) = bus.gamedrive.as_mut() else {
+        return;
+    };
+    let Some((at, chunk)) = gd.finish_async() else {
+        return;
+    };
+    for (i, b) in chunk.iter().enumerate() {
+        bus.write8(at.wrapping_add(i as u32), *b);
+    }
+}
+
 pub const SPI_STATUS: u32 = 0xF1_6002;
 pub const SPI_DATA: u32 = 0xF1_6004;
 pub const SPI_DATAB: u32 = 0xF1_6005;
@@ -41,11 +75,15 @@ const CMD_GETBIOS: u8 = 0x80;
 const SEEK_CUR: u16 = 1;
 const SEEK_END: u16 = 2;
 
+/// `GD_FRead` flags: 0 CPU, 1 GPU, 2 GPU async. Only the async mode is metered.
+pub const FREAD_GPU_ASYNC: u16 = 2;
+
 /// Firmware version reported to the probe. `gd_install` requires >= 0x111.
 const FIRMWARE: u16 = 0x0111;
 
 /// Function indices, from the bindings (`JagGD/gdbios_bindings.s`).
 pub const FN_INIT: u8 = 1;
+pub const FN_INITGPUREAD: u8 = 2;
 pub const FN_CARDIN: u8 = 9;
 pub const FN_FOPEN: u8 = 10;
 pub const FN_FCLOSE: u8 = 11;
@@ -73,8 +111,14 @@ const BIOS_BLOCK: usize = 512;
 /// through `fn_of_trap`. Two hand-maintained lists would silently drift, and a
 /// drifted entry means a file call quietly vectors to the wrong operation —
 /// which looks like corrupt data, not like a dispatch bug.
-pub const FN_TRAP: [(u8, u8); 11] = [
+pub const FN_TRAP: [(u8, u8); 12] = [
     (FN_INIT, 1),
+    // GD_InitGPURead. A no-op here, but it MUST have a thunk: on hardware the
+    // async read modes do nothing until it installs the GPU interrupt handler,
+    // so correct ROM code calls it first. With no entry, `jsr 8(%a6)` lands on
+    // zeros — i.e. the hardware-correct sequence would be the one that crashes,
+    // pushing authors toward code that only works here.
+    (FN_INITGPUREAD, 5),
     (FN_CARDIN, 9),
     (FN_FOPEN, 10),
     (FN_FCLOSE, 11),
@@ -121,6 +165,20 @@ struct OpenFile {
     pos: usize,
 }
 
+/// A `GD_FREAD_GPU_ASYNC` transfer in flight.
+///
+/// On real hardware this runs on the GPU interrupt, 32 bytes per service, while
+/// the game keeps drawing — so the bytes appear in the destination buffer over
+/// many frames. Modelling that is the difference between checking a loader's
+/// control flow and being able to answer "does the cutscene cover the load?".
+struct AsyncXfer {
+    dst: u32,
+    /// Bytes still to deliver, in order.
+    rest: std::collections::VecDeque<u8>,
+    /// Bytes already written, so `FAsyncPos` can advance.
+    done: u32,
+}
+
 /// The emulated GameDrive.
 pub struct GameDrive {
     /// Host directory backing the SD card.
@@ -143,8 +201,14 @@ pub struct GameDrive {
     files: HashMap<u16, OpenFile>,
     next_handle: u16,
     /// Destination end of the last read, reported by FN_ASYNCPOS. See
-    /// `async_pos()` for why this is a guess.
+    /// `async_pos()` for why the units are a guess.
     async_pos: u32,
+    /// Bytes an async read delivers per frame. **0 = complete instantly**, which
+    /// is the default and the historical behaviour: a run that does not ask for
+    /// a transfer model must not silently get one.
+    rate: u32,
+    /// The transfer in flight, if any (at most one — the hardware has one DMA).
+    xfer: Option<AsyncXfer>,
 }
 
 impl GameDrive {
@@ -161,12 +225,77 @@ impl GameDrive {
             files: HashMap::new(),
             next_handle: 1,
             async_pos: 0,
+            rate: 0,
+            xfer: None,
         }
+    }
+
+    /// Bytes a `GD_FREAD_GPU_ASYNC` read delivers per frame (`--sd-rate`).
+    /// 0 keeps the instant-completion model.
+    pub fn set_rate(&mut self, bytes_per_frame: u32) {
+        self.rate = bytes_per_frame;
+    }
+
+    /// Is a transfer model in effect at all?
+    pub fn rate(&self) -> u32 {
+        self.rate
     }
 
     /// Record where a completed read finished writing, for FN_ASYNCPOS.
     pub fn set_async_pos(&mut self, dst_end: u32) {
         self.async_pos = dst_end;
+    }
+
+    /// Begin a metered async read: the bytes are captured now (the file position
+    /// advances immediately, as it does on hardware — the DMA owns them) but are
+    /// handed to memory a frame at a time by `advance_frame`.
+    ///
+    /// Returns `false` if the handle is bad, in which case nothing starts.
+    pub fn fread_async_start(&mut self, handle: u16, dst: u32, n: u32) -> bool {
+        let Some(data) = self.fread(handle, n) else {
+            return false;
+        };
+        self.async_pos = dst;
+        self.xfer = Some(AsyncXfer {
+            dst,
+            rest: data.into_iter().collect(),
+            done: 0,
+        });
+        true
+    }
+
+    /// Deliver up to `rate` more bytes of the transfer in flight. Returns the
+    /// destination address and the bytes to write there, or `None` when there is
+    /// nothing in flight. Call once per frame.
+    pub fn advance_frame(&mut self) -> Option<(u32, Vec<u8>)> {
+        let rate = self.rate.max(1) as usize;
+        let x = self.xfer.as_mut()?;
+        let take = rate.min(x.rest.len());
+        let chunk: Vec<u8> = x.rest.drain(..take).collect();
+        let at = x.dst.wrapping_add(x.done);
+        x.done += take as u32;
+        self.async_pos = x.dst.wrapping_add(x.done);
+        if x.rest.is_empty() {
+            self.xfer = None;
+        }
+        if chunk.is_empty() {
+            None
+        } else {
+            Some((at, chunk))
+        }
+    }
+
+    /// FN_ASYNCWAIT — deliver everything still outstanding, at once.
+    pub fn finish_async(&mut self) -> Option<(u32, Vec<u8>)> {
+        let x = self.xfer.take()?;
+        let at = x.dst.wrapping_add(x.done);
+        self.async_pos = x.dst.wrapping_add(x.done + x.rest.len() as u32);
+        let chunk: Vec<u8> = x.rest.into_iter().collect();
+        if chunk.is_empty() {
+            None
+        } else {
+            Some((at, chunk))
+        }
     }
 
     /// `SPI_STATUS` read: HAVE_DATA in bit 3; never busy (bit 15), no stale
@@ -337,26 +466,26 @@ impl GameDrive {
         self.files.get(&handle).map(|f| f.pos as u32).unwrap_or(u32::MAX)
     }
 
-    /// FN_ASYNCACTIVE — always 0 (idle).
+    /// FN_ASYNCACTIVE — nonzero while a metered transfer is still in flight.
     ///
-    /// ⚠️ **The async path is modelled as INSTANT, so this emulator validates
-    /// the LOGIC of a streaming loader and tells you NOTHING about its
-    /// latency.** A real `GD_FREAD_GPU_ASYNC` runs on the GPU interrupt over
-    /// many frames; here the bytes are already in the buffer by the time the
-    /// call returns. A double buffer therefore never actually overlaps, and a
-    /// loader that deadlocks waiting on real transfer time will still pass.
-    /// Timing is a hardware question.
+    /// ⚠️ **Without `--sd-rate` this is always 0**, because reads then complete
+    /// inside the trap. That default validates a loader's LOGIC and says nothing
+    /// about its latency: a double buffer never actually overlaps, and a loader
+    /// that deadlocks waiting on real transfer time still passes. Set a rate to
+    /// exercise the wait path; the rate itself is your estimate of the card, not
+    /// a measured constant.
     pub fn async_active(&self) -> u32 {
-        0
+        u32::from(self.xfer.is_some())
     }
 
     /// FN_ASYNCPOS — how far the async read has got.
     ///
     /// ⚠️ The vendor bindings document this only as "current async GPU read
     /// position" and do not say whether that is a FILE offset or a DESTINATION
-    /// address. We return the destination end (`dst + n` of the last read),
-    /// which is what a double-buffer consumer compares against — but this is a
-    /// GUESS, unverified on silicon. **Prefer `GD_FAsyncActive`/`GD_FAsyncWait`
+    /// address. We return the destination pointer reached so far, which is what
+    /// a double-buffer consumer compares against — but the UNITS are a GUESS,
+    /// unverified on silicon, and no ROM in the corpus uses the call, so there
+    /// was nothing to infer it from. **Prefer `GD_FAsyncActive`/`GD_FAsyncWait`
     /// in ROM code**, whose meaning is unambiguous either way.
     pub fn async_pos(&self) -> u32 {
         self.async_pos
@@ -436,6 +565,68 @@ mod tests {
         assert_eq!(gd.ftell(h), 10);
         assert_eq!(gd.fread(h, 4).unwrap(), vec![0, 0, 0, 0]);
         assert_eq!(gd.fseek(9999, 0, 0), u32::MAX); // bad handle
+    }
+
+    /// With a rate set, an async read must NOT be finished when it returns —
+    /// that is the whole point. A model that delivers everything up front makes
+    /// a loader that never waits look correct.
+    #[test]
+    fn metered_async_delivers_over_several_frames() {
+        let dir = std::env::temp_dir().join("jagemu_gd_rate_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("PACK.BIN"), (0u8..100).collect::<Vec<u8>>()).unwrap();
+        let mut gd = GameDrive::new(&dir);
+        gd.set_rate(32);
+
+        let h = gd.fopen("PACK.BIN") as u16;
+        assert!(gd.fread_async_start(h, 0x1000, 100));
+        assert_eq!(gd.async_active(), 1, "busy the moment it starts");
+        assert_eq!(gd.async_pos(), 0x1000, "nothing delivered yet");
+
+        // 100 bytes at 32/frame = 4 frames (32, 32, 32, 4).
+        let mut got = Vec::new();
+        let mut frames = 0;
+        while let Some((at, chunk)) = gd.advance_frame() {
+            assert_eq!(at as usize, 0x1000 + got.len(), "chunks are contiguous");
+            got.extend_from_slice(&chunk);
+            frames += 1;
+        }
+        assert_eq!(frames, 4);
+        assert_eq!(got, (0u8..100).collect::<Vec<u8>>());
+        assert_eq!(gd.async_active(), 0, "idle once drained");
+        assert_eq!(gd.async_pos(), 0x1000 + 100);
+    }
+
+    /// `GD_FAsyncWait` must hand over everything outstanding at once, or a ROM
+    /// that waits instead of polling hangs forever.
+    #[test]
+    fn async_wait_drains_the_remainder() {
+        let dir = std::env::temp_dir().join("jagemu_gd_wait_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("PACK.BIN"), vec![0xAAu8; 100]).unwrap();
+        let mut gd = GameDrive::new(&dir);
+        gd.set_rate(10);
+
+        let h = gd.fopen("PACK.BIN") as u16;
+        gd.fread_async_start(h, 0x2000, 100);
+        let (_, first) = gd.advance_frame().unwrap();
+        assert_eq!(first.len(), 10);
+
+        let (at, rest) = gd.finish_async().unwrap();
+        assert_eq!(at, 0x2000 + 10);
+        assert_eq!(rest.len(), 90);
+        assert_eq!(gd.async_active(), 0);
+        assert!(gd.finish_async().is_none(), "nothing left to drain");
+    }
+
+    /// Rate 0 is the default and must keep the old behaviour exactly: no
+    /// transfer is ever in flight, so existing runs are unaffected.
+    #[test]
+    fn rate_zero_never_starts_a_transfer() {
+        let mut gd = GameDrive::new(".");
+        assert_eq!(gd.rate(), 0);
+        assert_eq!(gd.async_active(), 0);
+        assert!(gd.advance_frame().is_none());
     }
 
     /// A leading '/' is card-absolute. `PathBuf::join` would discard the
