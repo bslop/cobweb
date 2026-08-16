@@ -34,6 +34,12 @@ struct Acc {
     slow: bool,
     /// If this is an indexed store, the DATA register it does NOT scoreboard.
     indexed_store_data: Option<u8>,
+    /// This instruction's ONLY operand is the DESTINATION field (reg2) — neg,
+    /// not, abs, the quick-immediate ALU ops and shifts. It reads and writes the
+    /// same register, but its read sits in the field the scoreboard does not
+    /// interlock, so it does not settle a pending divide. See the [HW] note in
+    /// `check`.
+    rmw_dst_only: bool,
     op: u8,
 }
 
@@ -46,6 +52,7 @@ fn classify(e: &Emitted) -> Option<Acc> {
     let mut write = None;
     let mut slow = false;
     let mut indexed_store_data = None;
+    let mut rmw_dst_only = false;
     let dsp = e.target == crate::Target::Dsp;
 
     match op {
@@ -59,11 +66,13 @@ fn classify(e: &Emitted) -> Option<Acc> {
         2 | 3 | 6 | 7 | 14 | 15 | 24 | 25 | 27 | 29 => {
             reads.push(r2);
             write = Some(r2);
+            rmw_dst_only = true;
         }
         // neg/not/abs
         8 | 12 | 22 => {
             reads.push(r2);
             write = Some(r2);
+            rmw_dst_only = true;
         }
         13 => reads.push(r2),               // btst
         18 => {
@@ -190,7 +199,7 @@ fn classify(e: &Emitted) -> Option<Acc> {
         }
         _ => {}
     }
-    Some(Acc { reads, write, slow, indexed_store_data, op })
+    Some(Acc { reads, write, slow, indexed_store_data, rmw_dst_only, op })
 }
 
 fn is_jump(op: u8) -> bool {
@@ -313,6 +322,55 @@ pub fn check(emitted: &[Emitted]) -> Vec<Diag> {
                             p.line
                         ),
                     ).with_fix(format!("touch the register first, e.g. `or r{data},r{data}` (a `move r{data},r{data}` also counts), so the scoreboard settles it")));
+                }
+            }
+        }
+
+        // ☠️ A READ DOES NOT ALWAYS SETTLE THE SCOREBOARD. Checked here, BEFORE
+        // the read-settles loop below, for the same reason the indexed-store
+        // check is: once that loop runs the pending entry is gone.
+        //
+        // [HW] `div rX,r0` followed six instructions later by `neg r0` — inside
+        // the shadow — drew a stray polygon edge on a Skunkboard, 296 px across
+        // 7 columns, that no emulator reproduced. The negate landed first and
+        // the divide's cycle-18 write discarded it, so a negative delta kept a
+        // positive step. Reading the quotient into a scratch register first (a
+        // real source-field read, which does interlock) fixed it on the bench.
+        //
+        // jas reported that code as CLEAN, because `neg` reads r0 and a read
+        // settles the scoreboard. The mechanism that explains the divergence:
+        // the interlock is on the SOURCE field, and neg/not/abs and the
+        // quick-immediate ALU ops encode their only operand in the DESTINATION
+        // field — so their "read" sits in the field the erratum says carries no
+        // protection ("no score-board protection applies to writes").
+        //
+        // A WARNING, not an error: the silicon evidence is a single project's
+        // `neg` case, and extending it to the rest of the class is by mechanism
+        // rather than by measurement. Deliberately silent for a LOAD shadow —
+        // inventing a case the bench has not shown would be exactly the
+        // over-reporting the flow rules above exist to remove.
+        if acc.rmw_dst_only {
+            if let Some(w) = acc.write {
+                if let Some(p) = pending.get(&w) {
+                    if p.is_div && in_shadow(p) {
+                        diags.push(
+                            Diag::warn(
+                                e.line,
+                                format!(
+                                    "r{w} is read-modify-written inside the DIVIDE shadow from \
+                                     line {} — its operand is the destination field, which the \
+                                     scoreboard does not interlock, so the divide's late write \
+                                     can land AFTER this one and discard the result \
+                                     [HW: seen on silicon, invisible in emulation]",
+                                    p.line
+                                ),
+                            )
+                            .with_fix(format!(
+                                "read the quotient into a scratch first (`move r{w},rT` stalls \
+                                 correctly), operate on that, then write it back"
+                            )),
+                        );
+                    }
                 }
             }
         }
