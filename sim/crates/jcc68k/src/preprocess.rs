@@ -149,6 +149,25 @@ impl Pp {
                 // lines to close its parenthesis; gather them.
                 let mut text = raw.clone();
                 while needs_more_lines(&text) && i + 1 < lines.len() {
+                    // Never swallow a directive as macro-argument text. The
+                    // "unbalanced (" test cannot tell a function-macro call
+                    // from an ordinary parenthesized expression, and a
+                    // conditional spanning the operands of an `if (...)` is
+                    // both legal and common:
+                    //
+                    //     if (a(x) &&
+                    //     #ifdef FEAT
+                    //         b(x) &&
+                    //     #endif
+                    //         c(x))
+                    //
+                    // Absorbing those lines left the `#` in the token stream
+                    // and macro-expanded the condition's name along with it.
+                    // (A directive inside a real macro argument list is
+                    // undefined behaviour in C, so nothing legal is lost.)
+                    if lines[i + 1].0.trim_start().starts_with('#') {
+                        break;
+                    }
                     i += 1;
                     text.push('\n');
                     text.push_str(&lines[i].0);
