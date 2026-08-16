@@ -239,7 +239,15 @@ pub struct TimingStats {
     /// checked against subtractive silicon probes.
     pub blit: u64,
     /// Launch-overhead component of `blit` (BLIT_LAUNCH_TICKS per B_CMD).
+    ///
+    /// ⚠️ This is a TICK total, not a number of blits — the name reads like a
+    /// count and has been misread as one by more than one project. Use
+    /// `blit_count` for the number of blits.
     pub blit_launch: u64,
+    /// Number of blits LAUNCHED (one per B_CMD store that started a blit).
+    /// A plain count, so no caller has to divide `blit_launch` by an internal
+    /// constant to recover it.
+    pub blit_count: u64,
     /// Transfer component of `blit` (phrase-access ticks).
     pub blit_transfer: u64,
     /// Ticks this core spent executing loads of B_CMD that OBSERVED BUSY —
