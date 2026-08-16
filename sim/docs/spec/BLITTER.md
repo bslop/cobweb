@@ -583,6 +583,14 @@ kernel in the corpus was written against the forgiving model, and switching it
 on globally would break working code to expose a hazard those programs may not
 have.
 
+**A zero count is width-independent; a non-zero count is not** [jag_quake,
+2026-08-16]. The six-tick window is a reading of "several cycles" from the
+porting notes, not a measured figure. But a kernel whose `bcmd_poll_in_settle`
+is **zero** never reads `B_CMD` inside the window at all, so the hazard cannot
+reach it *at any window width* — that is a proof, and it does not depend on the
+estimate being right. A non-zero count is only as trustworthy as the six ticks,
+and wants a bench measurement of the real window before it is acted on.
+
 **Short-span optimization** [reference backend]: spans ≤ `SPAN_CPU_LIMIT` (=12
 pixels) are filled by the CPU directly — register setup (≈8–10 writes) + the idle
 poll costs more than a dozen word stores. Spec doesn't mandate this; it's a
