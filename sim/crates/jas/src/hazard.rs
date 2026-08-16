@@ -15,7 +15,9 @@
 //! * **nop+nop after a jump** (warning): the old two-NOP convention wasting a
 //!   real delay slot.
 //!
-//! The model is linear (one pass, straight-line) — it does not follow branches,
+//! The model is linear (one pass, straight-line) — it does not follow branches
+//! (though an UNCONDITIONAL jump does end the fall-through, and the shadow
+//! state is cleared after its delay slot),
 //! so it catches the local hazards that dominate hand and compiled JRISC. Its
 //! rules are the same ones jsim's timing model enforces, so the assembler and
 //! the simulator agree on what is dangerous.
@@ -205,8 +207,37 @@ pub fn check(emitted: &[Emitted]) -> Vec<Diag> {
     // look at the delay slot (the next instruction).
     let insns: Vec<&Emitted> = emitted.iter().filter(|e| e.op.is_some()).collect();
 
+    // ☠️ LINEAR FLOW ENDS AT AN UNCONDITIONAL JUMP. The pass is straight-line
+    // (see the note at the top), and that produced FALSE ERRORS on real code:
+    // a routine that loads r24..r27 down one branch, jumps away, and loads the
+    // same registers again in the ALTERNATIVE branch was reported as four
+    // bug-13 write-after-write races - even though the two blocks can never
+    // both run. Refusing correct code is worse than the warning it saves, and
+    // it was blocking gpu_bltex.gas / gpu_textured.gas from assembling at all.
+    // Clearing the shadow after `jump T` / `jr T` (plus its delay slot) is not
+    // merely conservative, it is CORRECT: execution does not continue past it,
+    // so nothing after it is in the shadow of a producer before it.
+    // ★ This is still not a CFG. Code reached only by a branch may inherit a
+    // shadow this pass cannot see; a real basic-block analysis is the proper
+    // fix and is worth doing when the assembler grows one.
+    let mut clear_after: Option<usize> = None;
     for (i, e) in insns.iter().enumerate() {
         let Some(acc) = classify(e) else { continue };
+
+        if let Some(at) = clear_after {
+            if i > at {
+                pending.clear();
+                clear_after = None;
+            }
+        }
+        // op 52 = JUMP (addr reg), 53 = JR (offset); the condition is the low
+        // field and 0x00 is "always" (encode.rs: "t" | "" | "always" => 0x00).
+        if is_jump(acc.op) {
+            let cc = (*e.words.first().unwrap_or(&0)) & 0x1F;
+            if cc == 0 {
+                clear_after = Some(i + 1);   // +1: the delay slot still runs
+            }
+        }
 
         // Delay-slot content check: look at what follows a jump.
         if is_jump(acc.op) {
