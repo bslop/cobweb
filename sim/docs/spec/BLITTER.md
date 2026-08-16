@@ -568,6 +568,21 @@ On BigPEmu, busy-polling DRAM while the coprocessor runs starves its thread; idl
 polling of the **register** is fine, but the architecture should sync loosely (one
 big autonomous job + interrupt), not per-primitive [porting notes §1, §3].
 
+**jsim's model of the settle window** [jag_rr, 2026-08-16]: on silicon the
+blitter takes several cycles after the `B_CMD` store before BUSY is
+observable, so a poll issued immediately after start reads a **stale IDLE** and
+the next register write lands inside a running blit. jsim arms `blit_busy` at
+`B_CMD`-write time, so by default BUSY appears instantaneously and **this
+hazard is invisible here** — a divergence in the forgiving direction, meaning
+poll-after-start bugs only ever surface on hardware.
+
+The `bcmd_poll_in_settle` counter always reports polls landing inside the
+window. Set **`JAGEMU_BLIT_SETTLE=1`** to also reproduce the behaviour, so such
+a poll reads IDLE as it would on silicon. It is off by default because every
+kernel in the corpus was written against the forgiving model, and switching it
+on globally would break working code to expose a hazard those programs may not
+have.
+
 **Short-span optimization** [reference backend]: spans ≤ `SPAN_CPU_LIMIT` (=12
 pixels) are filled by the CPU directly — register setup (≈8–10 writes) + the idle
 poll costs more than a dozen word stores. Spec doesn't mandate this; it's a

@@ -165,6 +165,17 @@ pub struct Tom {
     /// stale IDLE would break programs that currently work against the
     /// forgiving model, so that belongs behind a fidelity setting.
     pub blit_settle: u64,
+    /// Reproduce the BUSY-assertion window faithfully: a `B_CMD` status read
+    /// inside it returns **IDLE**, as silicon does, so a poll-after-start
+    /// misbehaves here the way it misbehaves on hardware.
+    ///
+    /// Default **off**. The forgiving model is what every existing kernel in
+    /// the corpus was written and tested against, and switching it on globally
+    /// would break working code in four other projects to fix a hazard none of
+    /// them may have. Opt in with `jagemu --blit-settle-faithful`; the
+    /// `bcmd_poll_in_settle` counter reports the condition either way, so the
+    /// diagnostic costs nothing and the behaviour change is a deliberate act.
+    pub blit_settle_faithful: bool,
 }
 
 impl Tom {
@@ -180,6 +191,12 @@ impl Tom {
             last_blit_launch: 0,
             blit_busy: 0,
             blit_settle: 0,
+            // Off unless explicitly asked for. Matches the existing
+            // JAGEMU_BLIT_TRACE precedent rather than threading a parameter
+            // through every machine-construction site.
+            blit_settle_faithful: std::env::var("JAGEMU_BLIT_SETTLE")
+                .map(|v| v == "1")
+                .unwrap_or(false),
         }
     }
 }
@@ -543,10 +560,14 @@ impl Bus {
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             if self.tom.blit_settle > 0 {
-                // Silicon would still read IDLE here and the program would
-                // corrupt the in-flight blit. Count it rather than emulate it.
                 self.bcmd_poll_in_settle
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if self.tom.blit_settle_faithful {
+                    // Silicon has not asserted BUSY yet: the poll reads a
+                    // stale IDLE and the caller will happily scribble into a
+                    // running blit.
+                    return crate::tom::blit::BLIT_IDLE;
+                }
             }
             return if self.tom.blit_busy > 0 {
                 crate::tom::blit::BLIT_IDLE & !1
