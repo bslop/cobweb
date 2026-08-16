@@ -39,6 +39,19 @@ pub struct Gen {
     /// Data registers available to the eval stack this function (the callee-saved
     /// set minus any [`reg_of`] has claimed for a local).
     dpool: Vec<&'static str>,
+    /// Same, for held lvalue addresses (the callee-saved address registers minus
+    /// any claimed by a pointer local).
+    apool: Vec<&'static str>,
+}
+
+/// Whether a register name denotes an address register (A0–A7).
+///
+/// These are not interchangeable with data registers on the 68000: they are
+/// illegal as the source of AND/OR/EOR, `tst`/byte ops don't accept them, and
+/// arithmetic into one is spelled `adda`. Every site that emits an instruction
+/// naming a [`Gen::reg_of`] register has to ask.
+fn is_areg(r: &str) -> bool {
+    r.as_bytes().first() == Some(&b'a') && r.len() == 2 && r.as_bytes()[1].is_ascii_digit()
 }
 
 /// Callee-saved data registers used as the expression eval stack (they survive
@@ -46,6 +59,59 @@ pub struct Gen {
 const DTEMP_REGS: &[&str] = &["d2", "d3", "d4", "d5", "d6", "d7"];
 /// Callee-saved address registers for held lvalue addresses.
 const ATEMP_REGS: &[&str] = &["a2", "a3", "a4", "a5"];
+
+/// A 68000 effective address that a load/store can name directly.
+///
+/// The point of this type is that the 68000 encodes a 16-bit displacement in
+/// the instruction for free, so a struct-field offset or a frame slot costs
+/// nothing extra. Materializing every address into A0 first (`move.l d0,a0` +
+/// `adda.l #off,a0` + `move.l (a0),d0`) spends three instructions on what
+/// `move.l off(a0),d0` does in one. [`Gen::addr_ea`] builds these instead.
+#[derive(Clone, Debug, PartialEq)]
+enum Ea {
+    /// `off(areg)`, rendered `(areg)` when the displacement is zero.
+    Disp(i32, String),
+    /// `sym+off` — absolute long.
+    Abs(String, i32),
+}
+
+impl Ea {
+    fn render(&self) -> String {
+        match self {
+            Ea::Disp(0, r) => format!("({r})"),
+            Ea::Disp(o, r) => format!("{o}({r})"),
+            Ea::Abs(s, 0) => s.clone(),
+            Ea::Abs(s, o) if *o > 0 => format!("{s}+{o}"),
+            Ea::Abs(s, o) => format!("{s}{o}"), // negative prints its own sign
+        }
+    }
+
+    /// Whether this address survives evaluating an arbitrary subexpression.
+    /// A6 is the frame pointer and absolutes are link-time constants; A0 is
+    /// caller-saved scratch that any nested call or helper will clobber.
+    fn is_stable(&self) -> bool {
+        match self {
+            Ea::Disp(_, r) => r == "a6",
+            Ea::Abs(..) => true,
+        }
+    }
+
+    /// The 68000 displacement field is a signed 16-bit word.
+    fn disp_ok(off: i32) -> bool {
+        (-32768..=32767).contains(&off)
+    }
+
+    /// This address plus a constant byte offset, when it still encodes.
+    fn plus(&self, d: i32) -> Option<Ea> {
+        match self {
+            Ea::Disp(o, r) => {
+                let n = o.checked_add(d)?;
+                Ea::disp_ok(n).then(|| Ea::Disp(n, r.clone()))
+            }
+            Ea::Abs(s, o) => Some(Ea::Abs(s.clone(), o.checked_add(d)?)),
+        }
+    }
+}
 
 /// A short, stable per-unit tag from the program's strings and symbol names, so
 /// two distinct translation units don't emit colliding string-pool labels.
@@ -80,6 +146,7 @@ pub fn generate(prog: &Program) -> Result<String, String> {
         atemp: 0,
         reg_of: HashMap::new(),
         dpool: Vec::new(),
+        apool: Vec::new(),
     };
     for gl in &prog.globals {
         g.globals.insert(gl.name.clone(), gl.ty.clone());
@@ -397,7 +464,7 @@ impl Gen {
     }
     /// Save A0 (a held lvalue address) onto the address eval stack.
     fn push_atemp(&mut self) -> String {
-        let slot = ATEMP_REGS.get(self.atemp).map(|r| r.to_string()).unwrap_or_else(|| "-(a7)".into());
+        let slot = self.apool.get(self.atemp).map(|r| r.to_string()).unwrap_or_else(|| "-(a7)".into());
         self.line(&format!("move.l a0,{slot}"));
         self.atemp += 1;
         slot
@@ -454,13 +521,28 @@ impl Gen {
         // hottest first; then drop duplicates (a param appears in both lists).
         cand.sort_by(|a, b| refs[b.0].cmp(&refs[a.0]).then(a.0.cmp(b.0)));
         cand.dedup_by(|a, b| a.0 == b.0);
-        const LOCAL_REGS: &[&str] = &["d7", "d6", "d5", "d4"];
+        // Pointers go to ADDRESS registers, everything else to data registers.
+        // This is the difference between `move.l 8(a2),d0` and the three-step
+        // `move.l d6,d0 / move.l d0,a0 / move.l 8(a0),d0` — a pointer parked in
+        // a data register has to be ferried into A0 before every single
+        // dereference, which is most of what struct-walking code does.
+        const LOCAL_DREGS: &[&str] = &["d7", "d6", "d5", "d4"];
+        // A5 is deliberately left out: the eval stack needs at least one address
+        // register for held lvalue addresses before it starts spilling to A7.
+        const LOCAL_AREGS: &[&str] = &["a2", "a3", "a4"];
         let mut claimed: Vec<&str> = Vec::new();
-        for ((n, _), &r) in cand.iter().zip(LOCAL_REGS) {
+        let (ptrs, others): (Vec<_>, Vec<_>) =
+            cand.iter().partition(|(_, t)| matches!(&***t, TypeK::Ptr(_)));
+        for ((n, _), &r) in ptrs.iter().zip(LOCAL_AREGS) {
+            self.reg_of.insert(n.to_string(), r.to_string());
+            claimed.push(r);
+        }
+        for ((n, _), &r) in others.iter().zip(LOCAL_DREGS) {
             self.reg_of.insert(n.to_string(), r.to_string());
             claimed.push(r);
         }
         self.dpool = DTEMP_REGS.iter().copied().filter(|r| !claimed.contains(r)).collect();
+        self.apool = ATEMP_REGS.iter().copied().filter(|r| !claimed.contains(r)).collect();
 
         let param_names: std::collections::HashSet<&str> =
             f.params.iter().map(|(n, _)| n.as_str()).collect();
@@ -762,12 +844,12 @@ impl Gen {
             }
             ExprK::Var(_) | ExprK::Unary(UnOp::Deref, _) | ExprK::Member(..) => {
                 // lvalue → load its value
-                self.gen_addr(e)?;
-                self.load(&e.ty);
+                let ea = self.addr_ea(e)?;
+                self.load_ea(&e.ty, &ea);
             }
             ExprK::Unary(UnOp::Addr, inner) => {
-                self.gen_addr(inner)?;
-                self.line("move.l a0,d0");
+                let ea = self.addr_ea(inner)?;
+                self.ea_addr_to_d0(&ea);
             }
             ExprK::Unary(UnOp::Neg, a) => {
                 self.gen_expr(a)?;
@@ -797,12 +879,21 @@ impl Gen {
                         return Ok(());
                     }
                 }
-                self.gen_addr(lhs)?;
-                let slot = self.push_atemp(); // hold dest addr in a callee-saved areg
-                self.gen_expr(rhs)?; // value in D0
-                self.cast(&rhs.ty, &lhs.ty); // implicit conversion (int↔fixed, widen)
-                self.pop_atemp_to(&slot, "a0"); // restore dest
-                self.store(&lhs.ty);
+                let ea = self.addr_ea(lhs)?;
+                if self.ea_stable_across(&ea, rhs) {
+                    // A frame slot or absolute cannot be disturbed by evaluating
+                    // the RHS, so it needs no address register held across it.
+                    self.gen_expr(rhs)?; // value in D0
+                    self.cast(&rhs.ty, &lhs.ty); // implicit conversion (int↔fixed, widen)
+                    self.store_ea(&lhs.ty, &ea);
+                } else {
+                    self.materialize_ea(&ea);
+                    let slot = self.push_atemp(); // hold dest addr in a callee-saved areg
+                    self.gen_expr(rhs)?; // value in D0
+                    self.cast(&rhs.ty, &lhs.ty);
+                    self.pop_atemp_to(&slot, "a0"); // restore dest
+                    self.store(&lhs.ty);
+                }
                 // result of assignment is the stored value (already in D0)
             }
             ExprK::PostIncDec(lhs, delta) => {
@@ -811,18 +902,21 @@ impl Gen {
                         // register local: result is the old value, then adjust
                         self.line(&format!("move.l {r},d0"));
                         self.load_imm_into("d1", *delta as i32);
-                        self.line(&format!("add.l d1,{r}"));
+                        // adding into an address register is ADDA, not ADD
+                        let add = if is_areg(&r) { "adda.l" } else { "add.l" };
+                        self.line(&format!("{add} d1,{r}"));
                         return Ok(());
                     }
                 }
-                self.gen_addr(lhs)?;
-                let aslot = self.push_atemp(); // hold dest addr
-                self.load(&lhs.ty); // old value in D0
+                // The EA is computed once and reused for both the load and the
+                // store: nothing between them touches A0, so the address never
+                // needs parking in a callee-saved register.
+                let ea = self.addr_ea(lhs)?;
+                self.load_ea(&lhs.ty, &ea); // old value in D0
                 let dslot = self.push_dtemp(); // hold old value (the result)
                 self.load_imm_into("d1", *delta as i32);
                 self.line("add.l d1,d0");
-                self.pop_atemp_to(&aslot, "a0"); // dest addr
-                self.store(&lhs.ty);
+                self.store_ea(&lhs.ty, &ea);
                 self.pop_dtemp_to(&dslot, "d0"); // result = old value
             }
             ExprK::Comma(a, b) => {
@@ -881,8 +975,17 @@ impl Gen {
                     self.gen_expr(b)?;
                     let slot = self.push_dtemp();
                     self.gen_expr(a)?;
-                    self.pop_dtemp_to(&slot, "d1"); // D0=lhs, D1=rhs
-                    self.gen_binop(*op, &a.ty, &b.ty);
+                    // When the rhs is parked in a register it is already a legal
+                    // instruction source, so the binop reads it where it sits;
+                    // only a stack-spilled operand has to come back through D1.
+                    let rhs = if slot == "-(a7)" {
+                        self.pop_dtemp_to(&slot, "d1");
+                        "d1".to_string()
+                    } else {
+                        self.dtemp -= 1; // release the slot without a copy
+                        slot
+                    };
+                    self.gen_binop(*op, &a.ty, &b.ty, &rhs);
                 }
             }
             ExprK::Call(callee, args) => {
@@ -900,15 +1003,20 @@ impl Gen {
                 return Ok(());
             }
         }
-        let slot = self.push_dtemp(); // save the value across gen_addr
-        self.gen_addr(lv)?;
+        let slot = self.push_dtemp(); // save the value across the address computation
+        let ea = self.addr_ea(lv)?;
         self.pop_dtemp_to(&slot, "d0");
-        self.store(&lv.ty);
+        self.store_ea(&lv.ty, &ea);
         Ok(())
     }
 
-    /// Compute the address of an lvalue into A0.
-    fn gen_addr(&mut self, e: &Expr) -> Result<(), String> {
+    /// The effective address of an lvalue, computing as little as possible.
+    ///
+    /// Frame slots and globals need no code at all — they are a displacement
+    /// off A6 or an absolute. Only a genuinely computed pointer costs an A0
+    /// materialization, and even then the field offset rides along in the
+    /// displacement rather than in an `adda.l`.
+    fn addr_ea(&mut self, e: &Expr) -> Result<Ea, String> {
         match &e.kind {
             ExprK::Var(name) => {
                 if self.reg_of.contains_key(name) {
@@ -918,29 +1026,107 @@ impl Gen {
                     return Err(format!("{}: address of register-allocated `{name}`", e.line));
                 }
                 if let Some(off) = self.frame.get(name).copied() {
+                    if Ea::disp_ok(off) {
+                        return Ok(Ea::Disp(off, "a6".into()));
+                    }
+                    // Frame deeper than a 16-bit displacement: compute it.
                     self.line(&format!("lea {off}(a6),a0"));
-                } else if self.globals.contains_key(name) {
-                    self.line(&format!("lea {},a0", mangle(name)));
-                } else {
-                    // unknown → treat as extern global
-                    self.line(&format!("lea {},a0", mangle(name)));
+                    return Ok(Ea::Disp(0, "a0".into()));
                 }
-                Ok(())
+                // known global, or unknown → treat as extern global
+                Ok(Ea::Abs(mangle(name), 0))
             }
-            ExprK::Unary(UnOp::Deref, inner) => {
-                self.gen_expr(inner)?; // pointer value in D0
-                self.line("move.l d0,a0");
-                Ok(())
-            }
-            ExprK::Member(base_addr, off) => {
-                self.gen_expr(base_addr)?; // struct address in D0
-                self.line("move.l d0,a0");
-                if *off != 0 {
-                    self.line(&format!("adda.l #{off},a0"));
-                }
-                Ok(())
-            }
+            ExprK::Unary(UnOp::Deref, inner) => self.ptr_ea(inner, 0),
+            ExprK::Member(base_addr, off) => self.ptr_ea(base_addr, *off as i32),
             _ => Err(format!("{}: not an lvalue", e.line)),
+        }
+    }
+
+    /// The effective address of `*(ptr) + off`, where `ptr`'s *value* is the
+    /// base address. Folds the two shapes that dominate real code: taking the
+    /// address of an lvalue (`&s` → `s`'s own EA, so `s.field` needs no
+    /// arithmetic at all) and adding a constant (already scaled to bytes by
+    /// the parser, so `tab[3]` collapses to one absolute).
+    fn ptr_ea(&mut self, ptr: &Expr, off: i32) -> Result<Ea, String> {
+        // A pointer local already living in an address register *is* the base
+        // register — `p->z` is one `move.l 8(a2),d0`, no address computation.
+        if let ExprK::Var(name) = &ptr.kind {
+            if let Some(r) = self.reg_of.get(name).cloned() {
+                if is_areg(&r) && Ea::disp_ok(off) {
+                    return Ok(Ea::Disp(off, r));
+                }
+            }
+        }
+        match &ptr.kind {
+            ExprK::Unary(UnOp::Addr, inner) => {
+                let base = self.addr_ea(inner)?;
+                if let Some(ea) = base.plus(off) {
+                    return Ok(ea);
+                }
+                self.materialize_ea(&base);
+                return self.a0_plus(off);
+            }
+            ExprK::Binary(BinOp::Add, a, b) => {
+                if let ExprK::Num(n) = &b.kind {
+                    if let Some(sum) = (*n as i32).checked_add(off) {
+                        return self.ptr_ea(a, sum);
+                    }
+                }
+            }
+            _ => {}
+        }
+        self.gen_expr(ptr)?; // pointer value in D0
+        self.line("move.l d0,a0");
+        self.a0_plus(off)
+    }
+
+    /// An EA for `off(a0)`, spending an `adda.l` only if the displacement
+    /// does not fit the instruction.
+    fn a0_plus(&mut self, off: i32) -> Result<Ea, String> {
+        if Ea::disp_ok(off) {
+            Ok(Ea::Disp(off, "a0".into()))
+        } else {
+            self.line(&format!("adda.l #{off},a0"));
+            Ok(Ea::Disp(0, "a0".into()))
+        }
+    }
+
+    /// Whether `ea` still names the same address after `rhs` has been evaluated.
+    ///
+    /// Beyond the unconditionally-stable cases, an address based on a
+    /// register-allocated pointer local is stable too: A2–A5 are callee-saved,
+    /// so calls and helpers preserve them, and the only thing that can change
+    /// one is an assignment to that very variable. This is what lets `o->x = …`
+    /// store straight through the pointer instead of parking its address in
+    /// another register across the right-hand side.
+    fn ea_stable_across(&self, ea: &Ea, rhs: &Expr) -> bool {
+        if ea.is_stable() {
+            return true;
+        }
+        let Ea::Disp(_, r) = ea else { return false };
+        match self.reg_of.iter().find(|(_, reg)| *reg == r) {
+            Some((name, _)) => !assigns_to(rhs, name),
+            None => false, // A0 scratch, or an eval-stack slot
+        }
+    }
+
+    /// Force an EA into A0, for the paths that need a real address register.
+    fn materialize_ea(&mut self, ea: &Ea) {
+        if *ea == Ea::Disp(0, "a0".into()) {
+            return; // already there
+        }
+        self.line(&format!("lea {},a0", ea.render()));
+    }
+
+    /// Leave the *address* denoted by `ea` in D0 (for `&x` and aggregate rvalues).
+    fn ea_addr_to_d0(&mut self, ea: &Ea) {
+        match ea {
+            Ea::Disp(0, r) => self.line(&format!("move.l {r},d0")),
+            Ea::Abs(s, 0) => self.line(&format!("move.l #{s},d0")),
+            _ => {
+                self.materialize_ea(ea);
+                self.line("move.l a0,d0");
+            }
         }
     }
 
@@ -976,8 +1162,58 @@ impl Gen {
     /// place). Returns false when the value can't be reduced (the caller
     /// falls back to the runtime helper). Signed division only reduces for
     /// n == 1 (an arithmetic shift rounds toward −∞, C truncates toward 0).
+    /// Multiply D0 by a constant that is a sum or difference of two powers of
+    /// two, using shifts instead of the `__mulsi3` helper.
+    ///
+    /// The 68000 has no 32x32 multiply, so every `i * sizeof(struct)` in an
+    /// array subscript became a subroutine call — the single most expensive
+    /// thing in a loop that walks an array of structs. Both identities need one
+    /// scratch register and no call:
+    ///
+    /// ```text
+    /// x * (2^a + 2^b) == ((x << (a-b)) + x) << b
+    /// x * (2^a - 2^b) == ((x << (a-b)) - x) << b
+    /// ```
+    ///
+    /// Signedness doesn't enter into it: the low 32 bits of a product are the
+    /// same either way. Shift counts are capped at 8, the largest the immediate
+    /// form encodes, which still covers every plausible element size.
+    fn fold_mul_const(&mut self, n: i64) -> bool {
+        if n <= 2 || n > 0xFFFF {
+            return false;
+        }
+        let b = n.trailing_zeros();
+        // n == 2^a + 2^b
+        let sum = (n.count_ones() == 2).then(|| (63 - n.leading_zeros(), true));
+        // n == 2^a - 2^b  ⇔  n + 2^b is a power of two
+        let diff = {
+            let m = n + (1i64 << b);
+            (m.count_ones() == 1).then(|| (63 - m.leading_zeros(), false))
+        };
+        let Some((a, is_add)) = sum.or(diff) else {
+            return false;
+        };
+        let (shift1, shift2) = (a - b, b);
+        if shift1 < 1 || shift1 > 8 || shift2 > 8 {
+            return false;
+        }
+        self.line("move.l d0,d1");
+        self.line(&format!("asl.l #{shift1},d0"));
+        self.line(if is_add { "add.l d1,d0" } else { "sub.l d1,d0" });
+        if shift2 > 0 {
+            self.line(&format!("asl.l #{shift2},d0"));
+        }
+        true
+    }
+
     fn fold_pow2(&mut self, op: BinOp, lt: &Type, rt: &Type, n: i64) -> bool {
         let unsigned = !(lt.is_signed() && rt.is_signed());
+        // A multiply by a non-power-of-two still beats the helper call when the
+        // constant is two powers of two apart — which every odd-sized struct
+        // index is (`p[i]` on a 12-byte struct is `i * 12`).
+        if matches!(op, BinOp::Mul) && n > 0 && (n & (n - 1)) != 0 {
+            return self.fold_mul_const(n);
+        }
         if n <= 0 || (n & (n - 1)) != 0 {
             return false;
         }
@@ -1020,55 +1256,58 @@ impl Gen {
     /// a drop-in like OpenLara's divmod68k.S would otherwise read stack
     /// garbage as operands and miscompile silently (the gpu.c/jerry.c
     /// black-screen boot from the adoption report, round 2).
-    fn call_runtime(&mut self, name: &str) {
-        self.line("move.l d1,-(a7)");
+    fn call_runtime_rhs(&mut self, rhs: &str, name: &str) {
+        self.line(&format!("move.l {rhs},-(a7)"));
         self.line("move.l d0,-(a7)");
         self.line(&format!("jsr {name}"));
         self.line("addq.l #8,a7");
     }
 
-    // ── binops (D0 = D0 op D1) ────────────────────────────────────────────────
-    fn gen_binop(&mut self, op: BinOp, lt: &Type, rt: &Type) {
+    // ── binops (D0 = D0 op RHS) ───────────────────────────────────────────────
+    /// `rhs` names the right operand's location — normally a data register the
+    /// eval stack parked it in, so the value is used where it already sits
+    /// instead of being copied into D1 first.
+    fn gen_binop(&mut self, op: BinOp, lt: &Type, rt: &Type, rhs: &str) {
         let unsigned = !(lt.is_signed() && rt.is_signed());
         match op {
-            BinOp::Add => self.line("add.l d1,d0"),
-            BinOp::Sub => self.line("sub.l d1,d0"),
-            BinOp::And => self.line("and.l d1,d0"),
-            BinOp::Or => self.line("or.l d1,d0"),
-            BinOp::Xor => self.line("eor.l d1,d0"),
-            BinOp::Shl => self.line("asl.l d1,d0"),
+            BinOp::Add => self.line(&format!("add.l {rhs},d0")),
+            BinOp::Sub => self.line(&format!("sub.l {rhs},d0")),
+            BinOp::And => self.line(&format!("and.l {rhs},d0")),
+            BinOp::Or => self.line(&format!("or.l {rhs},d0")),
+            BinOp::Xor => self.line(&format!("eor.l {rhs},d0")),
+            BinOp::Shl => self.line(&format!("asl.l {rhs},d0")),
             BinOp::Shr => {
                 if unsigned {
-                    self.line("lsr.l d1,d0");
+                    self.line(&format!("lsr.l {rhs},d0"));
                 } else {
-                    self.line("asr.l d1,d0");
+                    self.line(&format!("asr.l {rhs},d0"));
                 }
             }
             BinOp::Mul => {
                 if lt.is_fixed() || rt.is_fixed() {
-                    self.call_runtime("__mulfix");
+                    self.call_runtime_rhs(rhs, "__mulfix");
                 } else {
-                    self.call_runtime("__mulsi3");
+                    self.call_runtime_rhs(rhs, "__mulsi3");
                 }
             }
             BinOp::Div => {
                 if lt.is_fixed() || rt.is_fixed() {
-                    self.call_runtime("__divfix");
+                    self.call_runtime_rhs(rhs, "__divfix");
                 } else if unsigned {
-                    self.call_runtime("__udivsi3");
+                    self.call_runtime_rhs(rhs, "__udivsi3");
                 } else {
-                    self.call_runtime("__divsi3");
+                    self.call_runtime_rhs(rhs, "__divsi3");
                 }
             }
             BinOp::Mod => {
                 if unsigned {
-                    self.call_runtime("__umodsi3");
+                    self.call_runtime_rhs(rhs, "__umodsi3");
                 } else {
-                    self.call_runtime("__modsi3");
+                    self.call_runtime_rhs(rhs, "__modsi3");
                 }
             }
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
-                self.line("cmp.l d1,d0"); // sets flags for D0 - D1
+                self.line(&format!("cmp.l {rhs},d0")); // sets flags for D0 - D1
                 let cc = match (op, unsigned) {
                     (BinOp::Eq, _) => "seq",
                     (BinOp::Ne, _) => "sne",
@@ -1096,8 +1335,12 @@ impl Gen {
         match &e.kind {
             ExprK::Num(n) => Some((format!("#{}", *n as i32), true)),
             ExprK::Var(name) if self.reg_of.contains_key(name) => {
-                // a register-allocated local is itself a valid instruction source
-                Some((self.reg_of[name].clone(), false))
+                // A register-allocated local is itself a valid instruction
+                // source — except an address register, which the 68000 rejects
+                // as the source of AND/OR/EOR. Not worth encoding per-op: let
+                // those fall back to the generic path.
+                let r = self.reg_of[name].clone();
+                (!is_areg(&r)).then_some((r, false))
             }
             ExprK::Var(name) if is_scalar4(&e.ty) => {
                 let src = match self.frame.get(name).copied() {
@@ -1123,12 +1366,39 @@ impl Gen {
             // eor has no `<ea>,Dn` form — immediate only (eori)
             BinOp::Xor => is_imm,
             // immediate shift count, 1..8 only
+            // The immediate shift count encodes 1–8, but a larger constant is
+            // still better done as a short run of immediate shifts than by
+            // materializing the count into a register and going through the
+            // eval stack (`x >> 14` on 16.16 fixed point is everywhere).
             BinOp::Shl | BinOp::Shr => {
-                matches!(&b.kind, ExprK::Num(n) if (1..=8).contains(n))
+                matches!(&b.kind, ExprK::Num(n) if (1..=31).contains(n))
             }
             BinOp::LogAnd | BinOp::LogOr => false,
         };
         ok.then_some((src, is_imm))
+    }
+
+    /// Shift D0 by `src`, splitting a constant count larger than 8 into
+    /// successive immediate shifts (the 68000 encodes only 1–8 per instruction).
+    fn emit_shift(&mut self, mnemonic: &str, src: &str) {
+        let Some(mut n) = src.strip_prefix('#').and_then(|s| s.parse::<u32>().ok()) else {
+            self.line(&format!("{mnemonic} {src},d0")); // register count
+            return;
+        };
+        if n >= 32 {
+            // Shifting a 32-bit value by its whole width is undefined in C;
+            // produce zero for the logical forms, the sign bit for arithmetic.
+            n = if mnemonic == "asr.l" { 31 } else { 32 };
+            if n == 32 {
+                self.line("moveq #0,d0");
+                return;
+            }
+        }
+        while n > 0 {
+            let step = n.min(8);
+            self.line(&format!("{mnemonic} #{step},d0"));
+            n -= step;
+        }
     }
 
     /// Emit `op` with the right operand as a folded source (D0 already holds the
@@ -1141,10 +1411,8 @@ impl Gen {
             BinOp::And => self.line(&format!("and.l {src},d0")),
             BinOp::Or => self.line(&format!("or.l {src},d0")),
             BinOp::Xor => self.line(&format!("eori.l {src},d0")),
-            BinOp::Shl => self.line(&format!("asl.l {src},d0")),
-            BinOp::Shr => {
-                self.line(&format!("{} {src},d0", if unsigned { "lsr.l" } else { "asr.l" }));
-            }
+            BinOp::Shl => self.emit_shift("asl.l", src),
+            BinOp::Shr => self.emit_shift(if unsigned { "lsr.l" } else { "asr.l" }, src),
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
                 self.line(&format!("cmp.l {src},d0"));
                 let cc = match (op, unsigned) {
@@ -1176,43 +1444,45 @@ impl Gen {
                     }
                 }
                 self.line(&format!("move.l {src},d1"));
-                self.gen_binop(op, lt, rt);
+                self.gen_binop(op, lt, rt, "d1");
             }
             BinOp::LogAnd | BinOp::LogOr => unreachable!("handled in gen_expr"),
         }
     }
 
     // ── loads / stores by size (A0 = address) ─────────────────────────────────
-    fn load(&mut self, ty: &Type) {
+    /// Load the value at `ea` into D0, sign- or zero-extended to 32 bits.
+    fn load_ea(&mut self, ty: &Type, ea: &Ea) {
         match &**ty {
             TypeK::Array(..) | TypeK::Struct { .. } | TypeK::Func { .. } => {
                 // aggregate lvalue → its address is the value
-                self.line("move.l a0,d0");
+                self.ea_addr_to_d0(ea);
             }
             _ => {
                 let sz = ty.size();
                 let signed = ty.is_signed();
+                let a = ea.render();
                 match sz {
                     1 => {
                         if signed {
-                            self.line("move.b (a0),d0");
+                            self.line(&format!("move.b {a},d0"));
                             self.line("ext.w d0");
                             self.line("ext.l d0");
                         } else {
                             self.line("moveq #0,d0");
-                            self.line("move.b (a0),d0");
+                            self.line(&format!("move.b {a},d0"));
                         }
                     }
                     2 => {
                         if signed {
-                            self.line("move.w (a0),d0");
+                            self.line(&format!("move.w {a},d0"));
                             self.line("ext.l d0");
                         } else {
                             self.line("moveq #0,d0");
-                            self.line("move.w (a0),d0");
+                            self.line(&format!("move.w {a},d0"));
                         }
                     }
-                    _ => self.line("move.l (a0),d0"),
+                    _ => self.line(&format!("move.l {a},d0")),
                 }
             }
         }
@@ -1220,10 +1490,17 @@ impl Gen {
 
     fn store(&mut self, ty: &Type) {
         // A0 = dest, D0 = value
+        let ea = Ea::Disp(0, "a0".into());
+        self.store_ea(ty, &ea);
+    }
+
+    /// Store D0 into `ea`, truncated to the lvalue's width.
+    fn store_ea(&mut self, ty: &Type, ea: &Ea) {
+        let a = ea.render();
         match ty.size() {
-            1 => self.line("move.b d0,(a0)"),
-            2 => self.line("move.w d0,(a0)"),
-            _ => self.line("move.l d0,(a0)"),
+            1 => self.line(&format!("move.b d0,{a}")),
+            2 => self.line(&format!("move.w d0,{a}")),
+            _ => self.line(&format!("move.l d0,{a}")),
         }
     }
 
@@ -1311,7 +1588,14 @@ impl Gen {
             return; // fixed↔fixed, or fixed↔pointer: bit-identical
         }
         // Narrowing/widening in D0.
-        if to.size() >= 4 {
+        //
+        // Only a genuine integer source has a *width* to widen from. An array's
+        // `size()` is its aggregate footprint, so without this guard a
+        // `char[2]` decaying to a pointer looked like a 16-bit integer and got
+        // masked with `and.l #$FFFF` — silently truncating the pointer to
+        // garbage. Pointers and aggregates are already 32-bit values; they need
+        // no conversion at all.
+        if to.size() >= 4 && from.is_integer() {
             // widen to 32 from smaller int
             match from.size() {
                 1 => {
@@ -1455,7 +1739,294 @@ fn emit_init(out: &mut String, init: &[InitByte]) {
 /// next line is `L:` (a branch to the following instruction) — both a size
 /// optimization and a workaround for the assembler's short/long branch
 /// oscillation on a zero displacement.
+/// Split an operand list at the top-level comma — the one not inside `(...)`,
+/// so `8(a0,d1.l),d2` splits after the closing paren.
+fn split_operands(ops: &str) -> Option<(&str, &str)> {
+    let mut depth = 0i32;
+    for (i, c) in ops.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => return Some((ops[..i].trim(), ops[i + 1..].trim())),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// `(mnemonic, operands)` for an instruction line, or `None` for anything that
+/// is not one (blank, directive, label).
+fn split_insn(line: &str) -> Option<(&str, &str)> {
+    let t = line.trim();
+    if t.is_empty() || t.starts_with('.') || t.starts_with('*') || t.ends_with(':') {
+        return None;
+    }
+    Some(match t.find(char::is_whitespace) {
+        Some(i) => (&t[..i], t[i..].trim()),
+        None => (t, ""),
+    })
+}
+
+/// Mnemonic without its size suffix (`move.l` → `move`).
+fn base_mnemonic(m: &str) -> &str {
+    m.split('.').next().unwrap_or(m)
+}
+
+/// Whole-word search for a register name inside an operand string.
+fn mentions(ops: &str, r: &str) -> bool {
+    let b = ops.as_bytes();
+    let boundary = |c: u8| !(c.is_ascii_alphanumeric() || c == b'_');
+    ops.match_indices(r).any(|(i, _)| {
+        let before = i == 0 || boundary(b[i - 1]);
+        let after = i + r.len() >= b.len() || boundary(b[i + r.len()]);
+        before && after
+    })
+}
+
+fn is_machine_reg(s: &str) -> bool {
+    let b = s.as_bytes();
+    s.len() == 2 && matches!(b[0], b'd' | b'a') && b[1].is_ascii_digit()
+}
+
+/// Whether `r` is never read again before being overwritten, starting at `from`.
+///
+/// Conservative by construction: anything it cannot reason about (a label, a
+/// branch, an unrecognized mnemonic touching `r`) counts as *live*, which only
+/// ever costs an optimization, never correctness. The one non-obvious rule is
+/// the calling convention — D0/D1/A0/A1 are caller-saved in the jcc68k ABI, so
+/// a `jsr` kills them.
+fn dead_after(lines: &[&str], from: usize, r: &str) -> bool {
+    let scratch = matches!(r, "d0" | "d1" | "a0" | "a1");
+    for line in &lines[from.min(lines.len())..] {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if t.ends_with(':') {
+            return false; // a label may be reached with r live
+        }
+        let Some((m, ops)) = split_insn(t) else { continue };
+        let base = base_mnemonic(m);
+        match base {
+            "jsr" | "bsr" => {
+                return !mentions(ops, r) && scratch;
+            }
+            "rts" | "rte" => return r != "d0",
+            "jmp" | "bra" => return false,
+            _ if base.starts_with('b') || base.starts_with("db") => return false,
+            _ => {}
+        }
+        match split_operands(ops) {
+            Some((src, dst)) => {
+                if mentions(src, r) {
+                    return false; // read
+                }
+                if mentions(dst, r) {
+                    // Only a full-width overwrite of exactly this register kills it.
+                    let pure_write = matches!(base, "move" | "movea" | "moveq" | "lea" | "clr");
+                    return pure_write && dst == r && (m.ends_with(".l") || m == "moveq");
+                }
+            }
+            None => {
+                if !ops.is_empty() && mentions(ops, r) {
+                    return base == "clr" && ops.trim() == r;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Fold `move.l A,R` into the single following instruction that reads `R`,
+/// when `R` is dead afterwards.
+///
+/// This is what turns `move.l 8(a3),d0 / move.l d0,d2` into `move.l 8(a3),d2`
+/// and `move.l d3,d1 / add.l d1,d0` into `add.l d3,d0`. Only the immediately
+/// adjacent instruction is considered, which keeps the safety argument simple:
+/// nothing can invalidate `A` in between because there is no in-between.
+fn fold_copies(lines: &[&str]) -> (Vec<String>, bool) {
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut changed = false;
+    let mut i = 0;
+    while i < lines.len() {
+        if i + 1 < lines.len() {
+            if let Some(folded) = try_fold(lines, i) {
+                out.push(folded);
+                changed = true;
+                i += 2;
+                continue;
+            }
+        }
+        out.push(lines[i].to_string());
+        i += 1;
+    }
+    (out, changed)
+}
+
+fn try_fold(lines: &[&str], i: usize) -> Option<String> {
+    let (m0, ops0) = split_insn(lines[i])?;
+    if m0 != "move.l" && m0 != "movea.l" {
+        return None;
+    }
+    let (a, r) = split_operands(ops0)?;
+    if !is_machine_reg(r) {
+        return None;
+    }
+    // Source with an addressing side effect can't be duplicated or delayed.
+    if a.contains("-(") || a.contains(")+") {
+        return None;
+    }
+    let (m1, ops1) = split_insn(lines[i + 1])?;
+    if !m1.ends_with(".l") {
+        return None; // keep widths identical; sub-word ops change semantics
+    }
+    let base1 = base_mnemonic(m1);
+    let (src1, dst1) = split_operands(ops1)?;
+    // `cmp` reads both operands and writes neither, so a copy feeding its
+    // destination can be folded too — `move.l d7,d0 / cmp.l d5,d0` is just
+    // `cmp.l d5,d7`. The result must land in a data register to stay encodable.
+    if base_mnemonic(m1) == "cmp" && dst1 == r && src1 != r {
+        if !is_machine_reg(a) || !a.starts_with('d') {
+            return None;
+        }
+        if !dead_after(lines, i + 2, r) {
+            return None;
+        }
+        return Some(format!("\t{m1} {src1},{a}"));
+    }
+    // R must be read exactly once, as the whole source, and not written here.
+    if src1 != r || mentions(dst1, r) {
+        return None;
+    }
+    // The folding instruction must not clobber anything A depends on.
+    if is_machine_reg(dst1) && mentions(a, dst1) {
+        return None;
+    }
+    let a_is_areg = is_machine_reg(a) && a.starts_with('a');
+    let a_is_mem = !is_machine_reg(a) && !a.starts_with('#');
+    match base1 {
+        // An address register is illegal as the source of these.
+        "and" | "or" | "eor" if a_is_areg => return None,
+        // `<ea>,Dn` forms need a data-register destination.
+        "add" | "sub" | "cmp" | "and" | "or" | "eor" if a_is_mem && !dst1.starts_with('d') => {
+            return None
+        }
+        "move" | "movea" | "add" | "sub" | "cmp" | "and" | "or" | "eor" => {}
+        _ => return None, // unknown consumer: leave it alone
+    }
+    if !dead_after(lines, i + 2, r) {
+        return None;
+    }
+    // An immediate source needs the `#`-form mnemonic spelling left as-is;
+    // `move` into an address register is `movea`.
+    let mnem = if base1 == "move" && is_machine_reg(dst1) && dst1.starts_with('a') {
+        "movea.l".to_string()
+    } else {
+        m1.to_string()
+    };
+    Some(format!("\t{mnem} {a},{dst1}"))
+}
+
+/// `(scc, branch-if-condition-true, branch-if-condition-false)`.
+const SCC_TO_BRANCH: &[(&str, &str, &str)] = &[
+    ("seq", "beq", "bne"),
+    ("sne", "bne", "beq"),
+    ("slt", "blt", "bge"),
+    ("sle", "ble", "bgt"),
+    ("sgt", "bgt", "ble"),
+    ("sge", "bge", "blt"),
+    ("scs", "bcs", "bcc"),
+    ("sls", "bls", "bhi"),
+    ("shi", "bhi", "bls"),
+    ("scc", "bcc", "bcs"),
+];
+
+/// Is `r` dead at the instruction following `label`?
+fn dead_at_label(lines: &[&str], label: &str, r: &str) -> bool {
+    let want = format!("{label}:");
+    lines
+        .iter()
+        .position(|l| l.trim() == want)
+        .is_some_and(|i| dead_after(lines, i + 1, r))
+}
+
+/// Collapse "materialize a boolean, then test it" into a conditional branch.
+///
+/// Every `if`/`while` condition compiles to `cmp / s<cc> d0 / and.l #1,d0 /
+/// tst.l d0 / b<eq|ne>` — five instructions to use flags the `cmp` already set.
+/// The comparison's own flags can drive the branch directly, provided the
+/// boolean in D0 is genuinely unused on *both* successors.
+fn fuse_compare_branch(lines: &[&str]) -> (Vec<String>, bool) {
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut changed = false;
+    let mut i = 0;
+    while i < lines.len() {
+        if i + 4 < lines.len() {
+            if let Some(fused) = try_fuse(lines, i) {
+                out.push(lines[i].to_string()); // keep the cmp
+                out.push(fused);
+                changed = true;
+                i += 5;
+                continue;
+            }
+        }
+        out.push(lines[i].to_string());
+        i += 1;
+    }
+    (out, changed)
+}
+
+fn try_fuse(lines: &[&str], i: usize) -> Option<String> {
+    if split_insn(lines[i])?.0 != "cmp.l" {
+        return None;
+    }
+    let (m1, o1) = split_insn(lines[i + 1])?;
+    let entry = SCC_TO_BRANCH.iter().find(|(s, _, _)| *s == m1)?;
+    if o1.trim() != "d0" {
+        return None;
+    }
+    let (m2, o2) = split_insn(lines[i + 2])?;
+    if m2 != "and.l" || o2.replace(' ', "") != "#1,d0" {
+        return None;
+    }
+    let (m3, o3) = split_insn(lines[i + 3])?;
+    if m3 != "tst.l" || o3.trim() != "d0" {
+        return None;
+    }
+    let (m4, target) = split_insn(lines[i + 4])?;
+    let branch = match base_mnemonic(m4) {
+        "beq" => entry.2, // the boolean was false ⇒ the condition was false
+        "bne" => entry.1,
+        _ => return None,
+    };
+    // The boolean must be unused however control flows from here.
+    if !dead_after(lines, i + 5, "d0") || !dead_at_label(lines, target, "d0") {
+        return None;
+    }
+    let suffix = if m4.ends_with(".s") { ".s" } else { ".w" };
+    Some(format!("\t{branch}{suffix} {target}"))
+}
+
 fn peephole(asm: &str) -> String {
+    let stage1 = peephole_branches(asm);
+    // Copy folding exposes more copy folding (a three-instruction chain
+    // collapses one link per pass), so run to a fixpoint.
+    let mut cur = stage1;
+    for _ in 0..8 {
+        let lines: Vec<&str> = cur.lines().collect();
+        let (fused, c1) = fuse_compare_branch(&lines);
+        let refs: Vec<&str> = fused.iter().map(|s| s.as_str()).collect();
+        let (folded, c2) = fold_copies(&refs);
+        if !c1 && !c2 {
+            break;
+        }
+        cur = folded.join("\n");
+        cur.push('\n');
+    }
+    cur
+}
+
+fn peephole_branches(asm: &str) -> String {
     let lines: Vec<&str> = asm.lines().collect();
     let mut out = String::with_capacity(asm.len());
     let mut i = 0;
@@ -1553,6 +2124,28 @@ fn used_callee_saved(body: &str) -> Vec<&'static str> {
 /// A scalar type that occupies a full 4-byte longword (int, long, pointer,
 /// fixed) — safe to read/write as a `.l` memory operand. Excludes sub-int types
 /// (whose memory image is 1–2 bytes) and aggregates.
+/// Whether evaluating `e` can assign to the local named `name`.
+///
+/// Only a direct assignment or increment counts. A call cannot reach the
+/// variable indirectly: taking its address would have disqualified it from
+/// register allocation in the first place.
+fn assigns_to(e: &Expr, name: &str) -> bool {
+    let target_is = |lv: &Expr| matches!(&lv.kind, ExprK::Var(n) if n == name);
+    match &e.kind {
+        ExprK::Assign(lv, rhs) => target_is(lv) || assigns_to(lv, name) || assigns_to(rhs, name),
+        ExprK::PostIncDec(lv, _) => target_is(lv) || assigns_to(lv, name),
+        ExprK::Binary(_, a, b) | ExprK::Comma(a, b) => assigns_to(a, name) || assigns_to(b, name),
+        ExprK::Unary(_, a) | ExprK::Cast(a) | ExprK::Member(a, _) => assigns_to(a, name),
+        ExprK::Cond(c, a, b) => {
+            assigns_to(c, name) || assigns_to(a, name) || assigns_to(b, name)
+        }
+        ExprK::Call(callee, args) => {
+            assigns_to(callee, name) || args.iter().any(|a| assigns_to(a, name))
+        }
+        ExprK::Num(_) | ExprK::StrLit(_) | ExprK::Var(_) => false,
+    }
+}
+
 fn is_scalar4(ty: &Type) -> bool {
     ty.size() == 4 && !matches!(&**ty, TypeK::Array(..) | TypeK::Struct { .. } | TypeK::Func { .. })
 }
