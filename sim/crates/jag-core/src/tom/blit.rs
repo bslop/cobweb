@@ -345,19 +345,37 @@ pub fn run(bus: &mut Bus, cmd: u32) {
     let dstwrz = cmd & mem::BC_DSTWRZ != 0;
     let zmode = cmd & (mem::BC_ZMODELT | mem::BC_ZMODEEQ | mem::BC_ZMODEGT);
     let z_active = zbuff || dstenz || dstwrz || zmode != 0;
-    let (srcz1, srcz2, zinc, zoffs) = {
+    let (srcz1, srcz2, z3, zinc, zoffs) = {
         let w = &bus.tom.win;
         let dflags = w.r32(if dst == 0 { mem::A1_FLAGS } else { mem::A2_FLAGS });
         (
             [w.r32(mem::B_SRCZ1), w.r32(mem::B_SRCZ1 + 4)],
             [w.r32(mem::B_SRCZ2), w.r32(mem::B_SRCZ2 + 4)],
+            w.r32(mem::B_Z3),
             w.r32(mem::B_ZINC) as i32,
             (dflags >> mem::AF_ZOFFS_SHIFT) & 7,
         )
     };
+    // Seeding differs by XADD mode, and the evidence for that is a SHIPPED Atari
+    // renderer, not the register doc. N3D's `gour` kernel (decompiled with
+    // symbols — jaguar-shared case-studies/geode3d/03) stages exactly
+    // `B_ZINC, B_Z3, A1_PIXEL, B_COUNT, B_CMD` per scanline in PIXEL mode and
+    // never touches B_Z2..B_Z0; only its PHRASE variant `gourphr` pre-steps four
+    // Z values and writes them through a decrementing B_Z3 pointer, because a
+    // phrase consumes four pixels at once.
+    //
+    // So pixel mode behaves as ONE accumulator seeded from B_Z3. Modelling that
+    // as four identically-seeded lanes makes the per-lane path degenerate to it
+    // exactly, and keeps a single code path. Seeding pixel mode from B_SRCZ1/2
+    // instead would leave three of every four pixels reading a stale lane — and
+    // would render Atari's own kernel as garbage.
     let mut zacc: [i64; 4] = [0; 4];
-    for (l, z) in zacc.iter_mut().enumerate() {
-        *z = ((lane(srcz1, 16, l as u32) as i64) << 16) | lane(srcz2, 16, l as u32) as i64;
+    if pixel_mode {
+        zacc = [z3 as i64; 4];
+    } else {
+        for (l, z) in zacc.iter_mut().enumerate() {
+            *z = ((lane(srcz1, 16, l as u32) as i64) << 16) | lane(srcz2, 16, l as u32) as i64;
+        }
     }
     // ERRATA [TRM]: "Z comparators fail in pixel mode without BKGWREN". The
     // actual silicon behaviour of that failure is unrecorded, so we do NOT
@@ -821,11 +839,8 @@ mod tests {
         bus.tom.win.w32(mem::A1_PIXEL, 0);
         bus.tom.win.w32(mem::B_SRCD, 0xAAAA_AAAA);
         bus.tom.win.w32(mem::B_SRCD + 4, 0xAAAA_AAAA);
-        // Source Z = 100 in all four lanes, no fraction, no ramp.
-        bus.tom.win.w32(mem::B_SRCZ1, 0x0064_0064);
-        bus.tom.win.w32(mem::B_SRCZ1 + 4, 0x0064_0064);
-        bus.tom.win.w32(mem::B_SRCZ2, 0);
-        bus.tom.win.w32(mem::B_SRCZ2 + 4, 0);
+        // Pixel mode seeds from B_Z3 alone, exactly as N3D's `gour` does.
+        bus.tom.win.w32(mem::B_Z3, 100 << 16);
         bus.tom.win.w32(mem::B_ZINC, 0);
         bus.tom.win.w32(mem::B_COUNT, (1 << 16) | 4);
         bus.write32(
@@ -867,10 +882,7 @@ mod tests {
         bus.tom.win.w32(mem::A1_PIXEL, 0);
         bus.tom.win.w32(mem::B_SRCD, 0x1111_1111);
         bus.tom.win.w32(mem::B_SRCD + 4, 0x1111_1111);
-        bus.tom.win.w32(mem::B_SRCZ1, 0x0064_0064); // 100 in every lane
-        bus.tom.win.w32(mem::B_SRCZ1 + 4, 0x0064_0064);
-        bus.tom.win.w32(mem::B_SRCZ2, 0);
-        bus.tom.win.w32(mem::B_SRCZ2 + 4, 0);
+        bus.tom.win.w32(mem::B_Z3, 100 << 16); // pixel mode: B_Z3 is the start
         bus.tom.win.w32(mem::B_ZINC, 0x0001_0000); // +1.0 per pixel
         bus.tom.win.w32(mem::B_COUNT, (1 << 16) | 6);
         bus.write32(
@@ -908,10 +920,7 @@ mod tests {
         bus.tom.win.w32(mem::A1_PIXEL, 0);
         bus.tom.win.w32(mem::B_SRCD, 0x2222_2222);
         bus.tom.win.w32(mem::B_SRCD + 4, 0x2222_2222);
-        bus.tom.win.w32(mem::B_SRCZ1, 0x000A_000A); // 10
-        bus.tom.win.w32(mem::B_SRCZ1 + 4, 0x000A_000A);
-        bus.tom.win.w32(mem::B_SRCZ2, 0);
-        bus.tom.win.w32(mem::B_SRCZ2 + 4, 0);
+        bus.tom.win.w32(mem::B_Z3, 10 << 16);
         bus.tom.win.w32(mem::B_ZINC, 0x0000_8000); // +0.5 per pixel
         bus.tom.win.w32(mem::B_COUNT, (1 << 16) | 4);
         bus.write32(
