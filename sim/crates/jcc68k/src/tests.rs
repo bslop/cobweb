@@ -1156,3 +1156,88 @@ fn multiline_macro_call_still_gathers_lines() {
                  3); }\n";
     assert_eq!(run_pp(src), 23);
 }
+
+#[test]
+fn jerry_pose_angle_marshal_loop() {
+    // The shape of jerry_pose_kick's angle marshal: byte source, 32-bit
+    // volatile destination, unsigned loop bound `mcount*3`. The reported
+    // symptom was the LAST angle being corrupted, so every element is checked.
+    let src = "static unsigned char SRC[12] = {10,20,30,40,50,60,70,80,90,100,110,120};\
+               static volatile unsigned DST[12];\
+               void marshal(volatile unsigned *ab, const void *angles, unsigned mcount){\
+                 const unsigned char *s = (const unsigned char *)angles;\
+                 unsigned i2;\
+                 for (i2 = 0; i2 < mcount*3; i2++) ab[i2] = s[i2]; }\
+               int main(){ unsigned i; int sum=0;\
+                 for (i=0;i<12;i++) DST[i]=0;\
+                 marshal(DST, SRC, 4);\
+                 for (i=0;i<12;i++) sum += (int)DST[i] * (int)(i+1);\
+                 return sum; }";
+    // weighted so a wrong value in ANY slot (including the last) changes the sum
+    let want: u32 = (0..12u32).map(|i| (10 * (i + 1)) * (i + 1)).sum();
+    assert_eq!(run(src), want);
+}
+
+#[test]
+fn fifteen_parameters_all_arrive() {
+    // jerry_pose_kick takes 15 args with the loop bound LAST; a wrong offset
+    // for the tail arguments corrupts exactly the end of its output.
+    let src = "int f(int a,int b,int c,int d,int e,int g,int h,int i,\
+                     int j,int k,int l,int m,int n,int o,int p){\
+                 return a*1+b*2+c*3+d*4+e*5+g*6+h*7+i*8+j*9+k*10\
+                      + l*11+m*12+n*13+o*14+p*15; }\
+               int main(){ return f(1,1,1,1,1,1,1,1,1,1,1,1,1,1,1); }";
+    assert_eq!(run(src), (1..=15).sum::<u32>());
+}
+
+#[test]
+fn fifteen_parameters_mixed_pointers_and_scalars() {
+    // The real signature: pointers first (they claim address registers), then
+    // scalars, with an unsigned count last.
+    let src = "unsigned g_last;\
+               void kick(const void *a,const void *b,const void *c,const void *d,\
+                         const void *e,void *f,int r0,int r1,int r2,int r3,\
+                         int r4,int r5,int r6,int r7,unsigned cnt){\
+                 g_last = cnt + (unsigned)r7*1000; }\
+               static int buf[4];\
+               int main(){ kick(buf,buf,buf,buf,buf,buf,0,0,0,0,0,0,0,7,12);\
+                           return (int)g_last; }";
+    assert_eq!(run(src), 7012);
+}
+
+#[test]
+fn jerry_pose_kick_full_param_block() {
+    // A faithful copy of jerry_pose_kick: 15 parameters, a 16-long parameter
+    // block, then the byte->long angle marshal at +0x40. Every written long is
+    // checked, weighted by slot, so a wrong value anywhere (especially the
+    // last angle, the reported symptom) changes the result.
+    let src = "static volatile unsigned PB[64];\
+               static unsigned char ANG[12] = {3,1,4,1,5,9,2,6,5,3,5,8};\
+               void kick(const void *skv,const void *skvl,const void *sknode,\
+                         const void *angles,const void *sintab,void *out,\
+                         int rootx,int rooty,int rootz,int laC,int laS,\
+                         int rx0,int rz0,int base_y,unsigned mcount){\
+                 volatile unsigned *p = (volatile unsigned *)PB;\
+                 p[0]=(unsigned)skv; p[1]=(unsigned)skvl; p[2]=(unsigned)sknode;\
+                 p[3]=(unsigned)angles; p[4]=(unsigned)sintab; p[5]=(unsigned)out;\
+                 p[6]=(unsigned)rootx; p[7]=(unsigned)rooty; p[8]=(unsigned)rootz;\
+                 p[9]=(unsigned)laC; p[10]=(unsigned)laS; p[11]=(unsigned)rx0;\
+                 p[12]=(unsigned)rz0; p[13]=(unsigned)base_y; p[14]=mcount;\
+                 if (mcount <= 32) {\
+                   volatile unsigned *ab = (volatile unsigned *)((unsigned)PB + 0x40);\
+                   const unsigned char *s = (const unsigned char *)angles;\
+                   unsigned i2;\
+                   for (i2 = 0; i2 < mcount*3; i2++) ab[i2] = s[i2]; } }\
+               int main(){ unsigned i; int sum=0;\
+                 for (i=0;i<64;i++) PB[i]=0;\
+                 kick(0,0,0,ANG,0,0, 11,22,33,44,55,66,77,88, 4);\
+                 for (i=6;i<15;i++) sum += (int)PB[i]*(int)(i+1);\
+                 for (i=0;i<12;i++) sum += (int)PB[16+i]*(int)(i+1)*100;\
+                 return sum; }";
+    let params = [11u32, 22, 33, 44, 55, 66, 77, 88, 4];
+    let angles = [3u32, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5, 8];
+    let want: u32 = params.iter().enumerate().map(|(k, v)| v * (k as u32 + 7))
+        .chain(angles.iter().enumerate().map(|(k, v)| v * (k as u32 + 1) * 100))
+        .sum();
+    assert_eq!(run(src), want);
+}
