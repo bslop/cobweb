@@ -23,6 +23,9 @@ pub struct Scheduler {
     pub cpu_cycles_per_half_line: i64,
     pub half_lines_per_frame: u32,
 
+    /// Set once a non-firing VI value has been reported, so the warning about
+    /// it appears exactly once rather than every field.
+    vi_warned: bool,
     /// True once the VI has fired this frame (fire exactly once per field).
     vi_fired_this_frame: bool,
 
@@ -39,6 +42,15 @@ pub struct Scheduler {
     jpit_div: i64,
 }
 
+/// Will Tom actually raise a video interrupt for this VI value?
+///
+/// The comparator wants an odd half-line inside the active field; anything else
+/// is silently dead on hardware. Modelled from measurement, not from the TRM,
+/// which does not mention it — see the call site.
+fn vi_can_fire(vi: u16) -> bool {
+    vi != 0xFFFF && vi & 1 == 1 && vi >= 16 && vi < 515
+}
+
 impl Scheduler {
     pub fn ntsc() -> Self {
         // 13_295_453 Hz / 59.94 Hz ≈ 221_800 cyc/frame; /524 half-lines ≈ 423.
@@ -49,6 +61,7 @@ impl Scheduler {
             cpu_clock_hz: 13_295_453,
             cpu_cycles_per_half_line: 423,
             half_lines_per_frame: 524,
+            vi_warned: false,
             vi_fired_this_frame: false,
             pit_counter: 0,
             jtimer1_counter: 0,
@@ -68,6 +81,7 @@ impl Scheduler {
             cpu_clock_hz: 13_296_950,
             cpu_cycles_per_half_line: 426,
             half_lines_per_frame: 624,
+            vi_warned: false,
             vi_fired_this_frame: false,
             jpit_presc: 0,
             jpit_div: 0,
@@ -148,7 +162,25 @@ impl Scheduler {
             // enabled, also raise the 68k level-2 interrupt.
             if !self.vi_fired_this_frame {
                 let vi = bus.tom.win.r16(mem::VI);
-                if vi != 0xFFFF && self.half_line >= vi as u32 {
+                // EXACT match on an ODD half-line, not `half_line >= vi`.
+                //
+                // Measured on real silicon (jag_ascii, 2026-08-15): VI armed at
+                // 24 never fires, VI armed at 23 fires every field. jag_openlara
+                // separately probed that VI=15 and VI>=515 never fire either, and
+                // jag_quake arms `a_vdb - 4` with its earlier code forcing the
+                // value odd via `|1`. A `>=` comparison fires for ANY programmed
+                // value, so a ROM that arms an even line worked perfectly here
+                // and produced a dead-black screen on hardware with the ISR never
+                // entered — precisely the failure this is modelled from.
+                if vi != 0xFFFF && !vi_can_fire(vi) && !self.vi_warned {
+                    self.vi_warned = true;
+                    eprintln!(
+                        "jagemu: VI armed at {vi} — this NEVER fires on real hardware \
+                         (needs an odd half-line in 16..514). The vertical interrupt \
+                         will not be delivered here either."
+                    );
+                }
+                if vi_can_fire(vi) && self.half_line == vi as u32 {
                     bus.tom.int1_pending |= mem::C_VIDENA;
                     if bus.tom.int1_enable & mem::C_VIDENA != 0 {
                         cpu.request_interrupt(2);

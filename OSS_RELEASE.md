@@ -27,8 +27,14 @@ before first publication; blocked on nothing else.**
 | `calib/jaguar.inc`, `lastobj.s`, `bootstub.s` | register facts / user's corpus patterns | ours (platform is public domain) |
 | `RESEARCH.md` | authored in-project | ours |
 | Build toolchain (rmac/rln/gcc via cubanismo/jaguar-sdk Docker) | external **build dependency**, not distributed | document as prerequisite; long-term replaced by jas |
+| `sim/crates/jrom/src/univ.bin` | SubQMod's signed 8 KB universal header | ☠️ **third-party binary, REDISTRIBUTED** - `include_bytes!` puts it in the repo and in every `.j64` jrom emits. No formal licence exists for it; it is carried by most of the Jaguar homebrew toolchain. Called out in LICENSE and excluded from the MIT grant. |
 
-No blockers. Nothing in the tree carries a restrictive license.
+☠️ **This table previously said "nothing in the tree carries a restrictive
+license" while listing only `skunk.s` - it had missed `univ.bin` entirely.**
+An audit that enumerates the files it already knows about is not an audit.
+Nothing else in the tree is third-party: `Cargo.lock` resolves to 14 packages
+and all 14 are this workspace's own crates - there are no external
+dependencies at all.
 
 ## Authorship & attribution
 

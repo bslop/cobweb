@@ -211,9 +211,20 @@ pub fn op_render_line(vc: u16, cpu: &mut M68k, gpu: &mut Risc, bus: &mut Bus) {
     let vmode = bus.tom.win.r16(mem::VMODE);
     let fmt = PixFmt::from_vmode(vmode);
 
-    // First active call of the field: size/clear the canvas from the list.
+    // First active call of the field: size/clear the canvas from the list —
+    // but only once the list actually HAS something to draw.
+    //
+    // This used to size at the first even half-line of the field, which is
+    // before the vertical interrupt. Now that the OP consumes its objects, the
+    // list at that instant is last field's spent one (HEIGHT 0), and the canvas
+    // collapsed to a single row. Real hardware has no canvas; ROMs arm VI a few
+    // half-lines AHEAD of display start precisely so the list is rebuilt before
+    // the OP reads it, so waiting for a live object is what matches them.
     if !bus.tom.op.started {
-        op_begin_field(bus, fmt);
+        let olp = ((bus.tom.win.r16(mem::OLPH) as u32) << 16) | bus.tom.win.r16(mem::OLP) as u32;
+        if collect_bitmaps(bus, olp).iter().any(|b| b.height > 0) {
+            op_begin_field(bus, fmt);
+        }
     }
     let (width, height, anchor_x, anchor_y) =
         (bus.tom.op.width, bus.tom.op.height, bus.tom.op.anchor_x, bus.tom.op.anchor_y);
@@ -442,14 +453,25 @@ fn op_walk_line(
         let o = decode_obj(bus, addr8);
         match o.otype {
             0 | 1 => {
-                // Active on this line iff the scanline is within the object's
-                // vertical span. Source line = (vc - ypos)/2 (stateless — no
-                // header write-back, so a static list can never be corrupted).
-                if vc32 >= o.ypos {
-                    let src_line = (vc32 - o.ypos) / 2;
-                    if src_line < o.height {
-                        draw_object_line(bus, &o, src_line, anchor_x, line, written);
-                    }
+                // The OP CONSUMES the object as it draws it (TRM §3.2): on the
+                // line where YPOS matches it emits one line from DATA and then
+                // writes the header back with DATA advanced by DWIDTH, HEIGHT
+                // decremented and YPOS stepped to the next display line. After
+                // one field HEIGHT has reached 0 and the object is spent, so a
+                // display list built once shows exactly one field of picture and
+                // then nothing.
+                //
+                // jsim used to derive the source line arithmetically
+                // (`(vc - ypos)/2`) and never touch the header, on the grounds
+                // that a static list then could not be corrupted. That is
+                // convenient and wrong: it let a ROM that builds its list once
+                // at startup render forever here and go black on real hardware,
+                // which is exactly the bug it cost jag_ascii a bring-up session
+                // to find. Games must rebuild the list (or re-point OLP at a
+                // clean one) every field, and now they must here too.
+                if vc32 == o.ypos && o.height > 0 {
+                    draw_object_line(bus, &o, 0, anchor_x, line, written);
+                    op_consume_line(bus, addr8, &o);
                 }
                 // The OP ALWAYS follows LINK (an inactive object still chains on).
                 addr = bank | o.link;
@@ -815,6 +837,24 @@ fn peek16(bus: &Bus, addr: u32) -> u16 {
     u16::from_be_bytes(b)
 }
 #[inline]
+/// Advance a BITMAP/SCALED header by one drawn line, as the OP does in place:
+/// DATA += DWIDTH phrases, HEIGHT -= 1, YPOS += 2 half-lines. Only the fields
+/// the OP owns are rewritten; LINK and TYPE are preserved bit-for-bit.
+fn op_consume_line(bus: &mut Bus, addr8: u32, o: &Obj) {
+    let hi = peek32(bus, addr8);
+    let lo = peek32(bus, addr8 + 4);
+
+    let data_ph = ((o.data >> 3) + o.dwidth_phrases) & 0x1F_FFFF;
+    let new_hi = (data_ph << 11) | (hi & 0x7FF);
+
+    let height = o.height - 1;
+    let ypos = (o.ypos + 2) & 0x7FF;
+    let new_lo = (lo & 0xFF00_0000) | (height << 14) | (ypos << 3) | (lo & 7);
+
+    bus.write32(addr8, new_hi);
+    bus.write32(addr8 + 4, new_lo);
+}
+
 fn peek32(bus: &Bus, addr: u32) -> u32 {
     let mut b = [0u8; 4];
     bus.peek(addr, &mut b);
