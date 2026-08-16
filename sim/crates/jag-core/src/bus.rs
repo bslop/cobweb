@@ -149,6 +149,22 @@ pub struct Tom {
     /// instruction time while the GPU runs; scheduler wall time while it
     /// doesn't).
     pub blit_busy: u64,
+    /// Ticks remaining in the blitter's BUSY-ASSERTION window.
+    ///
+    /// On silicon the blitter takes several cycles after the `B_CMD` store
+    /// before BUSY appears, so a program that polls immediately after start
+    /// reads a **stale IDLE**, concludes the blit finished, and writes the
+    /// next command's registers into a running blit. BLITTER.md §6's
+    /// "wait for idle BEFORE setup, never after start" exists for this.
+    ///
+    /// The model asserts BUSY instantly, so the hazard is invisible here —
+    /// a divergence in the dangerous direction, since the emulator is more
+    /// forgiving than the hardware. This field does not yet change what the
+    /// status read returns; it exists so the condition can be COUNTED and
+    /// reported instead of silently passing. Making the read actually return
+    /// stale IDLE would break programs that currently work against the
+    /// forgiving model, so that belongs behind a fidelity setting.
+    pub blit_settle: u64,
 }
 
 impl Tom {
@@ -163,6 +179,7 @@ impl Tom {
             last_blit_ticks: 0,
             last_blit_launch: 0,
             blit_busy: 0,
+            blit_settle: 0,
         }
     }
 }
@@ -239,6 +256,10 @@ pub struct Bus {
     /// Atomic because the read path is `&self`; single-threaded ordering is
     /// all we need (Relaxed).
     pub bcmd_busy_reads: std::sync::atomic::AtomicU64,
+    /// `B_CMD` status polls issued inside the BUSY-assertion window — i.e.
+    /// exactly the poll-after-start pattern BLITTER.md §6 forbids. Nonzero
+    /// means the program would misbehave on silicon while passing here.
+    pub bcmd_poll_in_settle: std::sync::atomic::AtomicU64,
 }
 
 /// Cap on retained watch hits — enough to see the pattern, bounded so a
@@ -312,6 +333,7 @@ impl Bus {
             watch_suppress: 0,
             frame_mirror: 0,
             bcmd_busy_reads: std::sync::atomic::AtomicU64::new(0),
+            bcmd_poll_in_settle: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -518,6 +540,12 @@ impl Bus {
             // the bus until blit_busy drains. bit0 = idle.
             if self.tom.blit_busy > 0 {
                 self.bcmd_busy_reads
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            if self.tom.blit_settle > 0 {
+                // Silicon would still read IDLE here and the program would
+                // corrupt the in-flight blit. Count it rather than emulate it.
+                self.bcmd_poll_in_settle
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             return if self.tom.blit_busy > 0 {
