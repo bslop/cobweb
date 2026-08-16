@@ -1917,7 +1917,9 @@ fn state_json(jag: &Jaguar) -> String {
          \"gpu\":{{\"running\":{},\"pc_hex\":{},\"instret\":{},\"cycles\":{},\"granted\":{},\"timing\":{},\
          \"flags\":\"0x{:08X}\",\"regs0\":[{}],\"regs1\":[{}]}},\
          \"dsp\":{{\"running\":{},\"instret\":{},\"cycles\":{},\"timing\":{},\
-         \"flags\":\"0x{:08X}\",\"regs0\":[{}],\"regs1\":[{}]}},\"d\":[{}],\"a\":[{}]}}",
+         \"flags\":\"0x{:08X}\",\"regs0\":[{}],\"regs1\":[{}]}},\
+         \"blitter\":{{\"bcmd_busy_reads\":{},\"bcmd_poll_in_settle\":{}}},\
+         \"d\":[{}],\"a\":[{}]}}",
         jag.frame(),
         cpu.pc,
         jstr(&format!("0x{:06X}", cpu.pc)),
@@ -1941,6 +1943,11 @@ fn state_json(jag: &Jaguar) -> String {
         jag.dsp.flags,
         hexregs(&jag.dsp.regs[0]),
         hexregs(&jag.dsp.regs[1]),
+        // Bus-level, not per-core: a B_CMD status read is one bus transaction
+        // regardless of which master issued it, so these cannot live in
+        // TimingStats alongside the per-core stall counters.
+        jag.bus.bcmd_busy_reads.load(std::sync::atomic::Ordering::Relaxed),
+        jag.bus.bcmd_poll_in_settle.load(std::sync::atomic::Ordering::Relaxed),
         dregs.join(","),
         aregs.join(",")
     )
