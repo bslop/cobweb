@@ -230,6 +230,10 @@ fn attach_sd(jag: &mut Jaguar) {
 /// `--watchdog <frames>`, stashed so it reaches every boot path without adding
 /// a parameter to seven call sites for what is a debugging aid. 0 = disabled.
 static WATCHDOG_FRAMES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Set by `--blit-histogram`; read after the run to print the per-shape
+/// Blitter breakdown. Global for the same reason WATCHDOG_FRAMES is: the run
+/// helpers do not take the arg vector.
+static BLIT_HIST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn apply_watchdog(jag: &mut Jaguar) {
     let n = WATCHDOG_FRAMES.load(std::sync::atomic::Ordering::Relaxed);
@@ -415,6 +419,10 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     if let Some(n) = flag_val(args, "--watchdog").map(parse_u32).transpose()? {
         WATCHDOG_FRAMES.store(n, std::sync::atomic::Ordering::Relaxed);
     }
+    BLIT_HIST.store(
+        has_flag(args, "--blit-histogram"),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     let prof = has_flag(args, "--pc-histogram") || has_flag(args, "--profile68k");
     if prof {
         let top = flag_val(args, "--top").map(parse_u32).transpose()?.unwrap_or(25) as usize;
@@ -652,6 +660,41 @@ fn boot_profiled(
         dsp_c / hz,
         100.0 * dsp_c / wall_cyc
     );
+
+    // --blit-histogram: WHICH blits spend the Blitter's time. An aggregate
+    // cannot distinguish three full-screen copies from ten thousand short
+    // spans, and those call for opposite fixes.
+    if BLIT_HIST.load(std::sync::atomic::Ordering::Relaxed) {
+        let mut rows: Vec<_> = jag
+            .bus
+            .tom
+            .blit_shapes
+            .iter()
+            .map(|(k, v)| (*k, *v))
+            .collect();
+        rows.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
+        let total: u64 = rows.iter().map(|r| r.1 .1).sum();
+        let fr = frames.max(1) as f64;
+        eprintln!("\n=== blit shapes by transfer cost ({} distinct) ===", rows.len());
+        eprintln!(
+            "  {:>6} {:>6} {:>5} {:>6} {:>10} {:>14} {:>7} {:>12}",
+            "inner", "outer", "srcen", "phrase", "count", "transfer_ticks", "% xfer", "ticks/frame"
+        );
+        for (k, v) in rows.iter().take(20) {
+            eprintln!(
+                "  {:>6} {:>6} {:>5} {:>6} {:>10} {:>14} {:>6.1}% {:>12.0}",
+                k.0,
+                k.1,
+                if k.2 { "yes" } else { "no" },
+                if k.3 { "yes" } else { "no" },
+                v.0,
+                v.1,
+                if total > 0 { 100.0 * v.1 as f64 / total as f64 } else { 0.0 },
+                v.1 as f64 / fr
+            );
+        }
+        eprintln!("  total transfer ticks {total}  ({:.0}/frame)", total as f64 / fr);
+    }
 
     if let Some(p) = jag.dbg.prof.as_ref() {
         let rows = if gran > 0 { p.top_buckets(gran, top) } else { p.top(top) };

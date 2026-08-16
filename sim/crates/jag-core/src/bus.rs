@@ -138,6 +138,12 @@ pub struct Tom {
     pub last_blit_ticks: u64,
     /// Launch-overhead part of `last_blit_ticks` (for the counter split).
     pub last_blit_launch: u64,
+    /// Per-SHAPE blit accounting, for `jagemu run --blit-histogram`.
+    /// Key `(inner, outer, srcen, phrase_mode)`; value `(count, transfer_ticks)`.
+    /// Exists because "the Blitter is transfer-dominated" is not actionable
+    /// until you know WHICH blits spend it — a few full-screen copies and ten
+    /// thousand short spans look identical in an aggregate.
+    pub blit_shapes: std::collections::HashMap<(u32, u32, bool, bool), (u64, u64)>,
     /// Ticks until the in-flight blit completes — the Blitter is ASYNCHRONOUS.
     /// HARDWARE (calib 2026-07-19, 1/2/4/8/256-px probes + OpenLara's NOFILL
     /// delta): per-blit cost matches jsim within ~5% at every span length, yet
@@ -189,6 +195,7 @@ impl Tom {
             op: crate::tom::OpState::default(),
             last_blit_ticks: 0,
             last_blit_launch: 0,
+            blit_shapes: std::collections::HashMap::new(),
             blit_busy: 0,
             blit_settle: 0,
             // Off unless explicitly asked for. Matches the existing
