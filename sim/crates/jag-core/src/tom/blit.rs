@@ -625,6 +625,18 @@ pub fn run(bus: &mut Bus, cmd: u32) {
     // non-SRCEN RMW 2x — COBWEB_BUG_blitter_overcharged round 2.)
     let dst_reads = if dsten && srcen { dst_phrases } else { 0 };
     let transfer = (dst_phrases + dst_reads + src_phrases) * BLIT_ACCESS_TICKS_X10 / 10;
+    {
+        // Bucket by shape so a per-blit breakdown is available without a trace.
+        let key = (
+            inner as u32,
+            outer as u32,
+            srcen,
+            gens[dst].xadd == 0, // phrase-addressed destination
+        );
+        let e = bus.tom.blit_shapes.entry(key).or_insert((0, 0));
+        e.0 += 1;
+        e.1 += transfer;
+    }
     bus.tom.last_blit_launch = BLIT_LAUNCH_TICKS;
     bus.tom.last_blit_ticks = BLIT_LAUNCH_TICKS + transfer;
     bus.tom.blit_busy += BLIT_LAUNCH_TICKS + transfer; // asynchronous: drains as wall time passes
