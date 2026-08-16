@@ -774,6 +774,7 @@ impl Risc {
         if blit_ticks > 0 {
             let launch = std::mem::take(&mut bus.tom.last_blit_launch);
             self.pipe.stats.blit += blit_ticks;
+            self.pipe.stats.blit_count += 1;
             self.pipe.stats.blit_launch += launch;
             self.pipe.stats.blit_transfer += blit_ticks - launch;
         }
