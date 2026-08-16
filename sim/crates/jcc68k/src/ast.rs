@@ -249,6 +249,10 @@ pub enum InitByte {
     /// A 32-bit big-endian address of another global symbol, plus a byte addend
     /// (e.g. `&arr[2]` → `Addr("arr", 8)`). Emitted as `.dc.l _sym+addend`.
     Addr(String, i64),
+    /// A 32-bit big-endian address of a string-pool entry, by index into
+    /// `Program::strings` (e.g. `static const char *s = "hi";`). The label is
+    /// per-translation-unit, so only the code generator can spell it.
+    Str(usize),
 }
 
 pub struct Global {

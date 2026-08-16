@@ -1683,7 +1683,8 @@ impl Gen {
                     writeln!(self.out, "\t.globl {}", mangle(&g.name)).unwrap();
                 }
                 writeln!(self.out, "{}:", mangle(&g.name)).unwrap();
-                emit_init(&mut self.out, g.init.as_ref().unwrap());
+                let sp = self.str_prefix.clone(); // out is borrowed mutably
+                emit_init(&mut self.out, g.init.as_ref().unwrap(), &sp);
             }
         }
         let has_bss = prog.globals.iter().any(|g| emit(g) && is_zero(g));
@@ -1707,7 +1708,8 @@ impl Gen {
 
 /// Emit a global's initializer image: coalesce runs of literal bytes into
 /// `.dc.b` directives, and emit each symbol address as `.dc.l _sym+addend`.
-fn emit_init(out: &mut String, init: &[InitByte]) {
+/// `str_prefix` spells the per-unit string-pool labels.
+fn emit_init(out: &mut String, init: &[InitByte], str_prefix: &str) {
     let mut run: Vec<u8> = Vec::new();
     let flush = |out: &mut String, run: &mut Vec<u8>| {
         if !run.is_empty() {
@@ -1729,6 +1731,11 @@ fn emit_init(out: &mut String, init: &[InitByte]) {
                 } else {
                     writeln!(out, "\t.dc.l {}", mangle(sym)).unwrap();
                 }
+            }
+            InitByte::Str(idx) => {
+                flush(out, &mut run);
+                out.push_str("\t.even\n");
+                writeln!(out, "\t.dc.l {str_prefix}_{idx}").unwrap();
             }
         }
     }
