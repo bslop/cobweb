@@ -19,7 +19,7 @@ set -eu
 ROM=${1:?usage: run_bench.sh <rom.cof> [tag] [timeout_seconds]}
 TAG=${2:-$(basename "$ROM" .cof)}
 LIMIT=${3:-600}
-PATH=/home/jvilla/jaguar-tools/bin:$PATH
+PATH=~/jaguar-tools/bin:$PATH
 export PATH
 
 [ -f "$ROM" ] || { echo "run_bench: no such ROM: $ROM" >&2; exit 2; }
