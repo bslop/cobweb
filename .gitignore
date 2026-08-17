@@ -2,3 +2,4 @@ calib/build/
 sim/target/
 *.o
 __pycache__/
+.bigpemu
