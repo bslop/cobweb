@@ -1,3 +1,4 @@
 calib/build/
 sim/target/
 *.o
+__pycache__/
