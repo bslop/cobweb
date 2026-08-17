@@ -144,6 +144,20 @@ pub struct Tom {
     /// until you know WHICH blits spend it — a few full-screen copies and ten
     /// thousand short spans look identical in an aggregate.
     pub blit_shapes: std::collections::HashMap<(u32, u32, bool, bool), (u64, u64)>,
+    /// Blits booked to the master that actually stored B_CMD, as
+    /// `(count, launch_ticks, transfer_ticks)` indexed by [`Master`].
+    ///
+    /// The per-core `stats.blit*` counters cannot answer "who issued this
+    /// blit". `blit::run` assigns `last_blit_ticks`, and the RISC pipeline
+    /// drains it with `mem::take` during instruction execution, so a blit is
+    /// booked to whichever core happens to run next — a 68000-issued
+    /// full-screen clear lands in Tom's or Jerry's column depending only on
+    /// which was busier. That mislabelling cost two sessions a day of
+    /// confusion: an 8x improvement to a clear appeared to move nothing,
+    /// because the counter being watched belonged to a different population.
+    /// Here the master is the one stashed before the Blitter takes over the
+    /// bus, so the label is the truth.
+    pub blit_by_master: [(u64, u64, u64); 5],
     /// Ticks until the in-flight blit completes — the Blitter is ASYNCHRONOUS.
     /// HARDWARE (calib 2026-07-19, 1/2/4/8/256-px probes + OpenLara's NOFILL
     /// delta): per-blit cost matches jsim within ~5% at every span length, yet
@@ -196,6 +210,7 @@ impl Tom {
             last_blit_ticks: 0,
             last_blit_launch: 0,
             blit_shapes: std::collections::HashMap::new(),
+            blit_by_master: [(0, 0, 0); 5],
             blit_busy: 0,
             blit_settle: 0,
             // Off unless explicitly asked for. Matches the existing
@@ -595,6 +610,14 @@ impl Bus {
                 self.cur_master = Master::Blitter;
                 self.cur_master_pc = 0;
                 crate::tom::blit::run(self, v);
+                // `run` always assigns both fields on every path, so reading
+                // (not taking) them here is exact and leaves the RISC
+                // pipeline's own `mem::take` accounting untouched.
+                let (ticks, launch) = (self.tom.last_blit_ticks, self.tom.last_blit_launch);
+                let slot = &mut self.tom.blit_by_master[m as usize];
+                slot.0 += 1;
+                slot.1 += launch;
+                slot.2 += ticks - launch;
                 self.cur_master = m;
                 self.cur_master_pc = pc;
             }
