@@ -661,6 +661,16 @@ fn boot_profiled(
         100.0 * dsp_c / wall_cyc
     );
 
+    if jag.bus.risc_ram_narrow_writes > 0 {
+        eprintln!(
+            "\n  !! {} sub-32-bit write(s) into GPU/DSP internal RAM.\n\
+             \x20    Silicon takes 32-BIT ACCESSES ONLY there - a byte/word store does not\n\
+             \x20    land, so a kernel uploaded this way is corrupt and the core never starts.\n\
+             \x20    jsim models byte-addressable memory and runs it fine; hardware will not.",
+            jag.bus.risc_ram_narrow_writes
+        );
+    }
+
     // --blit-histogram: WHICH blits spend the Blitter's time. An aggregate
     // cannot distinguish three full-screen copies from ten thousand short
     // spans, and those call for opposite fixes.
@@ -1961,7 +1971,7 @@ fn state_json(jag: &Jaguar) -> String {
          \"flags\":\"0x{:08X}\",\"regs0\":[{}],\"regs1\":[{}]}},\
          \"dsp\":{{\"running\":{},\"instret\":{},\"cycles\":{},\"timing\":{},\
          \"flags\":\"0x{:08X}\",\"regs0\":[{}],\"regs1\":[{}]}},\
-         \"blitter\":{{\"bcmd_busy_reads\":{},\"bcmd_poll_in_settle\":{}}},\
+         \"blitter\":{{\"bcmd_busy_reads\":{},\"bcmd_poll_in_settle\":{}}},\"risc_ram_narrow_writes\":{},\
          \"d\":[{}],\"a\":[{}]}}",
         jag.frame(),
         cpu.pc,
@@ -1991,6 +2001,7 @@ fn state_json(jag: &Jaguar) -> String {
         // TimingStats alongside the per-core stall counters.
         jag.bus.bcmd_busy_reads.load(std::sync::atomic::Ordering::Relaxed),
         jag.bus.bcmd_poll_in_settle.load(std::sync::atomic::Ordering::Relaxed),
+        jag.bus.risc_ram_narrow_writes,
         dregs.join(","),
         aregs.join(",")
     )
