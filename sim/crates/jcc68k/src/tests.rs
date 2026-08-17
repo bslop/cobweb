@@ -1638,6 +1638,28 @@ fn struct_assignment_copies_the_object() {
 }
 
 #[test]
+fn unsigned_literal_suffix_is_honoured() {
+    // The lexer consumed `u`/`U` and threw it away, so `1u` was typed `int`.
+    // `(0u - 1u)` then wrapped to -1 instead of 0xFFFFFFFF, and `>>` on it
+    // folded ARITHMETICALLY. The same expression written through `unsigned`
+    // variables was correct, which is what made it hard to spot.
+    assert_eq!(run("int main(void){ return (0u - 1u) > 0u; }"), 1);
+    assert_eq!(run("int main(void){ return (int)((1u - 6u) >> 8); }"), 16777215);
+    assert_eq!(run("int main(void){ return (int)((1u - 6u) / 2u); }"), 2147483645);
+    assert_eq!(run("int main(void){ return (int)((1u - 6u) % 7u); }"), 6);
+    // signed literals must still be signed
+    assert_eq!(run("int main(void){ return (1 - 6); }"), (-5i32) as u32);
+    assert_eq!(run("int main(void){ return ((1 - 6) >> 1); }"), (-3i32) as u32);
+    assert_eq!(run("int main(void){ return ((1 - 6) / 2); }"), (-2i32) as u32);
+    // a signed operand converts to unsigned when the other side is unsigned
+    assert_eq!(run("int main(void){ return -1 < 0u; }"), 0);
+    // a literal too large for int is unsigned even without a suffix, since
+    // int and long are both 32-bit here and long long is unsupported
+    assert_eq!(run("int main(void){ return (int)(4294967291u >> 8); }"), 16777215);
+    assert_eq!(run("int main(void){ return (int)((0xFFu << 24) >> 24); }"), 255);
+}
+
+#[test]
 fn diff_unary_ops_promote_to_int() {
     // `-` and `~` keep the operand's type unless integer promotion runs first,
     // so a narrow operand truncated the result: `~(unsigned char)13` came out

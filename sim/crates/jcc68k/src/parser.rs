@@ -113,7 +113,7 @@ fn strip_gnu(toks: Vec<Token>) -> (Vec<Token>, HashMap<String, u32>) {
                         let mut j = start;
                         while j < i {
                             if matches!(&toks[j].tok, Tok::Ident(a) if a == "aligned" || a == "__aligned__") {
-                                if let (Some(Tok::Punct(o)), Some(Tok::Num(n))) = (
+                                if let (Some(Tok::Punct(o)), Some(Tok::Num(n, _))) = (
                                     toks.get(j + 1).map(|t| &t.tok),
                                     toks.get(j + 2).map(|t| &t.tok),
                                 ) {
@@ -1288,8 +1288,6 @@ impl Parser {
             // sign-extended back to the same bits, which is why this survived
             // until differential testing hit the unsigned case.
             let ty = if t.ty.is_integer() && e.ty.is_integer() {
-                let wide_unsigned =
-                    |x: &Type| matches!(&**x, TypeK::Int { size, signed: false } if *size >= 4);
                 let signed = !(wide_unsigned(&t.ty) || wide_unsigned(&e.ty));
                 Rc::new(TypeK::Int { size: 4, signed })
             } else if t.ty.is_fixed() || e.ty.is_fixed() {
@@ -1537,9 +1535,14 @@ impl Parser {
     fn primary(&mut self) -> PResult<Expr> {
         let line = self.line();
         match self.peek().clone() {
-            Tok::Num(n) => {
+            Tok::Num(n, uns) => {
                 self.pos += 1;
-                Ok(Expr { kind: ExprK::Num(n), ty: t_int(), line })
+                // `1u` is `unsigned int`, not `int`. Dropping the suffix made
+                // `(0u - 1u) > 0u` false and folded `(1u - 6u) >> 8` as an
+                // arithmetic shift, while the same expression through
+                // `unsigned` variables was correct.
+                let ty = if uns { t_uint() } else { t_int() };
+                Ok(Expr { kind: ExprK::Num(n), ty, line })
             }
             Tok::Float(f) => {
                 self.pos += 1;
@@ -1643,8 +1646,6 @@ impl Parser {
                 // as unsigned, so a negative difference compared as a huge
                 // positive — `(a - b) < 0` was false for every narrow unsigned
                 // operand. Found by differential testing against the host cc.
-                let wide_unsigned =
-                    |t: &Type| matches!(&**t, TypeK::Int { size, signed: false } if *size >= 4);
                 let signed = !(wide_unsigned(&lt) || wide_unsigned(&rt));
                 Rc::new(TypeK::Int { size: 4, signed })
             }
@@ -1653,7 +1654,13 @@ impl Parser {
         // generator's address folding: an offset that is still a `Binary` node
         // at codegen time has to be computed in registers at runtime.
         if let (ExprK::Num(a), ExprK::Num(b)) = (&lhs.kind, &rhs.kind) {
-            let signed = lt.is_signed() && rt.is_signed();
+            // Fold with the SAME signedness as the result type computed above.
+            // Using `is_signed()` here disagreed with `ty` for narrow-unsigned
+            // and unsigned-literal operands, so `(1u - 6u) >> 8` folded as an
+            // arithmetic shift and produced 0xFFFFFFFF instead of 0x00FFFFFF —
+            // while the identical expression written through variables was
+            // correct, because only the constant path was wrong.
+            let signed = !(wide_unsigned(&lt) || wide_unsigned(&rt));
             if let Some(v) = fold_const_binary(op, *a, *b, signed) {
                 return Ok(Expr { kind: ExprK::Num(v), ty, line });
             }
@@ -1701,6 +1708,17 @@ fn scale(e: Expr, sz: u32, line: usize) -> Expr {
 /// forgetting it has produced four separate wrong-code bugs in this compiler:
 /// binary result typing, `?:` result typing, comparison/division signedness,
 /// and unary `-`/`~`. If you add an arithmetic operator, start here.
+/// Whether an operand forces the *unsigned* form after integer promotion:
+/// an unsigned integer of `int` rank or wider. Narrow unsigned types promote
+/// to signed `int` on this target and so do NOT force it.
+///
+/// Shared by the result-type rule and the constant folder, which previously
+/// disagreed — the folder used `is_signed()` and shifted `(1u - 6u) >> 8`
+/// arithmetically while the type said unsigned.
+fn wide_unsigned(t: &Type) -> bool {
+    matches!(&**t, TypeK::Int { size, signed: false } if *size >= 4)
+}
+
 fn promote_int(t: &Type) -> Type {
     match &**t {
         TypeK::Int { size, .. } if *size < 4 => t_int(),
