@@ -35,12 +35,30 @@
 static unsigned short fb[W * H] __attribute__((aligned(16)));
 static unsigned op_list[8] __attribute__((aligned(16)));
 
+/* Jaguar RGB16: R at bits 15-11, B at 10-6, GREEN at 5-0 — six bits, unshifted.
+ *
+ * Measured, not assumed. Writing green as `g << 1` puts it in bits 1-6, which
+ * both drops its low bit and spills its top bit into the blue field: a ramp fed
+ * 0..63 comes back with 32 distinct green levels and 2 distinct blue, instead
+ * of 63 and 1. That formula is safe only for a 5-BIT green, where nothing
+ * reaches bit 6 — so it silently wastes the sixth bit rather than failing, and
+ * every channel-isolation and ramp assertion still passes.
+ *
+ * r, b: 0..31.   g: 0..63.
+ */
 static unsigned short rgb(unsigned r, unsigned g, unsigned b)
 {
-    return (unsigned short)((r << 11) | (b << 6) | (g << 1));
+    return (unsigned short)((r << 11) | (b << 6) | g);
 }
 
-static unsigned char ramp[W];      /* x -> 0..31, computed once */
+/* Two ramps, deliberately ASYMMETRIC. Red and blue are 5-bit fields; green is
+ * 6. Feeding 0..31 to all three means nothing ever exercises green's sixth bit,
+ * so a layout packing 5-bit green into the 6-bit field passes every isolation
+ * and ramp assertion — the check could discriminate, it was just never shown a
+ * case that provoked the fault. Coverage and discrimination are separate
+ * properties and the test needs both. */
+static unsigned char ramp5[W];     /* x -> 0..31, for red and blue */
+static unsigned char ramp6[W];     /* x -> 0..63, so green's low bit matters */
 
 static void paint(void)
 {
@@ -48,20 +66,23 @@ static void paint(void)
     /* One divide per COLUMN, not per pixel: the 68000 has no 32-bit divide, so
        every `/` in an inner loop is a __divsi3 call. Dividing per pixel meant
        paint() had not finished after 60 frames. */
-    for (x = 0; x < W; x++) ramp[x] = (unsigned char)((x * 31) / W);
+    for (x = 0; x < W; x++) {
+        ramp5[x] = (unsigned char)((x * 31) / W);
+        ramp6[x] = (unsigned char)((x * 63) / W);
+    }
 
     for (y = 0; y < H; y++) {
         unsigned short *row = &fb[y * W];
         int band = (y < H / 3) ? 0 : ((y < (2 * H) / 3) ? 1 : 2);
         int diag = (y * W) / H;
         for (x = 0; x < W; x++) {
-            unsigned v = ramp[x];
+            unsigned v5 = ramp5[x], v6 = ramp6[x];
             unsigned short c;
-            if (y < 2 || y >= H - 2 || x < 2 || x >= W - 2) c = rgb(31, 31, 31);
-            else if (x == diag)                            c = rgb(31, 31, 0);
-            else if (band == 0)                            c = rgb(v, 0, 0);
-            else if (band == 1)                            c = rgb(0, v, 0);
-            else                                           c = rgb(0, 0, v);
+            if (y < 2 || y >= H - 2 || x < 2 || x >= W - 2) c = rgb(31, 63, 31);
+            else if (x == diag)                            c = rgb(31, 63, 0);
+            else if (band == 0)                            c = rgb(v5, 0, 0);
+            else if (band == 1)                            c = rgb(0, v6, 0);   /* 6-bit */
+            else                                           c = rgb(0, 0, v5);
             row[x] = c;
         }
     }

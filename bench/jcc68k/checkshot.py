@@ -92,11 +92,33 @@ def main():
         ok, v = ramps(y, ch)
         chk(f"ramp {name} rises left-to-right", ok, f"left/right means {v}")
 
+    # PRECISION: does green actually carry six bits?
+    #
+    # Channel isolation proves WHICH channel a value lands in; it cannot prove
+    # how many bits that channel has. A layout packing 5-bit green into the
+    # 6-bit field passes isolation and ramp assertions while silently halving
+    # green resolution. The discriminator is that distinct inputs must produce
+    # distinct outputs: if the low bit is dropped, consecutive values collide
+    # in pairs. drawtest.c drives green 0..63 (red/blue stay 0..31) precisely
+    # so this is observable — an assertion cannot catch a failure the input
+    # never provokes.
+    gy = 60                                  # inside the green band
+    seen = {}
+    for x in range(BORDER + 4, W - BORDER - 4):
+        if x == (gy * W) // H:               # skip the diagonal
+            continue
+        seen.setdefault(px[x, gy][1], 0)
+        seen[px[x, gy][1]] += 1
+    distinct = len(seen)
+    chk("green carries 6 bits (precision)", distinct >= 40,
+        f"{distinct} distinct green levels across the ramp — 5-bit green in a "
+        f"6-bit field roughly halves this")
+
     x0, y0, x1, y1 = SQUARE
     c = px[(x0 + x1) // 2, (y0 + y1) // 2]
     chk("magenta block (R+B, no G)", c[0] > 200 and c[2] > 200 and c[1] < 40, f"got {c}")
 
-    print(f"\n  {len(fails)} failure(s)" if fails else f"\n  {12} checks passed")
+    print(f"\n  {len(fails)} failure(s)" if fails else f"\n  {13} checks passed")
     return 1 if fails else 0
 
 
