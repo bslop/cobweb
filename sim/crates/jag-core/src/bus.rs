@@ -251,6 +251,14 @@ pub struct Bus {
     pub jerry: Jerry,
     /// Count of bus accesses, for the debugger / profiler.
     pub access_count: u64,
+    /// 68000 writes NARROWER THAN 32 BITS into GPU or DSP internal RAM.
+    /// On silicon RISC internal RAM takes 32-bit accesses only: a byte or
+    /// word store does NOT land, so a kernel uploaded with a `move.b` loop
+    /// is corrupt and the core never starts. Emulators model plain
+    /// byte-addressable memory and run such an upload perfectly, which is
+    /// exactly how one project shipped eleven sessions of DSP work that had
+    /// never executed on hardware. Counted so the run can say so out loud.
+    pub risc_ram_narrow_writes: u64,
     /// Captured stereo audio (interleaved L,R 16-bit) when `audio_capture` is on.
     pub audio: Vec<i16>,
     pub audio_capture: bool,
@@ -346,6 +354,7 @@ impl Bus {
             gamedrive: None,
             jerry: Jerry::new(),
             access_count: 0,
+            risc_ram_narrow_writes: 0,
             audio: Vec::new(),
             audio_capture: false,
             audio_rate: 44_100,
@@ -431,6 +440,18 @@ impl Bus {
         self.m68k_bus_cycles += 1;
         self.access_count += 1;
         let a = addr & ADDR_MASK;
+        // GPU SRAM $F03000-$F03FFF, DSP SRAM $F1B000-$F1CFFF: 32-bit only.
+        // `watch_suppress` is nonzero exactly while a wider write is being
+        // decomposed into bytes (write32 -> write16 -> write8 for Jerry space),
+        // so it is what separates a REAL byte store from the tail of a correct
+        // 32-bit one. Without this guard the counter fires identically for a
+        // fixed and a broken upload - which it did, on the first attempt.
+        if self.watch_suppress == 0
+            && ((0x00F0_3000..0x00F0_4000).contains(&a)
+                || (0x00F1_B000..0x00F1_D000).contains(&a))
+        {
+            self.risc_ram_narrow_writes += 1;
+        }
         self.watch_note(a, 8, v as u32);
         if mem::is_dram(a) {
             self.dram[a as usize] = v;
