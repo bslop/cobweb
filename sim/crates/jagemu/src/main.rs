@@ -2015,7 +2015,7 @@ fn timing_json(t: &TimingStats) -> String {
          \"stall_div_busy\":{},\"jump_refill\":{},\"fetch_external\":{},\"mem_external\":{},\
          \"waw_hazards\":{},\"indexed_store_stale\":{},\"slot_movei\":{},\"slot_jump\":{},\
          \"bigpemu_divergence\":{},\"contention\":{},\"blit\":{},\
-         \"blit_count\":{},\"blit_launch\":{},\"blit_transfer\":{},\"blit_wait\":{},\"div_by_zero\":{}}}",
+         \"unaligned_risc32\":{},\"blit_count\":{},\"blit_launch\":{},\"blit_transfer\":{},\"blit_wait\":{},\"div_by_zero\":{}}}",
         t.stall_alu,
         t.stall_load,
         t.stall_div,
@@ -2031,6 +2031,7 @@ fn timing_json(t: &TimingStats) -> String {
         t.bigpemu_divergence,
         t.contention,
         t.blit,
+        t.unaligned_risc32,
         t.blit_count,
         t.blit_launch,
         t.blit_transfer,
