@@ -248,6 +248,14 @@ pub struct TimingStats {
     /// A plain count, so no caller has to divide `blit_launch` by an internal
     /// constant to recover it.
     pub blit_count: u64,
+    /// RISC 32-bit data accesses to an address that is NOT long-aligned.
+    /// The JRISC ignores the low two address bits, so such an access reads or
+    /// writes the CONTAINING long - a coordinate spliced out of two
+    /// neighbours. Emulators that honour the unaligned address run the code
+    /// perfectly and hide the bug; jsim now masks like the hardware AND
+    /// counts, because a silently-correct read is how one project shipped a
+    /// misaligned vertex array nobody could reproduce off-silicon.
+    pub unaligned_risc32: u64,
     /// Transfer component of `blit` (phrase-access ticks).
     pub blit_transfer: u64,
     /// Ticks this core spent executing loads of B_CMD that OBSERVED BUSY —
