@@ -5,7 +5,8 @@
 #[derive(Debug, Clone, PartialEq)]
 pub enum Tok {
     // literals / identifiers
-    Num(i64),
+    /// Integer literal: (value, was it `u`-suffixed / too big for int).
+    Num(i64, bool),
     /// Floating literal (kept as f64; lowered to 16.16 fixed-point by codegen).
     Float(f64),
     Str(Vec<u8>),
@@ -185,8 +186,8 @@ fn parse_line_marker(rest: &str) -> Option<(usize, Option<&str>)> {
 fn scan_number(b: &[u8]) -> Result<(Tok, usize), String> {
     // hex / octal are always integers
     if b.len() >= 2 && b[0] == b'0' && (b[1] == b'x' || b[1] == b'X') {
-        let (v, n) = lex_number(b)?;
-        return Ok((Tok::Num(v), n));
+        let (v, u, n) = lex_number(b)?;
+        return Ok((Tok::Num(v, u), n));
     }
     let mut i = 0;
     let mut is_float = false;
@@ -218,12 +219,12 @@ fn scan_number(b: &[u8]) -> Result<(Tok, usize), String> {
         }
         Ok((Tok::Float(f), i))
     } else {
-        let (v, n) = lex_number(b)?;
-        Ok((Tok::Num(v), n))
+        let (v, u, n) = lex_number(b)?;
+        Ok((Tok::Num(v, u), n))
     }
 }
 
-fn lex_number(b: &[u8]) -> Result<(i64, usize), String> {
+fn lex_number(b: &[u8]) -> Result<(i64, bool, usize), String> {
     let mut i = 0;
     let val: i64;
     if b.len() >= 2 && b[0] == b'0' && (b[1] == b'x' || b[1] == b'X') {
@@ -249,11 +250,25 @@ fn lex_number(b: &[u8]) -> Result<(i64, usize), String> {
         val = std::str::from_utf8(&b[..i]).unwrap().parse::<i64>()
             .map_err(|e| format!("bad integer literal: {e}"))?;
     }
-    // consume integer suffixes u/U/l/L
+    // Consume integer suffixes u/U/l/L, and REMEMBER whether one made this
+    // unsigned. Discarding that made `1u` a plain `int`, so `(0u - 1u) > 0u`
+    // was false and `(1u - 6u) >> 8` folded as an arithmetic shift — the
+    // literal path disagreed with the identical expression written through
+    // `unsigned` variables. `long` is 32-bit here, so l/L changes nothing.
+    let mut uns = false;
     while i < b.len() && matches!(b[i], b'u' | b'U' | b'l' | b'L') {
+        if b[i] == b'u' || b[i] == b'U' {
+            uns = true;
+        }
         i += 1;
     }
-    Ok((val, i))
+    // A value too large for `int` is unsigned as well: `int` and `long` are both
+    // 32-bit on this target and `long long` is unsupported, so unsigned int is
+    // the only type left that can represent it.
+    if val > i32::MAX as i64 || val < i32::MIN as i64 {
+        uns = true;
+    }
+    Ok((val, uns, i))
 }
 
 fn escape(b: &[u8]) -> Result<(u8, usize), String> {
