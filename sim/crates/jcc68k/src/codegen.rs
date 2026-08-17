@@ -24,7 +24,16 @@ pub struct Gen {
     frame: HashMap<String, i32>,
     types: HashMap<String, Type>,
     globals: HashMap<String, Type>,
+    /// The unit's string-literal pool, needed at statement level because
+    /// `char buf[N] = "text"` must copy the CHARACTERS into the frame rather
+    /// than store a pointer to the pool.
+    strings: Vec<Vec<u8>>,
     ret_label: String,
+    /// The current function's declared return type. `return e;` converts to it
+    /// like any other assignment, so a `char`/`short` result is narrowed before
+    /// it reaches D0 — otherwise a caller reading the full 32 bits sees the
+    /// untruncated value.
+    ret_ty: Type,
     break_labels: Vec<String>,
     cont_labels: Vec<String>,
     /// Evaluation-stack depth for data temporaries (operands of an outer op held
@@ -139,7 +148,9 @@ pub fn generate(prog: &Program) -> Result<String, String> {
         frame: HashMap::new(),
         types: HashMap::new(),
         globals: HashMap::new(),
+        strings: prog.strings.clone(),
         ret_label: String::new(),
+        ret_ty: t_int(),
         break_labels: Vec::new(),
         cont_labels: Vec::new(),
         dtemp: 0,
@@ -387,7 +398,7 @@ fn collect_stmt_refs(s: &Stmt, out: &mut std::collections::HashSet<String>) {
         Stmt::Return(None) | Stmt::Break | Stmt::Continue | Stmt::Goto(_)
         | Stmt::Case(_) | Stmt::Default(_) | Stmt::Null => {}
         Stmt::Asm(t) => asm_text(t, out),
-        Stmt::AsmExt { template, output, input } => {
+        Stmt::AsmExt { template, output, input, .. } => {
             asm_text(template, out);
             if let Some((_, e)) = output {
                 expr(e, out);
@@ -486,6 +497,28 @@ impl Gen {
 
     // ── functions ─────────────────────────────────────────────────────────────
     fn gen_function(&mut self, f: &Function) -> Result<(), String> {
+        // Passing or returning a struct BY VALUE is not implemented, and the
+        // code that used to come out was silently wrong rather than absent:
+        // `gen_call` pushes an aggregate argument's ADDRESS, so the callee
+        // mutated the caller's object (pass-by-reference), only 4 bytes were
+        // cleaned from the stack, and a struct return assigned 4 bytes — the
+        // address — into the destination. Refuse it instead, the way the
+        // 64-bit types are refused: a diagnostic is recoverable, a silent
+        // miscompile in a renderer is not.
+        if matches!(&*f.ret, TypeK::Struct { .. }) {
+            return Err(format!(
+                "{}: returning a struct by value is not supported on this target — \
+                 return it through an out-pointer parameter instead",
+                f.name
+            ));
+        }
+        if let Some((pn, _)) = f.params.iter().find(|(_, t)| matches!(&**t, TypeK::Struct { .. })) {
+            return Err(format!(
+                "{}: parameter `{pn}` passes a struct by value, which is not supported on \
+                 this target — pass a pointer to it instead",
+                f.name
+            ));
+        }
         // Lay out the frame. Params get positive offsets (8,12,… above A6);
         // other locals get negative offsets below A6.
         self.frame.clear();
@@ -530,19 +563,26 @@ impl Gen {
         // A5 is deliberately left out: the eval stack needs at least one address
         // register for held lvalue addresses before it starts spilling to A7.
         const LOCAL_AREGS: &[&str] = &["a2", "a3", "a4"];
+        // Registers an inline asm says it destroys are off the table entirely —
+        // for locals and for the evaluation stack alike.
+        let banned = collect_asm_clobbers(&f.body);
+        let usable = |set: &[&'static str]| -> Vec<&'static str> {
+            set.iter().copied().filter(|r| !banned.contains(*r)).collect()
+        };
+        let (local_aregs, local_dregs) = (usable(LOCAL_AREGS), usable(LOCAL_DREGS));
         let mut claimed: Vec<&str> = Vec::new();
         let (ptrs, others): (Vec<_>, Vec<_>) =
             cand.iter().partition(|(_, t)| matches!(&***t, TypeK::Ptr(_)));
-        for ((n, _), &r) in ptrs.iter().zip(LOCAL_AREGS) {
+        for ((n, _), r) in ptrs.iter().zip(&local_aregs) {
             self.reg_of.insert(n.to_string(), r.to_string());
             claimed.push(r);
         }
-        for ((n, _), &r) in others.iter().zip(LOCAL_DREGS) {
+        for ((n, _), r) in others.iter().zip(&local_dregs) {
             self.reg_of.insert(n.to_string(), r.to_string());
             claimed.push(r);
         }
-        self.dpool = DTEMP_REGS.iter().copied().filter(|r| !claimed.contains(r)).collect();
-        self.apool = ATEMP_REGS.iter().copied().filter(|r| !claimed.contains(r)).collect();
+        self.dpool = usable(DTEMP_REGS).into_iter().filter(|r| !claimed.contains(r)).collect();
+        self.apool = usable(ATEMP_REGS).into_iter().filter(|r| !claimed.contains(r)).collect();
 
         let param_names: std::collections::HashSet<&str> =
             f.params.iter().map(|(n, _)| n.as_str()).collect();
@@ -550,7 +590,24 @@ impl Gen {
         for (pn, pt) in &f.params {
             // A register param still receives its arg in the stack slot; we copy
             // it to the register in the prologue below.
-            self.frame.insert(pn.clone(), poff);
+            //
+            // Every argument occupies a full 32-bit slot, so a `char`/`short`
+            // parameter's value sits in the LOW end of its slot on this
+            // big-endian chip: at +3 for a byte, +2 for a word. Addressing the
+            // slot from its base and reading a word there returns the zero (or
+            // sign) padding instead of the argument. That was the joypad strobe
+            // bug — `strobe(0x81FE)` read sel == 0, so all four scan columns
+            // wrote the same value and the pad reported nothing pressed.
+            //
+            // Aggregates are exempt: `gen_call` pushes an aggregate argument's
+            // *address*, so those slots really are 4-byte pointers. Registered
+            // params are exempt by construction — `is_scalar4` only promotes
+            // 4-byte types, so the prologue's `move.l off(a6)` never sees an
+            // adjusted offset.
+            let sz = pt.size().max(1) as i32;
+            let scalar = !matches!(&**pt, TypeK::Array(..) | TypeK::Struct { .. } | TypeK::Func { .. });
+            let lo = if scalar && sz < 4 { 4 - sz } else { 0 };
+            self.frame.insert(pn.clone(), poff + lo);
             self.types.insert(pn.clone(), pt.clone());
             poff += 4; // args are pushed as longs
         }
@@ -570,6 +627,7 @@ impl Gen {
 
         let name = mangle(&f.name);
         self.ret_label = format!(".Lret_{}", self.l());
+        self.ret_ty = f.ret.clone(); // set before the body: `return` reads it
 
         // Generate the body into a side buffer first, then wrap it in the
         // smallest correct prologue/epilogue: LINK/UNLK only when the frame is
@@ -647,7 +705,7 @@ impl Gen {
                     }
                 }
             }
-            Stmt::AsmExt { template, output, input } => {
+            Stmt::AsmExt { template, output, input, .. } => {
                 // Operand plan (GCC numbering, output first): %0 → d0, %1 → d1.
                 // Evaluate the input, hold it, load a `+` output's old value,
                 // emit the substituted template, store d0 back to the output.
@@ -685,6 +743,26 @@ impl Gen {
             Stmt::Return(e) => {
                 if let Some(e) = e {
                     self.gen_expr(e)?;
+                    // Narrow a char/short result to its declared width, so a
+                    // caller reading the full 32 bits of D0 cannot see the
+                    // untruncated value (`unsigned char f(){return 0x1FF;}`
+                    // must yield 255, not 511).
+                    //
+                    // Deliberately limited to sub-word *integer* returns rather
+                    // than a general conversion to the return type. `float` here
+                    // is raw 16.16 fixed, and this project's convention is that
+                    // returning one through an `int` hands back the raw word —
+                    // see `fixed_raw_repr`. A full C conversion would silently
+                    // change that for every ported source file.
+                    //
+                    // `cast` never narrows — it relies on the destination store
+                    // to truncate, and a return has no store. Casting *from* the
+                    // narrow return type *to* int runs its widening path, which
+                    // is exactly the mask-and-re-extend this needs.
+                    let rt = self.ret_ty.clone();
+                    if matches!(&*rt, TypeK::Int { size: 1 | 2, .. }) {
+                        self.cast(&rt, &t_int());
+                    }
                 }
                 let rl = self.ret_label.clone();
                 self.line(&format!("bra.w {rl}"));
@@ -697,6 +775,20 @@ impl Gen {
             Stmt::Decl(name, ty, init) => {
                 if let Some(init) = init {
                     let off = self.frame.get(name).copied().unwrap_or(0);
+                    if self.try_str_array_init(off, ty, init) {
+                        return Ok(());
+                    }
+                    // `struct P y = x;` — an aggregate initialized from another
+                    // aggregate is a copy, not a pointer store.
+                    if matches!(&**ty, TypeK::Struct { .. }) {
+                        if let Init::Scalar(e) = init {
+                            self.gen_expr(e)?; // source address in D0
+                            self.line("move.l d0,a0");
+                            self.line(&format!("lea {off}(a6),a1"));
+                            self.copy_block(ty.size());
+                            return Ok(());
+                        }
+                    }
                     match init {
                         Init::Scalar(e) => {
                             self.gen_expr(e)?;
@@ -868,8 +960,42 @@ impl Gen {
             ExprK::Cast(a) => {
                 self.gen_expr(a)?;
                 self.cast(&a.ty, &e.ty);
+                // An explicit cast is a VALUE conversion, and `cast` never
+                // narrows — it leaves truncation to the destination store, of
+                // which a cast expression has none. Without this `(short)v` and
+                // `(unsigned char)v` were complete no-ops: the full 32-bit
+                // value flowed straight into the surrounding expression.
+                // Casting *from* the narrow type *to* int runs cast's widening
+                // path, which is the mask-and-re-extend this needs. Same shape
+                // as the sub-word `return` fix.
+                if matches!(&*e.ty, TypeK::Int { size: 1 | 2, .. }) {
+                    self.cast(&e.ty, &t_int());
+                }
             }
             ExprK::Assign(lhs, rhs) => {
+                // `y = x` on a struct copies the whole object. The RHS is an
+                // aggregate rvalue, i.e. its *address* lands in D0, so hold
+                // that across the destination's address computation and then
+                // block-copy.
+                if matches!(&*lhs.ty, TypeK::Struct { .. }) {
+                    let sz = lhs.ty.size();
+                    self.gen_expr(rhs)?; // source address in D0
+                    let slot = self.push_dtemp();
+                    let dst = self.addr_ea(lhs)?;
+                    self.materialize_ea(&dst); // destination address in A0
+                    self.line("move.l a0,a1");
+                    self.pop_dtemp_to(&slot, "d0");
+                    self.line("move.l d0,a0");
+                    self.copy_block(sz);
+                    // The value of the assignment is the destination object,
+                    // and an aggregate rvalue *is* its address — so hand back
+                    // where A1 started, not where the copy left it. Without
+                    // this `z = y = x` silently produced garbage instead of
+                    // chaining.
+                    self.line("move.l a1,d0");
+                    self.line(&format!("sub.l #{sz},d0"));
+                    return Ok(());
+                }
                 if let ExprK::Var(name) = &lhs.kind {
                     if let Some(r) = self.reg_of.get(name).cloned() {
                         // register-allocated local → assign the register directly
@@ -1057,6 +1183,23 @@ impl Gen {
                 }
             }
         }
+        // An array lvalue *is* its own address (C's array-to-pointer decay), so
+        // `m->m[k]` indexes straight off the base register. Without this the
+        // aggregate load path hands the address through D0 and costs a
+        // `movea.l` on every element access.
+        if matches!(&*ptr.ty, TypeK::Array(..))
+            && matches!(
+                &ptr.kind,
+                ExprK::Var(_) | ExprK::Member(..) | ExprK::Unary(UnOp::Deref, _)
+            )
+        {
+            let base = self.addr_ea(ptr)?;
+            if let Some(ea) = base.plus(off) {
+                return Ok(ea);
+            }
+            self.materialize_ea(&base);
+            return self.a0_plus(off);
+        }
         match &ptr.kind {
             ExprK::Unary(UnOp::Addr, inner) => {
                 let base = self.addr_ea(inner)?;
@@ -1131,6 +1274,16 @@ impl Gen {
     }
 
     fn gen_call(&mut self, callee: &Expr, args: &[Expr]) -> Result<(), String> {
+        // Catch a by-value struct argument at the call site too: an `extern`
+        // callee never reaches `gen_function`, so the definition-side check
+        // above cannot see it.
+        if let Some(a) = args.iter().find(|a| matches!(&*a.ty, TypeK::Struct { .. })) {
+            return Err(format!(
+                "{}: passing a struct by value is not supported on this target — \
+                 pass a pointer to it instead",
+                a.line
+            ));
+        }
         // Push args right-to-left as longs.
         let nbytes = args.len() * 4;
         for a in args.iter().rev() {
@@ -1207,7 +1360,7 @@ impl Gen {
     }
 
     fn fold_pow2(&mut self, op: BinOp, lt: &Type, rt: &Type, n: i64) -> bool {
-        let unsigned = !(lt.is_signed() && rt.is_signed());
+        let unsigned = forces_unsigned(lt) || forces_unsigned(rt);
         // A multiply by a non-power-of-two still beats the helper call when the
         // constant is two powers of two apart — which every odd-sized struct
         // index is (`p[i]` on a 12-byte struct is `i * 12`).
@@ -1268,7 +1421,7 @@ impl Gen {
     /// eval stack parked it in, so the value is used where it already sits
     /// instead of being copied into D1 first.
     fn gen_binop(&mut self, op: BinOp, lt: &Type, rt: &Type, rhs: &str) {
-        let unsigned = !(lt.is_signed() && rt.is_signed());
+        let unsigned = forces_unsigned(lt) || forces_unsigned(rt);
         match op {
             BinOp::Add => self.line(&format!("add.l {rhs},d0")),
             BinOp::Sub => self.line(&format!("sub.l {rhs},d0")),
@@ -1404,7 +1557,7 @@ impl Gen {
     /// Emit `op` with the right operand as a folded source (D0 already holds the
     /// left operand). Mirrors [`gen_binop`] but takes the rhs from `src`.
     fn fold_binop(&mut self, op: BinOp, lt: &Type, rt: &Type, src: &str, _is_imm: bool) {
-        let unsigned = !(lt.is_signed() && rt.is_signed());
+        let unsigned = forces_unsigned(lt) || forces_unsigned(rt);
         match op {
             BinOp::Add => self.line(&format!("add.l {src},d0")),
             BinOp::Sub => self.line(&format!("sub.l {src},d0")),
@@ -1506,6 +1659,33 @@ impl Gen {
 
     /// Zero `size` bytes at `off(a6)` (used before an aggregate initializer so
     /// unlisted elements read as 0, per C).
+    /// Copy `size` bytes from the address in A0 to the address in A1.
+    ///
+    /// Whole-struct assignment copies the OBJECT. Before this existed the
+    /// aggregate fell through the scalar path, which stored four bytes — the
+    /// source's *address* — over the destination's first field, so `y = x`
+    /// produced pointer-shaped garbage.
+    ///
+    /// Same shape as [`Gen::clear_frame`]: a `dbra` loop over longs then the
+    /// odd tail. `dbra` counts a 16-bit register, so this handles up to 256KB
+    /// per struct — far past anything declarable here.
+    fn copy_block(&mut self, size: u32) {
+        if size == 0 {
+            return;
+        }
+        let longs = size / 4;
+        if longs > 0 {
+            let lbl = self.l();
+            self.load_imm_into("d0", longs as i32 - 1);
+            self.lbl(&format!(".Lcpy_{lbl}"));
+            self.line("move.l (a0)+,(a1)+");
+            self.line(&format!("dbra d0,.Lcpy_{lbl}"));
+        }
+        for _ in 0..(size % 4) {
+            self.line("move.b (a0)+,(a1)+");
+        }
+    }
+
     fn clear_frame(&mut self, off: i32, size: u32) {
         if size == 0 {
             return;
@@ -1524,8 +1704,47 @@ impl Gen {
         }
     }
 
+    /// `char buf[N] = "text"` — copy the CHARACTERS into the frame slot and
+    /// zero-fill the tail. Returns false when the initializer isn't that shape.
+    ///
+    /// Without this the scalar path evaluates the literal to its pool ADDRESS
+    /// and stores four bytes of pointer over the first elements, leaving the
+    /// rest of the array uninitialized — `char s[6] = "abc"` then sums to
+    /// whatever the pointer bytes happened to be. File-scope initializers
+    /// already emit the characters (`.dc.b $61,$62,$63,$00,$00,$00`); this
+    /// makes locals agree with them.
+    fn try_str_array_init(&mut self, off: i32, ty: &Type, init: &Init) -> bool {
+        let (TypeK::Array(el, n), Init::Scalar(e)) = (&**ty, init) else {
+            return false;
+        };
+        if el.size() != 1 {
+            return false;
+        }
+        let ExprK::StrLit(idx) = &e.kind else {
+            return false;
+        };
+        let Some(bytes) = self.strings.get(*idx).cloned() else {
+            return false;
+        };
+        let n = *n as usize;
+        // Zero the whole slot, then write only the non-zero characters — the
+        // same clear-then-fill shape the braced-list path uses. A literal
+        // longer than the array is truncated (C lets the NUL drop when the
+        // characters exactly fill it); a shorter one leaves zeros behind.
+        self.clear_frame(off, n as u32);
+        for i in 0..n.min(bytes.len()) {
+            if bytes[i] != 0 {
+                self.line(&format!("move.b #{},{}(a6)", bytes[i], off + i as i32));
+            }
+        }
+        true
+    }
+
     /// Emit an aggregate/scalar initializer into the frame slot at `off(a6)`.
     fn gen_local_init(&mut self, off: i32, ty: &Type, init: &Init) -> Result<(), String> {
+        if self.try_str_array_init(off, ty, init) {
+            return Ok(());
+        }
         match (init, &**ty) {
             (Init::Scalar(e), _) => {
                 self.gen_expr(e)?;
@@ -1851,6 +2070,170 @@ fn dead_after(lines: &[&str], from: usize, r: &str) -> bool {
 /// and `move.l d3,d1 / add.l d1,d0` into `add.l d3,d0`. Only the immediately
 /// adjacent instruction is considered, which keeps the safety argument simple:
 /// nothing can invalidate `A` in between because there is no in-between.
+/// Whether an operand carries an addressing side effect (`-(an)` / `(an)+`).
+fn is_auto(op: &str) -> bool {
+    op.contains("-(") || op.contains(")+")
+}
+
+/// Whether an effective address provably names ordinary stack memory.
+///
+/// This is the safety gate on [`elim_redundant_loads`], and it is deliberately
+/// narrow. The frontend **discards `volatile` on pointed-to types** — it keeps
+/// the qualifier only on locals, to bar them from register promotion — so by
+/// the time codegen runs, a hardware register read through a `volatile
+/// uint32_t *` is indistinguishable from an ordinary struct field load. Reusing
+/// a register for the second of two MMIO reads is a miscompile of exactly the
+/// kind that leaves a Jaguar pad strobe reading stale data.
+///
+/// A6-relative memory is this compiler's own frame. Nothing the program can
+/// map to hardware lives there, so folding those loads is sound regardless of
+/// what the frontend forgot. Widening this to pointer dereferences requires
+/// carrying `volatile` in the type system first.
+fn ea_is_frame(ea: &str) -> bool {
+    ea.ends_with("(a6)") && !is_auto(ea)
+}
+
+/// Local redundant-load elimination — the available-expressions optimization,
+/// scoped to a basic block.
+///
+/// A second `move.l <ea>,dN` naming an address whose value is already sitting
+/// in a register becomes a register copy, which `fold_copies` then usually
+/// deletes outright. Straight-line pointer code reloads the same field
+/// constantly (`p->w` twice in one expression is two `move.l 8(a2)`s), so this
+/// fires on ordinary game code, not just contrived cases.
+///
+/// The alias model is deliberately blunt: any store through a named memory
+/// operand forgets every remembered load. The one exception is both sound and
+/// load-bearing — `-(a7)`/`(a7)+` push and pop touch memory *below* the stack
+/// pointer, which no object the program can name overlaps, so argument
+/// marshalling doesn't wipe the table. It does move A7, though, so anything
+/// addressed off A7 is dropped. Calls clear everything except the arithmetic
+/// runtime helpers, which touch no memory and preserve all but D0/D1/A0/A1.
+/// Anything this pass does not positively recognize clears the table.
+fn elim_redundant_loads(lines: &[&str]) -> (Vec<String>, bool) {
+    /// jcc68k's own 32-bit mul/div helpers: pure arithmetic, no memory traffic.
+    const PURE_HELPERS: &[&str] = &["__mulsi3", "__divsi3", "__udivsi3", "__modsi3", "__umodsi3"];
+    /// Reads its operands, writes neither.
+    const NO_WRITE: &[&str] = &["cmp", "cmpa", "cmpi", "cmpm", "tst", "btst"];
+    /// `op src,dst` — writes `dst`.
+    const WRITES_DST: &[&str] = &[
+        "add", "adda", "addq", "addi", "sub", "suba", "subq", "subi", "and", "andi", "or", "ori",
+        "eor", "eori", "asl", "asr", "lsl", "lsr", "rol", "ror", "muls", "mulu", "divs", "divu",
+        "moveq", "lea", "move", "movea",
+    ];
+    /// `op dst` — writes its single operand.
+    const WRITES_ONE: &[&str] = &["neg", "not", "clr", "ext", "extb", "swap", "tas"];
+
+    fn kill_reg(avail: &mut Vec<(String, String)>, r: &str) {
+        avail.retain(|(ea, reg)| reg != r && !mentions(ea, r));
+    }
+
+    let mut avail: Vec<(String, String)> = Vec::new(); // (effective address, register holding it)
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut changed = false;
+
+    for line in lines {
+        if line.trim().is_empty() {
+            out.push(line.to_string());
+            continue;
+        }
+        let Some((m, ops)) = split_insn(line) else {
+            avail.clear(); // a label may be a branch target: nothing survives it
+            out.push(line.to_string());
+            continue;
+        };
+        let base = base_mnemonic(m);
+
+        if base == "jsr" || base == "bsr" {
+            if base == "jsr" && PURE_HELPERS.contains(&ops.trim()) {
+                for r in ["d0", "d1", "a0", "a1"] {
+                    kill_reg(&mut avail, r);
+                }
+            } else {
+                avail.clear();
+            }
+            out.push(line.to_string());
+            continue;
+        }
+
+        // A push or pop shifts A7, invalidating everything addressed off it.
+        if is_auto(ops) && mentions(ops, "a7") {
+            kill_reg(&mut avail, "a7");
+        }
+
+        if m == "move.l" || m == "movea.l" {
+            if let Some((src, dst)) = split_operands(ops) {
+                let src_imm = src.starts_with('#');
+                let src_mem = !is_machine_reg(src) && !src_imm;
+                if src_mem && is_machine_reg(dst) && ea_is_frame(src) {
+                    if let Some(held) = avail.iter().find(|(ea, _)| ea == src).map(|(_, r)| r.clone())
+                    {
+                        changed = true;
+                        if held == dst {
+                            continue; // value already in this very register
+                        }
+                        out.push(format!("\t{m} {held},{dst}"));
+                        kill_reg(&mut avail, dst);
+                        avail.push((src.to_string(), dst.to_string()));
+                        continue;
+                    }
+                    kill_reg(&mut avail, dst);
+                    avail.push((src.to_string(), dst.to_string()));
+                    out.push(line.to_string());
+                    continue;
+                }
+                if src_mem && is_machine_reg(dst) {
+                    // A load this pass may not reason about (it could be MMIO):
+                    // it still writes its destination.
+                    kill_reg(&mut avail, dst);
+                    out.push(line.to_string());
+                    continue;
+                }
+                if !is_machine_reg(dst) {
+                    // a store; pushes alias nothing nameable, so they keep the table
+                    if !is_auto(dst) {
+                        avail.clear();
+                        if is_machine_reg(src) && ea_is_frame(dst) {
+                            avail.push((dst.to_string(), src.to_string()));
+                        }
+                    }
+                    out.push(line.to_string());
+                    continue;
+                }
+                // register/immediate → register: the value travels with the copy
+                let carried = is_machine_reg(src)
+                    .then(|| avail.iter().find(|(_, r)| r == src).map(|(ea, _)| ea.clone()))
+                    .flatten();
+                kill_reg(&mut avail, dst);
+                if let Some(ea) = carried.filter(|ea| !mentions(ea, dst)) {
+                    avail.push((ea, dst.to_string()));
+                }
+                out.push(line.to_string());
+                continue;
+            }
+        }
+
+        if NO_WRITE.contains(&base) {
+            out.push(line.to_string());
+            continue;
+        }
+        let is_scc = base.len() == 3 && base.starts_with('s');
+        let written = match split_operands(ops) {
+            Some((_, dst)) if WRITES_DST.contains(&base) => Some(dst),
+            None if WRITES_ONE.contains(&base) || is_scc => Some(ops.trim()),
+            _ => None,
+        };
+        match written {
+            Some(dst) if is_machine_reg(dst) => kill_reg(&mut avail, dst),
+            Some(dst) if !is_auto(dst) => avail.clear(), // store to memory
+            Some(_) => {}
+            None => avail.clear(), // unrecognized: assume the worst
+        }
+        out.push(line.to_string());
+    }
+    (out, changed)
+}
+
 fn fold_copies(lines: &[&str]) -> (Vec<String>, bool) {
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
     let mut changed = false;
@@ -2023,8 +2406,10 @@ fn peephole(asm: &str) -> String {
         let lines: Vec<&str> = cur.lines().collect();
         let (fused, c1) = fuse_compare_branch(&lines);
         let refs: Vec<&str> = fused.iter().map(|s| s.as_str()).collect();
+        let (loaded, c3) = elim_redundant_loads(&refs);
+        let refs: Vec<&str> = loaded.iter().map(|s| s.as_str()).collect();
         let (folded, c2) = fold_copies(&refs);
-        if !c1 && !c2 {
+        if !c1 && !c2 && !c3 {
             break;
         }
         cur = folded.join("\n");
@@ -2151,6 +2536,80 @@ fn assigns_to(e: &Expr, name: &str) -> bool {
         }
         ExprK::Num(_) | ExprK::StrLit(_) | ExprK::Var(_) => false,
     }
+}
+
+/// Whether an operand forces the *unsigned* form of a comparison or division.
+///
+/// C's usual arithmetic conversions run integer PROMOTION first, and on this
+/// target `int` is 32-bit, so it represents every `unsigned char` and
+/// `unsigned short` value: those promote to **signed** `int` and do NOT make
+/// the operation unsigned. Only an unsigned integer of `int` rank or wider
+/// does — plus pointers, which always compare unsigned.
+///
+/// Testing `!is_signed()` instead gets this wrong for exactly the narrow
+/// unsigned types: `unsigned char c = 200; c > -1` is TRUE in C (200 > -1 as
+/// ints) but compiles to a `shi` against 0xFFFFFFFF and yields 0.
+fn forces_unsigned(ty: &Type) -> bool {
+    match &**ty {
+        TypeK::Int { size, signed } => !*signed && *size >= 4,
+        // arrays and functions have already decayed to addresses by here
+        TypeK::Ptr(_) | TypeK::Array(..) | TypeK::Func { .. } => true,
+        // Fixed is signed 16.16; Void/Struct never reach an arithmetic operand
+        _ => false,
+    }
+}
+
+/// Every machine register named in an `asm` clobber list anywhere in `body`.
+///
+/// Scope is the whole function, not the statement: the allocator assigns a
+/// local one register for its entire lifetime, so a register clobbered by an
+/// asm *anywhere* is unusable *everywhere*. Coarse, but the alternative is
+/// live-range splitting, and being coarse here costs a register while being
+/// wrong costs the value — `hot` parked in D6 across `moveq #0,d6` is simply
+/// gone, with nothing in the output to suggest it.
+///
+/// Non-register clobbers (`"cc"`, `"memory"`) are ignored: this compiler keeps
+/// no value in the condition codes across a statement, and the peephole's
+/// redundant-load pass already forgets memory at any instruction it does not
+/// positively recognize, which every asm line is.
+fn collect_asm_clobbers(body: &[Stmt]) -> std::collections::HashSet<String> {
+    fn walk(s: &Stmt, out: &mut std::collections::HashSet<String>) {
+        match s {
+            Stmt::AsmExt { clobbers, .. } => {
+                for c in clobbers {
+                    let r = c.trim().trim_start_matches('%').to_ascii_lowercase();
+                    if is_machine_reg(&r) {
+                        out.insert(r);
+                    }
+                }
+            }
+            Stmt::If(_, t, e) => {
+                walk(t, out);
+                if let Some(e) = e {
+                    walk(e, out);
+                }
+            }
+            Stmt::While(_, b) | Stmt::DoWhile(b, _) | Stmt::Label(_, b) => walk(b, out),
+            Stmt::For(i, _, _, b) => {
+                if let Some(i) = i {
+                    walk(i, out);
+                }
+                walk(b, out);
+            }
+            Stmt::Block(items) => {
+                for it in items {
+                    walk(it, out);
+                }
+            }
+            Stmt::Switch(_, b, _, _) => walk(b, out),
+            _ => {}
+        }
+    }
+    let mut out = std::collections::HashSet::new();
+    for s in body {
+        walk(s, &mut out);
+    }
+    out
 }
 
 fn is_scalar4(ty: &Type) -> bool {
