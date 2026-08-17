@@ -613,7 +613,11 @@ fn boot_profiled(
     } else if frames > 0 {
         jag.run_frames(frames);
     }
+    // ☠ `awake` stays 0 when the 68000 was not the profiled core. That is NOT
+    // the same as "the 68000 slept", so the wall-clock line below must not
+    // report it as 0.0% — see the guard there.
     let mut awake = 0u64;
+    let m68k_profiled = jag.dbg.prof.is_some();
     if let Some(p) = jag.dbg.prof.as_ref() {
         awake = p.main_cycles + p.isr_cycles;
         let tot = p.total_cycles.max(1);
@@ -665,11 +669,23 @@ fn boot_profiled(
     let m68k_hz = 13_295_453.0_f64;
     let awake_wall = awake as f64 / m68k_hz;
     eprintln!("\n=== wall-clock accounting ({wall:.2} s simulated) ===");
-    eprintln!(
-        "  68000 awake     {:>8.3} s  {:5.1}%",
-        awake_wall,
-        100.0 * awake_wall / wall
-    );
+    // ☠☠ DO NOT PRINT A CONFIDENT ZERO FOR A CORE NOBODY MEASURED. This line
+    // used to read "68000 awake 0.000 s 0.0%" whenever jagemu was run with
+    // --core gpu or --core dsp, because `awake` is only accumulated by the
+    // 68000 profiler. A jag_quake run read that as an optimisation having
+    // driven the 68000 to sleep and put the number in a commit message; the
+    // real figure, measured like-for-like with --core 68k, was 35.3%.
+    // An unmeasured quantity must say so — a plausible number is worse than
+    // no number, because nothing downstream can tell them apart.
+    if m68k_profiled {
+        eprintln!(
+            "  68000 awake     {:>8.3} s  {:5.1}%",
+            awake_wall,
+            100.0 * awake_wall / wall
+        );
+    } else {
+        eprintln!("  68000 awake          not profiled  (re-run with --core 68k)");
+    }
     eprintln!(
         "  Tom GPU busy    {:>8.3} s  {:5.1}%   (of which Blitter {:.3} s, {:.1}%)",
         gpu_c / hz,
