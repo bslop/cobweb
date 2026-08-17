@@ -376,7 +376,13 @@ impl Risc {
                 _ => self.win_r32(bus, addr),
             }
         } else {
-            bus.read32(addr)
+            // HARDWARE: the JRISC ignores the low two address bits on a 32-bit
+            // access. Masking (rather than honouring the unaligned address) is
+            // what makes a misaligned array behave here as it does on silicon.
+            if addr & 3 != 0 {
+                self.pipe.stats.unaligned_risc32 += 1;
+            }
+            bus.read32(addr & !3)
         }
     }
 
@@ -411,7 +417,10 @@ impl Risc {
                 _ => self.win_w32(bus, addr, val),
             }
         } else {
-            bus.write32(addr, val);
+            if addr & 3 != 0 {
+                self.pipe.stats.unaligned_risc32 += 1;
+            }
+            bus.write32(addr & !3, val);   // JRISC ignores the low 2 bits
         }
     }
 
