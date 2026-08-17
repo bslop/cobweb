@@ -55,6 +55,8 @@ class Gen:
         self.vars = []          # (name, ctype, signed)
         self.calls = []         # (helper name, arg count)
         self.has_struct = False # whether `struct T s` is in scope
+        self.has_writer = False # whether the pointer-writing helper exists
+        self.globals_names = []
 
     def decls(self, n):
         out = []
@@ -66,6 +68,57 @@ class Gen:
             out.append(f"    {ty} {name} = {val}{suffix};")
             self.vars.append((name, ty, signed))
         return "\n".join(out)
+
+    def globals_block(self):
+        """File-scope objects, read AND written.
+
+        Everything else the generator makes is a local, so globals were the
+        only unexercised addressing mode: they are absolute (`sym`) rather
+        than frame-relative (`off(a6)`), and the redundant-load pass treats
+        the two differently. Statics add the same addressing with internal
+        linkage.
+        """
+        r = self.rng
+        lines, names = [], []
+        for i in range(r.randint(2, 4)):
+            ty, signed, lo, hi = r.choice(TYPES)
+            nm = f"g{i}"
+            suffix = "u" if not signed and "int" in ty else ""
+            kw = "static " if r.random() < 0.4 else ""
+            lines.append(f"{kw}{ty} {nm} = {r.randint(lo, hi)}{suffix};")
+            names.append((nm, ty, signed))
+        lines.append(f"static short garr[4] = {{ {', '.join(str(r.randint(-9999, 9999)) for _ in range(4))} }};")
+        names += [(f"garr[{i}]", "short", True) for i in range(4)]
+        self.globals_names = names
+        self.vars += names
+        return "\n".join(lines)
+
+    def store(self, n):
+        """A statement that WRITES through a pointer, an index, or a field.
+
+        The whole store path — including the narrowing that `cast()` defers to
+        the destination width — was previously reached only by the generator's
+        own bookkeeping, never by generated code.
+        """
+        r = self.rng
+        targets = []
+        if self.has_struct:
+            targets += ["s.a", "s.b", "s.c", "nst.inner.a", "nst.v[1]", "sa[0].b"]
+            # Indices must stay inside the arrays, whose length is random
+            # (3..6). A hardcoded `p[3]` wrote one past the end whenever the
+            # length came out 3 — undefined behaviour, and it corrupted
+            # different neighbours on host and target, which read as a
+            # compiler bug. Only 0..2 are safe for every length.
+            targets += ["arr[2]", "bytes[1]", "p[1]", "*p"]
+        if getattr(self, "globals_names", None):
+            targets += [nm for nm, _t, _s in self.globals_names]
+        if not targets:
+            return None
+        t = r.choice(targets)
+        e = self.expr()
+        if r.random() < 0.3:
+            return f"    {t} = ({t}) ^ (unsigned char)({e});"
+        return f"    {t} = ({e});"
 
     def helpers(self, n):
         """Free functions with mixed-width parameters and return types.
@@ -86,6 +139,17 @@ class Gen:
             body = f"({terms}) * {r.randint(1, 7)} - {r.randint(0, 1000)}"
             out.append(f"static {ret} h{i}({params}) {{ return ({ret})({body}); }}")
             self.calls.append((f"h{i}", nargs))
+        # A helper that writes through a POINTER parameter: the callee stores
+        # into the caller's object, which exercises the store path across a
+        # call boundary rather than inside one function.
+        out.append(
+            "static void hw(int *out, short *sp, unsigned char *bp, int k) {\n"
+            "    *out = *out * 3 + k;\n"
+            "    *sp = (short)(*sp - k);\n"
+            "    *bp = (unsigned char)(*bp + k);\n"
+            "}"
+        )
+        self.has_writer = True
         return "\n".join(out)
 
     def call(self, depth):
@@ -257,7 +321,11 @@ class Gen:
         self.vars = []
         self.calls = []
         self.has_struct = False
-        prelude = self.helpers(self.rng.randint(1, 3)) if self.rng.random() < 0.7 else ""
+        self.has_writer = False
+        self.globals_names = []
+        prelude = self.globals_block() if self.rng.random() < 0.6 else ""
+        if self.rng.random() < 0.7:
+            prelude = (prelude + "\n" if prelude else "") + self.helpers(self.rng.randint(1, 3))
         nvars = self.rng.randint(14, 22) if self.stress else self.rng.randint(3, 6)
         parts = [self.decls(nvars)]
         if self.rng.random() < 0.6:
@@ -274,6 +342,14 @@ class Gen:
         if self.rng.random() < 0.5:
             n = self.rng.randint(1, 6)
             body.append(f"    for (int i = 0; i < {n}; i++) acc = acc * 3u + (unsigned)({self.expr()});")
+        # stores: writes through pointers, indices, fields and globals
+        for _ in range(self.rng.randint(1, 4)):
+            st = self.store(0)
+            if st:
+                body.append(st)
+        if self.has_writer and self.has_struct:
+            body.append("    hw(&s.a, &arr[1], &bytes[2], 5);")
+            body.append("    acc += (unsigned)(s.a + arr[1] + bytes[2]);")
         # control-flow forms the expression generator cannot reach
         for k in range(self.rng.randint(0, 3)):
             body.append(self.stmt(k))
