@@ -102,19 +102,28 @@ fn builtin_header(name: &str) -> Option<&'static str> {
              typedef int int_fast16_t; typedef unsigned int uint_fast16_t;\
              typedef signed char int_least8_t; typedef unsigned char uint_least8_t;"
         }
+        // NOTE: every `#define` below must start its own LINE. A directive is
+        // only recognized when `#` is the first token on a line, and Rust's `\`
+        // line-continuation splices the source into one line — which silently
+        // turned these into stray `#` tokens the parser choked on. Use `\n`.
         "stddef.h" => {
-            "typedef unsigned int size_t; typedef int ptrdiff_t;\
-             #define NULL ((void*)0)"
+            "typedef unsigned int size_t; typedef int ptrdiff_t;\n\
+             #define NULL ((void*)0)\n"
         }
-        "stdbool.h" => "typedef int bool; #define true 1\n#define false 0\n#define __bool_true_false_are_defined 1",
+        "stdbool.h" => {
+            "typedef int bool;\n\
+             #define true 1\n\
+             #define false 0\n\
+             #define __bool_true_false_are_defined 1\n"
+        }
         "stdarg.h" => {
             // Args are 32-bit longs on the stack; va_list walks upward. `ap` is
             // initialized to the address just past the last named argument.
-            "typedef char* va_list;\
-             #define va_start(ap,last) ((ap) = (va_list)&(last) + sizeof(last))\
-             #define va_arg(ap,ty) (*(ty*)(((ap) += 4) - 4))\
-             #define va_end(ap) ((void)0)\
-             #define va_copy(d,s) ((d)=(s))"
+            "typedef char* va_list;\n\
+             #define va_start(ap,last) ((ap) = (va_list)&(last) + sizeof(last))\n\
+             #define va_arg(ap,ty) (*(ty*)(((ap) += 4) - 4))\n\
+             #define va_end(ap) ((void)0)\n\
+             #define va_copy(d,s) ((d)=(s))\n"
         }
         "stdlib.h" | "string.h" | "stdio.h" | "math.h" | "assert.h" | "ctype.h" => "",
         _ => return None,

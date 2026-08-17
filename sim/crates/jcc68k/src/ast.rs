@@ -184,6 +184,12 @@ pub enum Stmt {
         template: String,
         output: Option<(bool, Expr)>, // (read_write, lvalue)
         input: Option<Expr>,
+        /// Registers the asm destroys, e.g. `"d0"`, `"a1"`, `"cc"`, `"memory"`.
+        /// The code generator bars these from holding a local or an eval-stack
+        /// temporary anywhere in the enclosing function — ignoring them is
+        /// silent wrong code, since a value parked in a clobbered register is
+        /// simply gone after the asm runs.
+        clobbers: Vec<String>,
     },
     If(Expr, Box<Stmt>, Option<Box<Stmt>>),
     While(Expr, Box<Stmt>),

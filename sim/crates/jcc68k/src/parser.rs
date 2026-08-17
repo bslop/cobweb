@@ -820,6 +820,15 @@ impl Parser {
         match &self.toks[self.pos + 1].tok {
             Tok::Punct(p) if p == "*" => true,
             Tok::Punct(p) if p == "(" => true,
+            // `int (v)` — redundant parentheses around a plain declarator. The
+            // name is what distinguishes this from a parameter list: an
+            // identifier that is NOT a typedef name cannot start one, so this
+            // is a grouping. Without this arm the declarator fell through to
+            // the function-declarator path, the name was dropped, and the
+            // initializer wrote to an anonymous frame slot while every later
+            // reference silently resolved to a global of the same name —
+            // returning the global's value, not the local's.
+            Tok::Ident(s) => self.find_typedef(s).is_none(),
             _ => false,
         }
     }
@@ -1011,9 +1020,15 @@ impl Parser {
         }
         let outputs = self.asm_operands()?;
         let inputs = if self.eat_punct(":") { self.asm_operands()? } else { Vec::new() };
+        // Clobber list: kept, not discarded. The code generator bars these
+        // registers from holding anything across the asm.
+        let mut clobbers: Vec<String> = Vec::new();
         if self.eat_punct(":") {
-            // clobber list: strings, accepted and ignored
-            while matches!(self.peek(), Tok::Str(_)) {
+            while let Tok::Str(s) = self.peek().clone() {
+                // String tokens carry their terminating NUL; drop it, or the
+                // name reads as "d7\0" and matches no register.
+                let name: Vec<u8> = s.iter().take_while(|&&b| b != 0).copied().collect();
+                clobbers.push(String::from_utf8_lossy(&name).into_owned());
                 self.pos += 1;
                 if !self.eat_punct(",") {
                     break;
@@ -1055,7 +1070,7 @@ impl Parser {
             }
             None => None,
         };
-        Ok(Stmt::AsmExt { template, output, input })
+        Ok(Stmt::AsmExt { template, output, input, clobbers })
     }
 
     /// One `"constraint" (expr)` list section of an extended asm statement.
@@ -1263,7 +1278,25 @@ impl Parser {
             let t = self.expr()?;
             self.expect(":")?;
             let e = self.conditional()?;
-            let ty = t.ty.clone();
+            // C applies the usual arithmetic conversions to the two RESULT
+            // operands, so the type is not simply the second operand's. Taking
+            // it verbatim typed the whole conditional by whichever arm came
+            // first: `(unsigned)(0 ? uchar : (1u - 6u))` came out as 251,
+            // because the conditional was typed `unsigned char` and the
+            // widening cast then masked the *other* arm's value to a byte.
+            // Only a narrow-unsigned arm exposes it — a `short` arm is
+            // sign-extended back to the same bits, which is why this survived
+            // until differential testing hit the unsigned case.
+            let ty = if t.ty.is_integer() && e.ty.is_integer() {
+                let wide_unsigned =
+                    |x: &Type| matches!(&**x, TypeK::Int { size, signed: false } if *size >= 4);
+                let signed = !(wide_unsigned(&t.ty) || wide_unsigned(&e.ty));
+                Rc::new(TypeK::Int { size: 4, signed })
+            } else if t.ty.is_fixed() || e.ty.is_fixed() {
+                t_fixed()
+            } else {
+                t.ty.clone()
+            };
             return Ok(Expr { kind: ExprK::Cond(Box::new(c), Box::new(t), Box::new(e)), ty, line: self.line() });
         }
         Ok(c)
@@ -1360,12 +1393,15 @@ impl Parser {
         }
         if self.eat_punct("-") {
             let e = self.cast()?;
-            let ty = e.ty.clone();
+            // Integer promotion first: `-(unsigned char)13` is -13 as an int,
+            // not 243 truncated back into a byte.
+            let ty = promote_int(&e.ty);
             return Ok(Expr { kind: ExprK::Unary(UnOp::Neg, Box::new(e)), ty, line });
         }
         if self.eat_punct("~") {
             let e = self.cast()?;
-            let ty = e.ty.clone();
+            // Likewise: `~(unsigned char)13` is -14, not 242.
+            let ty = promote_int(&e.ty);
             return Ok(Expr { kind: ExprK::Unary(UnOp::Not, Box::new(e)), ty, line });
         }
         if self.eat_punct("!") {
@@ -1597,9 +1633,19 @@ impl Parser {
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
             | BinOp::LogAnd | BinOp::LogOr => t_int(),
             _ => {
-                // usual arithmetic conversion: result is the wider (>=int) type;
-                // unsigned if either operand is unsigned.
-                let signed = lt.is_signed() && rt.is_signed();
+                // Usual arithmetic conversions — and integer PROMOTION happens
+                // first. `int` is 32-bit here, so it represents every
+                // `unsigned char` / `unsigned short` value and those promote to
+                // SIGNED int; only an unsigned operand of int rank or wider
+                // makes the result unsigned.
+                //
+                // Testing `is_signed()` instead typed `(unsigned short)a - b`
+                // as unsigned, so a negative difference compared as a huge
+                // positive — `(a - b) < 0` was false for every narrow unsigned
+                // operand. Found by differential testing against the host cc.
+                let wide_unsigned =
+                    |t: &Type| matches!(&**t, TypeK::Int { size, signed: false } if *size >= 4);
+                let signed = !(wide_unsigned(&lt) || wide_unsigned(&rt));
                 Rc::new(TypeK::Int { size: 4, signed })
             }
         };
@@ -1645,6 +1691,23 @@ fn scale(e: Expr, sz: u32, line: usize) -> Expr {
 /// depend on it, so those fold only when both operands are signed. Values are
 /// kept as `i64` and truncated by the code generator exactly as a runtime
 /// 32-bit computation would wrap.
+/// Integer promotion (C 6.3.1.1): a type narrower than `int` becomes `int`.
+///
+/// On this target `int` is 32-bit, so it represents every `char`/`short` value
+/// — signed or unsigned — and the promoted type is always SIGNED `int`. Only an
+/// unsigned type of int rank or wider stays unsigned.
+///
+/// Every operator that takes an arithmetic operand has to do this first, and
+/// forgetting it has produced four separate wrong-code bugs in this compiler:
+/// binary result typing, `?:` result typing, comparison/division signedness,
+/// and unary `-`/`~`. If you add an arithmetic operator, start here.
+fn promote_int(t: &Type) -> Type {
+    match &**t {
+        TypeK::Int { size, .. } if *size < 4 => t_int(),
+        _ => t.clone(),
+    }
+}
+
 fn fold_const_binary(op: BinOp, a: i64, b: i64, signed: bool) -> Option<i64> {
     let r = match op {
         BinOp::Add => a.wrapping_add(b),
