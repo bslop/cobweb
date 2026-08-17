@@ -1922,6 +1922,17 @@ impl Gen {
                 writeln!(self.out, "\t.ds.b {sz}").unwrap();
             }
         }
+        // Leave the location counter EVEN. Initialized globals emit their exact
+        // bytes, so a single `unsigned char g = 231;` ends the unit on an odd
+        // address — and `--prog` concatenates startup + this unit + the runtime
+        // with no realignment between them. Every runtime helper then began at
+        // an odd address, so the first `jsr __umodsi3` took an ADDRESS ERROR
+        // and vanished into the boot ROM: a program that used a byte-sized
+        // global *and* any 32-bit divide, multiply or modulo simply ran away,
+        // with `illegal` still reading 0 because a fetch fault is not an
+        // illegal opcode. (`.bss` already rounds each object up to even, and
+        // each section starts `.align 16`, which is why only this path bled.)
+        self.out.push_str("\t.even\n");
     }
 }
 

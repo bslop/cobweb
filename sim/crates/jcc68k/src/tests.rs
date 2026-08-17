@@ -1561,6 +1561,39 @@ fn diff_narrow_unsigned_promotes_to_signed_int() {
 }
 
 #[test]
+fn odd_sized_global_leaves_the_unit_even() {
+    // An initialized byte global emitted its exact bytes and left the location
+    // counter ODD. `--prog` concatenates startup + unit + runtime with no
+    // realignment, so every runtime helper began at an odd address and the
+    // first `jsr __umodsi3` took an address error and disappeared into the
+    // boot ROM. Any program with a byte-sized global AND a 32-bit
+    // divide/multiply/modulo simply ran away — with `illegal` reading 0,
+    // because a fetch fault is not an illegal opcode.
+    assert_eq!(run("unsigned char g=231; int main(void){ return (int)(1u % (unsigned)g); }"), 1);
+    assert_eq!(run("unsigned char g=231; int main(void){ return (int)(1u / ((unsigned)(g*4)|1u)); }"), 0);
+    assert_eq!(run("unsigned char g=231; int main(void){ int k=9; return (int)(g*k); }"), 2079);
+    // an odd NUMBER of byte globals is the case that actually goes odd
+    assert_eq!(
+        run("unsigned char a=1,b=2,c=3; int main(void){ return (int)((unsigned)(a+b+c) % 5u); }"),
+        1
+    );
+    // a char array of odd length does it too
+    assert_eq!(
+        run("unsigned char t[3]={1,2,3}; int main(void){ return (int)((unsigned)(t[0]+t[1]+t[2]) % 4u); }"),
+        2
+    );
+    // and structurally: the data must be followed by a realignment, since the
+    // runtime helpers are concatenated after it
+    let asm = crate::compile_program("unsigned char g=1; int main(void){return g;}").expect("compile");
+    let last_byte = asm.rfind(".dc.b").expect("byte global should emit .dc.b");
+    assert!(
+        asm[last_byte..].contains(".even"),
+        "emitted data must be followed by .even:\n{}",
+        &asm[last_byte..last_byte + 120.min(asm.len() - last_byte)]
+    );
+}
+
+#[test]
 fn struct_assignment_copies_the_object() {
     // Whole-struct assignment fell through the scalar path and stored four
     // bytes — the source's ADDRESS — over the destination's first field, so
