@@ -234,6 +234,15 @@ static WATCHDOG_FRAMES: std::sync::atomic::AtomicU32 = std::sync::atomic::Atomic
 /// Blitter breakdown. Global for the same reason WATCHDOG_FRAMES is: the run
 /// helpers do not take the arg vector.
 static BLIT_HIST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// `--blit-top N`: how many shape rows to print. 0 means all of them.
+///
+/// The default is a readable summary, not the answer. A renderer in a real
+/// level produces hundreds of distinct shapes with a very long tail, and a
+/// truncated table invites exactly one mistake: summing the printed rows and
+/// concluding the big blits dominate, when the rows shown may be a minority of
+/// the total cost. The footer below always states the coverage so that error
+/// is impossible to make silently; `--blit-top 0` prints the tail itself.
+static BLIT_TOP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(20);
 
 fn apply_watchdog(jag: &mut Jaguar) {
     let n = WATCHDOG_FRAMES.load(std::sync::atomic::Ordering::Relaxed);
@@ -423,7 +432,20 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
         has_flag(args, "--blit-histogram"),
         std::sync::atomic::Ordering::Relaxed,
     );
+    if let Some(n) = flag_val(args, "--blit-top").map(parse_u32).transpose()? {
+        BLIT_TOP.store(n, std::sync::atomic::Ordering::Relaxed);
+    }
     let prof = has_flag(args, "--pc-histogram") || has_flag(args, "--profile68k");
+    // The histogram is printed from the profiled boot path, so on its own
+    // `--blit-histogram` is silently inert — the worst way for a flag to fail.
+    if has_flag(args, "--blit-histogram") && !prof {
+        eprintln!(
+            "jagemu: --blit-histogram needs a profiled boot: add --pc-histogram \
+             (or --profile68k). It also needs --fidelity silicon — the default \
+             functional mode runs no timing model, so every Blitter counter \
+             reads 0."
+        );
+    }
     if prof {
         let top = flag_val(args, "--top").map(parse_u32).transpose()?.unwrap_or(25) as usize;
         let gran = flag_val(args, "--bucket").map(parse_u32).transpose()?.unwrap_or(0);
@@ -675,12 +697,34 @@ fn boot_profiled(
         rows.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
         let total: u64 = rows.iter().map(|r| r.1 .1).sum();
         let fr = frames.max(1) as f64;
+        // Who actually issued the blits. The per-core `gpu/dsp.timing.blit*`
+        // counters answer a different question — they are drained by whichever
+        // RISC core runs next, so a 68000-issued blit lands under Tom or Jerry
+        // depending only on which was busier. Read this table for issuance and
+        // those for per-core drain; do not mix them.
+        eprintln!("\n=== blits by issuing master ===");
+        eprintln!("  {:>8} {:>10} {:>14} {:>14}", "master", "count", "launch_ticks", "transfer_ticks");
+        for (i, s) in jag.bus.tom.blit_by_master.iter().enumerate() {
+            if s.0 == 0 {
+                continue;
+            }
+            let name = match i {
+                0 => "68000",
+                1 => "Tom",
+                2 => "Jerry",
+                3 => "Blitter",
+                _ => "host",
+            };
+            eprintln!("  {:>8} {:>10} {:>14} {:>14}", name, s.0, s.1, s.2);
+        }
         eprintln!("\n=== blit shapes by transfer cost ({} distinct) ===", rows.len());
         eprintln!(
             "  {:>6} {:>6} {:>5} {:>6} {:>10} {:>14} {:>7} {:>12}",
             "inner", "outer", "srcen", "phrase", "count", "transfer_ticks", "% xfer", "ticks/frame"
         );
-        for (k, v) in rows.iter().take(20) {
+        let want = BLIT_TOP.load(std::sync::atomic::Ordering::Relaxed) as usize;
+        let shown = if want == 0 { rows.len() } else { want.min(rows.len()) };
+        for (k, v) in rows.iter().take(shown) {
             eprintln!(
                 "  {:>6} {:>6} {:>5} {:>6} {:>10} {:>14} {:>6.1}% {:>12.0}",
                 k.0,
@@ -693,7 +737,23 @@ fn boot_profiled(
                 v.1 as f64 / fr
             );
         }
+        // Always state what the printed rows actually cover. Reading a
+        // truncated table as if it were the whole cost is the specific error
+        // this footer exists to prevent.
+        let covered: u64 = rows.iter().take(shown).map(|r| r.1 .1).sum();
         eprintln!("  total transfer ticks {total}  ({:.0}/frame)", total as f64 / fr);
+        if shown < rows.len() {
+            eprintln!(
+                "  shown {shown} of {} shapes = {:.1}% of transfer; {} rows ({:.1}%) not printed \
+                 — use --blit-top 0 for all",
+                rows.len(),
+                if total > 0 { 100.0 * covered as f64 / total as f64 } else { 0.0 },
+                rows.len() - shown,
+                if total > 0 { 100.0 * (total - covered) as f64 / total as f64 } else { 0.0 },
+            );
+        } else {
+            eprintln!("  all {} shapes shown (100% of transfer)", rows.len());
+        }
     }
 
     if let Some(p) = jag.dbg.prof.as_ref() {
