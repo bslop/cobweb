@@ -33,8 +33,12 @@
 /* YPOS = 2*BASE_Y half-lines must clear VDB on BOTH standards, or the object
  * starts before the display window opens and its top lines are clipped: VDB is
  * 25 on NTSC but 35 on PAL, so BASE_Y=16 (YPOS=32) is fine on NTSC hardware and
- * loses the top border under PAL. 24 -> YPOS=48, clear of both. */
-#define BASE_Y  24
+ * loses the top border under PAL. 20 -> YPOS=40, clear of both.
+ * And YPOS + 2*HEIGHT must FIT THE FIELD: at BASE_Y=24 a 240-line object needs
+ * 48 + 480 = 528 half-lines against a 524-half-line field, so its last TWO lines
+ * fall off the end and the bottom border silently vanishes. 40 + 480 = 520 fits.
+ * Same family as "HEIGHT is a count, not an index" in the shared notes. */
+#define BASE_Y  20   /* see below */
 #define PWIDTH  ((W * 2) / 8)        /* phrases per line at 16bpp */
 #define DEPTH16 (4u << 12)           /* OBDEPTH 4 = 16bpp */
 
