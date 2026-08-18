@@ -17,6 +17,36 @@ const M68K_FETCH_WAIT_X10: u32 = 3;
 /// Extra 68k cycles per DATA bus cycle, tenths (calibrated).
 const M68K_DATA_WAIT_X10: u32 = 5;
 
+/// ── OBJECT-PROCESSOR TAX ON THE 68000 ───────────────────────────────────────
+///
+/// The two constants above are a CONSTANT wait per bus cycle. The RISC cores
+/// pay that same kind of constant *plus* a LOAD-DEPENDENT charge that scales
+/// with how much the Object Processor is fetching this line
+/// (`Pipe::charge_op_tax`, `risc/timing.rs`). The 68000 had no load-dependent
+/// term at all, so a 68k DRAM loop cost the same whether the OP was scanning a
+/// full-width bitmap or drawing nothing.
+///
+/// That is the wrong way round for this machine: the 68000 is the LOWEST
+/// priority bus master (refresh > OP > Blitter > GPU > DSP > 68k), so it is the
+/// master that should lose the most when the OP is busy. The symptom is a
+/// hardware/simulator divergence with a very specific shape — a 68k poll loop
+/// that always makes progress in simulation and stalls out on silicon while the
+/// OP is scanning — and no counter in the model could see it, because the model
+/// had no term for it.
+///
+/// ⭐ THE COEFFICIENT IS DERIVED, NOT FITTED. The RISC tax is a hardware
+/// calibration of the same physical bus occupancy: `OP_TAX_MILLI_NUM/DEN` =
+/// 5.75 milli-ticks per phrase per access, in RISC ticks. The scheduler runs the
+/// RISCs at exactly 2x the 68000 clock (`risc_ticks = cpu_cycles * 2`), so the
+/// identical occupancy expressed in 68000 cycles is half of it: 2.875
+/// milli-cycles per phrase per access. No new constant is being invented, and
+/// nothing here was tuned to make a particular program behave.
+///
+/// Charged on DRAM cycles ONLY (`bus.m68k_dram_cycles`) — Tom and Jerry register
+/// accesses are not on the DRAM bus and the OP does not contend for them.
+const M68K_OP_TAX_MILLI_NUM: u64 = 2875;
+const M68K_OP_TAX_MILLI_DEN: u64 = 1000;
+
 // Condition-code register bits (in the low byte of SR).
 const FLAG_C: u16 = 1 << 0;
 const FLAG_V: u16 = 1 << 1;
@@ -90,6 +120,14 @@ pub struct M68k {
     fetch_ba: u32,
     /// Sub-cycle remainder of the external-bus wait charge (tenths).
     bus_debt: u32,
+    /// Fractional Object-Processor tax owed, in milli-cycles (see
+    /// `M68K_OP_TAX_MILLI_NUM`). Carried between instructions so a charge
+    /// smaller than one cycle per access still accumulates instead of vanishing.
+    op_tax_debt: u64,
+    /// Whole 68000 cycles lost to Object-Processor bus occupancy since reset.
+    /// ⭐ This is the counter the model previously had no way to express: the
+    /// 68k had no load-dependent bus term, so there was nothing to count.
+    pub op_tax_cycles: u64,
     /// Nesting depth of interrupt handlers (for ISR-vs-main attribution).
     pub isr_depth: u32,
     pub instret: u64,
@@ -121,6 +159,8 @@ impl M68k {
             cycles: 0,
             fetch_ba: 0,
             bus_debt: 0,
+            op_tax_debt: 0,
+            op_tax_cycles: 0,
             isr_depth: 0,
             instret: 0,
             last_illegal: None,
@@ -257,13 +297,32 @@ impl M68k {
         // A flat blended constant matched whichever probe calibrated it and
         // was 45% wrong on real programs (wip/m68k-bus-wait, superseded).
         let total = std::mem::take(&mut bus.m68k_bus_cycles);
+        let dram = std::mem::take(&mut bus.m68k_dram_cycles);
         let fetch = self.fetch_ba.min(total);
         let data = total - fetch;
         self.bus_debt += fetch * M68K_FETCH_WAIT_X10 + data * M68K_DATA_WAIT_X10;
         let extra = self.bus_debt / 10;
         self.bus_debt -= extra * 10;
-        self.cycles += extra as u64;
-        let c = c0 + extra;
+
+        // Object-Processor tax: the OP holds DRAM while it scans, and the 68000
+        // is the lowest-priority master, so it waits. Accumulated in
+        // milli-cycles so a sub-cycle-per-access charge is not rounded away —
+        // the same debt trick `charge_op_tax` uses on the RISC side.
+        let phrases = bus.tom.op.phrases_per_line as u64;
+        let mut op_extra: u32 = 0;
+        if phrases > 0 && dram > 0 {
+            self.op_tax_debt +=
+                dram as u64 * phrases * M68K_OP_TAX_MILLI_NUM / M68K_OP_TAX_MILLI_DEN;
+            let whole = self.op_tax_debt / 1000;
+            if whole > 0 {
+                self.op_tax_debt -= whole * 1000;
+                self.op_tax_cycles += whole;
+                op_extra = whole as u32;
+            }
+        }
+
+        self.cycles += (extra + op_extra) as u64;
+        let c = c0 + extra + op_extra;
 
         if dbg.prof.is_some() {
             let in_isr = self.isr_depth > 0;

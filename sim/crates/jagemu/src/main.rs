@@ -2073,7 +2073,7 @@ fn state_json(jag: &Jaguar) -> String {
         bank.iter().map(|v| format!("\"0x{v:08X}\"")).collect::<Vec<_>>().join(",")
     };
     format!(
-        "{{\"frame\":{},\"pc\":{},\"pc_hex\":{},\"sr\":{},\"instret\":{},\"illegal\":{},\
+        "{{\"frame\":{},\"pc\":{},\"pc_hex\":{},\"sr\":{},\"instret\":{},\"m68k_op_tax_cycles\":{},\"illegal\":{},\
          \"last_illegal_op\":\"0x{:04X}\",\
          \"gpu\":{{\"running\":{},\"pc_hex\":{},\"instret\":{},\"cycles\":{},\"granted\":{},\"timing\":{},\
          \"flags\":\"0x{:08X}\",\"regs0\":[{}],\"regs1\":[{}]}},\
@@ -2086,6 +2086,9 @@ fn state_json(jag: &Jaguar) -> String {
         jstr(&format!("0x{:06X}", cpu.pc)),
         cpu.sr,
         cpu.instret,
+        // 68k cycles lost to Object-Processor DRAM occupancy. Previously
+        // unrepresentable: the 68k had no load-dependent bus term at all.
+        cpu.op_tax_cycles,
         cpu.illegal_count,
         cpu.last_illegal_op,
         jag.gpu.running,
