@@ -30,7 +30,11 @@
 #define W       320
 #define H       120
 #define BASE_X  16
-#define BASE_Y  16
+/* YPOS = 2*BASE_Y half-lines must clear VDB on BOTH standards, or the object
+ * starts before the display window opens and its top lines are clipped: VDB is
+ * 25 on NTSC but 35 on PAL, so BASE_Y=16 (YPOS=32) is fine on NTSC hardware and
+ * loses the top border under PAL. 24 -> YPOS=48, clear of both. */
+#define BASE_Y  24
 #define PWIDTH  ((W * 2) / 8)        /* phrases per line at 16bpp */
 #define DEPTH16 (4u << 12)           /* OBDEPTH 4 = 16bpp */
 
@@ -189,13 +193,36 @@ int main(void)
      * on this card's ground colour: (0,0,125) unmasked -> (0,0,21) masked,
      * against rgb(0,0,3) as painted. */
     {
-        unsigned blank = (unsigned)(vmid - height) + 2u * (unsigned)H + 4u;
+        /* Gate on VDB: rebuild in the blanking window at the TOP of the
+           field, immediately before display starts — the same window
+           OpenLara's vertical interrupt fires in.
+           ☠ Do NOT derive the gate from the object height (vdb + 2*H + 4).
+           For any object shorter than the display that lands MID-FIELD: the OP
+           finishes the object, the rebuild resets DATA, and the OP draws the
+           whole thing AGAIN over the rest of the field. The second pass is what
+           you see, it starts wherever the rebuild landed, so YPOS appears to do
+           nothing — measured with H=120, BASE_Y=16 and BASE_Y=100 both produced
+           capture rows 251..473. A full-height object hides it.
+           ☠ Nor from the display end (vmid + height). That is 609 half-lines on
+           PAL, longer than the field, so the wait never completes and the list
+           is never rebuilt at all — which is exactly how jsim (which reports
+           PAL) rendered nothing while the NTSC hardware was fine.
+           And NOT VDB either: VDB is 35 on PAL while this object's YPOS is
+           2*BASE_Y = 32, so a "rebuild while VC < VDB" window OVERLAPS the
+           object's first fetch and clobbers DATA as the OP starts drawing —
+           which clipped exactly the four border edges while every band, ramp
+           and the magenta block still passed.
+           Rebuild just after the field WRAPS instead: VC 0..7 is inside the
+           field on both standards and finishes well before YPOS=32. OpenLara
+           works to the same constraint from the other side, firing its VI at
+           vdb-4 against a hard ~350us deadline. */
+        unsigned blank = 8u;
         for (;;) {
-            while ((unsigned)(VC & 0x7FF) <  blank) { }  /* end of active video */
+            while ((unsigned)(VC & 0x7FF) >= blank) { }  /* wait for vblank  */
             build_list();
             OLP = (olp >> 16) | (olp << 16);
             OBF = 0;
-            while ((unsigned)(VC & 0x7FF) >= blank) { }  /* exactly one per field */
+            while ((unsigned)(VC & 0x7FF) <  blank) { }  /* one per field    */
         }
     }
 }

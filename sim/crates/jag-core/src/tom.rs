@@ -225,10 +225,22 @@ pub fn op_render_line(vc: u16, cpu: &mut M68k, gpu: &mut Risc, bus: &mut Bus) {
     let vmode = bus.tom.win.r16(mem::VMODE);
     let fmt = PixFmt::from_vmode(vmode);
 
-    // First active call of the field: size/clear the canvas from the list.
-    if !bus.tom.op.started {
+    // Size/clear the canvas from the list at the first ACTIVE line, not at
+    // half-line 0.
+    //
+    // Canvas sizing is a jsim abstraction; the real OP has no such step, it just
+    // draws an object when the beam reaches its YPOS. Doing it at half-line 0
+    // demanded the list be intact at the very TOP of the field, which wrongly
+    // fails a program that rebuilds during VERTICAL BLANK — the correct place,
+    // and the one hardware gives it. Gating on VDB hands the program the same
+    // window silicon does.
+    let vdb = bus.tom.win.r16(mem::VDB);
+    if !bus.tom.op.started && vc >= vdb {
         op_begin_field(bus, fmt);
         bus.tom.op.consumed = false;
+    }
+    if !bus.tom.op.started {
+        return; // before the display window opens: nothing to composite yet
     }
 
     // End of active display: the real OP has now walked every header to its last
