@@ -94,11 +94,22 @@ impl PixFmt {
 /// must persist between lines is the chosen canvas geometry and the screen
 /// anchor (the base object's origin). Multi-line bitmaps advance their source
 /// pointer *statelessly* — at half-line `vc` an object draws source line
-/// `(vc - ypos)/2` — so we never mutate the game's DRAM list (which it rebuilds
-/// each vblank) and a static homebrew list can never be corrupted.
+/// `(vc - ypos)/2`.
+///
+/// ⚠️ Drawing is stateless, but the LIST IS STILL CONSUMED. This type used to
+/// say we "never mutate the game's DRAM list (which it rebuilds each vblank)" —
+/// and that parenthesis was an *assumption about the program*, not a property of
+/// the hardware. A ROM that does not rebuild draws one field on silicon and goes
+/// blank forever, while jsim rendered it perfectly; `jag_rr` lost most of a
+/// hardware investigation to exactly that gap. `op_consume_list` now spends the
+/// headers at the end of active display, which is when the real OP has finished
+/// walking them and when a program's vblank rebuild is still in time.
 pub struct OpState {
     /// Has the canvas been sized/cleared for the current field yet?
     pub started: bool,
+    /// Has this field's list been consumed yet? Latched so the end-of-active
+    /// -display write-back happens exactly once per field.
+    pub consumed: bool,
     /// Display canvas size (pixels), chosen at field start.
     pub width: u32,
     pub height: u32,
@@ -124,6 +135,7 @@ impl Default for OpState {
     fn default() -> Self {
         OpState {
             started: false,
+            consumed: false,
             width: 320,
             height: 240,
             anchor_x: 0,
@@ -214,6 +226,19 @@ pub fn op_render_line(vc: u16, cpu: &mut M68k, gpu: &mut Risc, bus: &mut Bus) {
     // First active call of the field: size/clear the canvas from the list.
     if !bus.tom.op.started {
         op_begin_field(bus, fmt);
+        bus.tom.op.consumed = false;
+    }
+
+    // End of active display: the real OP has now walked every header to its last
+    // line, leaving them spent in DRAM. Do it HERE rather than at the field wrap
+    // so a program still gets its whole vertical blank to rebuild — consuming at
+    // the wrap would race `op_begin_field` on the very next half-line and blank
+    // even a correct, rebuilding ROM.
+    if !bus.tom.op.consumed
+        && vc > bus.tom.op.anchor_y.saturating_add(2 * bus.tom.op.height as u16)
+    {
+        bus.tom.op.consumed = true;
+        op_consume_list(bus);
     }
     let (width, height, anchor_x, anchor_y) =
         (bus.tom.op.width, bus.tom.op.height, bus.tom.op.anchor_x, bus.tom.op.anchor_y);
@@ -412,6 +437,65 @@ fn collect_bitmaps(bus: &Bus, olp: u32) -> Vec<Obj> {
         }
     }
     out
+}
+
+/// ☠ THE OP SELF-CONSUMES ITS OBJECT LIST — model it, or every build-once ROM
+/// that is blank on silicon renders perfectly here.
+///
+/// Real hardware updates a BITMAP/SCALED header in DRAM as it renders: DATA
+/// advances by DWIDTH phrases per displayed line and HEIGHT counts down, so at
+/// the end of the field the stored header is spent (HEIGHT 0, DATA past the end
+/// of the bitmap). A program must therefore rebuild the list EVERY field; one
+/// that builds it once and spins draws exactly one field and then goes blank
+/// permanently.
+///
+/// jsim used to re-read the list from DRAM each field and never write anything
+/// back, so a build-once ROM looked correct forever. `jag_rr` lost most of a
+/// hardware investigation to that gap on 2026-08-17: the emulator showed a
+/// perfect test card while the Jaguar showed background, which sends you
+/// hunting the object fields — alignment, IWIDTH, placement, colour — when the
+/// list itself is simply gone. Same family as the narrow-RISC-RAM-write case:
+/// modelling a hazard's existence without its consequence is what makes an
+/// emulator *too forgiving*, and a too-forgiving emulator is worse than a
+/// missing feature because it actively exonerates the bug.
+///
+/// Called once per field, at the field boundary, so within-field per-line reads
+/// (the bus-contention appetite sampling) still see the live list.
+pub fn op_consume_list(bus: &mut Bus) {
+    use std::collections::HashSet;
+    let olp = ((bus.tom.win.r16(mem::OLPH) as u32) << 16) | bus.tom.win.r16(mem::OLP) as u32;
+    let mut seen: HashSet<u32> = HashSet::new();
+    let mut stack = vec![olp];
+    while let Some(addr) = stack.pop() {
+        let addr8 = addr & !7;
+        if !seen.insert(addr8) || seen.len() > 4096 {
+            continue;
+        }
+        let o = decode_obj(bus, addr8);
+        match o.otype {
+            0 | 1 => {
+                if o.link != 0 {
+                    stack.push(o.link);
+                }
+                // DATA advances one DWIDTH per line drawn; HEIGHT counts to 0.
+                let advanced = o
+                    .data
+                    .wrapping_add(o.height.wrapping_mul(o.dwidth_phrases).wrapping_mul(8));
+                let hi = peek32(bus, addr8);
+                let lo = peek32(bus, addr8 + 4);
+                poke32_dram(bus, addr8, (hi & 0x7FF) | (((advanced >> 3) & 0x1F_FFFF) << 11));
+                poke32_dram(bus, addr8 + 4, lo & !(0x3FF << 14));
+            }
+            4 => {} // STOP ends this path
+            3 => {
+                if o.link != 0 {
+                    stack.push(o.link);
+                }
+                stack.push(addr8 + 8);
+            }
+            _ => stack.push(addr8 + 8),
+        }
+    }
 }
 
 /// Walk the live object list for one scanline (`vc` in half-lines), drawing each
@@ -683,6 +767,42 @@ mod tests {
         assert_eq!(&frame.rgba[o..o + 4], &[255, 0, 0, 255]);
     }
 
+    /// The OP SELF-CONSUMES its list: a ROM that builds the list once and never
+    /// rebuilds draws exactly ONE field on silicon and is blank forever after.
+    ///
+    /// This is a REGRESSION GUARD, and the property it protects is jsim's
+    /// ability to FAIL. Before this, a build-once list rendered perfectly here
+    /// field after field, so the emulator actively exonerated a ROM that showed
+    /// nothing on hardware — `jag_rr` lost most of a hardware investigation to
+    /// it on 2026-08-17. An emulator that models a hazard's existence without
+    /// its consequence is worse than one that omits it entirely.
+    #[test]
+    fn op_self_consumes_list_second_field_is_blank() {
+        let mut bus = Bus::new();
+        let (fb, ol, w, h) = (0x10_0000u32, 0x1000u32, 320u32, 240u32);
+        for i in 0..(w * h) {
+            bus.write16(fb + i * 2, 0xF800); // red
+        }
+        setup_a3d_style(&mut bus, fb, ol, w, h, 16, 16);
+
+        // Field 1: the list is intact, so the full canvas composites.
+        let first = compose_frame(&mut bus);
+        assert_eq!((first.width, first.height), (320, 240), "first field should draw");
+        let o = ((120 * 320 + 160) * 4) as usize;
+        assert_eq!(&first.rgba[o..o + 4], &[255, 0, 0, 255], "first field should be red");
+
+        // Field 2 with NO rebuild: the header is spent, so there is nothing to
+        // size a canvas from. Height collapses — exactly the silicon symptom.
+        let second = compose_frame(&mut bus);
+        assert!(
+            second.height < 240,
+            "second field must NOT draw a full canvas from a consumed list \
+             (got {}x{}) — jsim is exonerating a build-once ROM again",
+            second.width,
+            second.height
+        );
+    }
+
     #[test]
     fn op_composites_color_bands() {
         let mut bus = Bus::new();
@@ -819,4 +939,17 @@ fn peek32(bus: &Bus, addr: u32) -> u32 {
     let mut b = [0u8; 4];
     bus.peek(addr, &mut b);
     u32::from_be_bytes(b)
+}
+
+/// DRAM-only 32-bit poke that does NOT charge `m68k_bus_cycles`.
+///
+/// The Object Processor is not the 68000: its writes must not appear in the
+/// CPU's bus accounting or every contention measurement built on that counter
+/// shifts. `Bus::write32` charges two cycles, so it is the wrong tool here.
+#[inline]
+fn poke32_dram(bus: &mut Bus, addr: u32, v: u32) {
+    let a = addr & crate::bus::ADDR_MASK;
+    if mem::is_dram(a) && a + 3 < mem::DRAM_END {
+        bus.dram[a as usize..a as usize + 4].copy_from_slice(&v.to_be_bytes());
+    }
 }

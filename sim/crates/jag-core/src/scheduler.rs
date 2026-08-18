@@ -132,7 +132,8 @@ impl Scheduler {
                 // coherent field even if the run stops mid-way into the new one.
                 bus.tom.presented = bus.tom.fb.clone();
                 // New field: the OP re-sizes/clears its canvas at the next
-                // active line.
+                // active line. (The list is self-consumed at the END OF ACTIVE
+                // DISPLAY, in `op_render_line`, not here — see `op_consume_list`.)
                 bus.tom.op.started = false;
             }
 
