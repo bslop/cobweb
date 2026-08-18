@@ -13,6 +13,7 @@
 #define REG16(a) (*(volatile unsigned short *)(a))
 #define REG32(a) (*(volatile unsigned       *)(a))
 
+#define VC    REG16(0xF00006)   /* vertical count, HALF-LINES; bit 11 = field! */
 #define OLP   REG32(0xF00020)   /* object list pointer — halves swapped! */
 #define OBF   REG16(0xF00026)   /* object processor flag — write 0 after OLP */
 #define VMODE REG16(0xF00028)
@@ -169,16 +170,32 @@ int main(void)
 
     VMODE = 0x06C7;                                    /* VIDEN last */
 
-    /* Keep handing the OP a fresh list. Rebuilding FREE-RUNNING rather than once
-     * per vertical-blank window matters: a VC-gated rebuild fired at the wrong
-     * phase misses every SECOND field, so the object draws on alternate fields
-     * and a capture averages object+background 50/50 — which shows up as a blue
-     * floor under every colour and reads exactly like a colour bug. Measured:
-     * solid red went (120,0,116) -> (218,0,0) on switching to free-running.
-     * Correctness needs only that the list is never stale for a whole field. */
-    for (;;) {
-        build_list();
-        OLP = (olp >> 16) | (olp << 16);
-        OBF = 0;
+    /* Rebuild ONCE PER FIELD, inside the vertical blank.
+     *
+     * ☠ NOT free-running. The OP ADVANCES the object's DATA pointer as it
+     * renders each line, so a loop that rewrites the header continuously resets
+     * DATA to the top of the framebuffer on every scanline and the whole screen
+     * becomes a copy of LINE 0. An earlier revision of this file recommended
+     * free-running; that was wrong, and it survived because neither test card
+     * could see it — a solid fill is invariant in y, and this card's bands vary
+     * only in x. ⭐ A card can only detect a line-stride fault if it varies
+     * along the axis the fault acts on.
+     *
+     * ☠ MASK VC WITH $7FF. Bit 11 of VC ($F00006) is the FIELD flag, not part of
+     * the half-line count, so comparing raw VC makes the gate always-true on
+     * every second field: only alternate fields get a rebuilt list, and a
+     * capture then averages object with background 50/50 — a floor of the BG
+     * colour under every pixel, which reads exactly like a colour bug. Measured
+     * on this card's ground colour: (0,0,125) unmasked -> (0,0,21) masked,
+     * against rgb(0,0,3) as painted. */
+    {
+        unsigned blank = (unsigned)(vmid - height) + 2u * (unsigned)H + 4u;
+        for (;;) {
+            while ((unsigned)(VC & 0x7FF) <  blank) { }  /* end of active video */
+            build_list();
+            OLP = (olp >> 16) | (olp << 16);
+            OBF = 0;
+            while ((unsigned)(VC & 0x7FF) >= blank) { }  /* exactly one per field */
+        }
     }
 }
