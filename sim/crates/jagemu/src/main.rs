@@ -189,11 +189,41 @@ fn boot(rom: &[u8], frames: u64, fid: Fidelity) -> Result<Jaguar, String> {
     boot_input(rom, frames, 0, 0, fid)
 }
 
+/// The name of a fidelity, for reporting it back to the caller.
+///
+/// Every subcommand echoes this now, because the default is silent and
+/// **fidelity is part of the experiment, not a rendering option**. A
+/// `run --fidelity silicon` profile and a bare `peek` of the same ROM are two
+/// different timelines: a reporting project cross-checked a profiler finding
+/// with `peek` and `break`, got a flat contradiction, and spent a session
+/// concluding the profiler was misattributing cycles. It was not — the checks
+/// were running the other timeline, in which the game had not even reached the
+/// same state. See `COBWEB_ISSUES_RESIDENT.md`.
+pub fn fidelity_name(f: Fidelity) -> &'static str {
+    match f {
+        Fidelity::Functional => "functional",
+        Fidelity::Silicon => "silicon",
+        Fidelity::BigPEmu => "bigpemu",
+    }
+}
+
 /// Parse `--fidelity functional|silicon|bigpemu` (default functional — the
 /// timed profiles are the jsim truth layer, opt-in until hardware-calibrated).
+///
+/// Warns on stderr when it falls back to the default, so the choice is never
+/// invisible: an omitted flag and a deliberate `--fidelity functional` produce
+/// the same run but very different confidence, and only one of them is a
+/// decision somebody made.
 fn fidelity_arg(args: &[String]) -> Result<Fidelity, String> {
     Ok(match flag_val(args, "--fidelity") {
-        None => Fidelity::Functional,
+        None => {
+            eprintln!(
+                "jagemu: fidelity=functional (default). Timing differs from \
+                 --fidelity silicon, and so can the ROM's behaviour - compare \
+                 only runs that used the SAME fidelity."
+            );
+            Fidelity::Functional
+        }
         Some(s) => match s.to_ascii_lowercase().as_str() {
             "functional" => Fidelity::Functional,
             "silicon" => Fidelity::Silicon,
@@ -1355,14 +1385,15 @@ fn cmd_peek(args: &[String]) -> Result<(), String> {
     // Raw-file dumps can be large; interactive hex dumps stay bounded at 4 KB.
     let cap = if out.is_some() { 0x20_0000 } else { 4096 };
     let len = flag_val(args, "--len").map(parse_u32).transpose()?.unwrap_or(64).min(cap);
-    let jag = boot_input(&data, frames, btn, after, fidelity_arg(args)?)?;
+    let fid = fidelity_arg(args)?;
+    let jag = boot_input(&data, frames, btn, after, fid)?;
     let mut buf = vec![0u8; len as usize];
     jag.bus.peek(at, &mut buf);
     if let Some(path) = out {
         std::fs::write(path, &buf).map_err(|e| e.to_string())?;
         println!(
-            "{{\"ok\":true,\"at\":{},\"at_hex\":{},\"len\":{},\"out\":{}}}",
-            at, jstr(&format!("0x{at:06X}")), len, jstr(path)
+            "{{\"ok\":true,\"at\":{},\"at_hex\":{},\"len\":{},\"fidelity\":{},\"out\":{}}}",
+            at, jstr(&format!("0x{at:06X}")), len, jstr(fidelity_name(fid)), jstr(path)
         );
         return Ok(());
     }
@@ -1377,10 +1408,11 @@ fn cmd_peek(args: &[String]) -> Result<(), String> {
     }
     let bytes: Vec<String> = buf.iter().map(|b| b.to_string()).collect();
     println!(
-        "{{\"ok\":true,\"at\":{},\"at_hex\":{},\"len\":{},\"bytes\":[{}]}}",
+        "{{\"ok\":true,\"at\":{},\"at_hex\":{},\"len\":{},\"fidelity\":{},\"bytes\":[{}]}}",
         at,
         jstr(&format!("0x{at:06X}")),
         len,
+        jstr(fidelity_name(fid)),
         bytes.join(",")
     );
     Ok(())
