@@ -1887,6 +1887,40 @@ fn rt_multiply_wraps_like_c() {
 }
 
 #[test]
+fn rt_signed_pow2_div_mod_truncate_toward_zero() {
+    // The trap this guards: ASR rounds toward -infinity, C truncates toward
+    // zero. -1/2 is 0 in C and -1 from a bare `asr.l #1`. Every negative
+    // dividend that is not an exact multiple hits it, so the wrong version
+    // passes any test written with positive numbers.
+    for a in [-1i32, -3, -7, -8, -9, -1023, -1024, -1025, -32768, -100000, 0, 1, 3, 7, 8, 9, 1023, 1024, 1025, 100000] {
+        for k in [1u32, 2, 8, 10, 16] {
+            let n = 1i32 << k;
+            let src = format!("int main(void){{ int a={a}; return a/{n}; }}");
+            assert_eq!(run(&src), (a / n) as u32, "{a}/{n}");
+            let src = format!("int main(void){{ int a={a}; return a%{n}; }}");
+            assert_eq!(run(&src), (a % n) as u32, "{a}%{n}");
+        }
+    }
+    // divide/modulo by 1 are the degenerate k == 0 cases
+    assert_eq!(run("int main(void){ int a=-7; return a/1; }"), (-7i32) as u32);
+    assert_eq!(run("int main(void){ int a=-7; return a%1; }"), 0);
+}
+
+#[test]
+fn cg_signed_pow2_div_avoids_the_helper() {
+    // The point of the fold is that __divsi3 is not called at all; a correct
+    // result via the helper would pass the behavioural test above and cost
+    // ~1,450 cycles a divide.
+    let asm = crate::compile_program("int f(int a){ return a/1024; } int g(int a){ return a%256; }")
+        .expect("compile");
+    // `compile_program` appends the runtime, so the helpers are DEFINED in the
+    // output either way — the check is that nothing CALLS them.
+    assert!(!asm.contains("jsr __divsi3"), "signed /2^k still calls the helper:\n{asm}");
+    assert!(!asm.contains("jsr __modsi3"), "signed %2^k still calls the helper:\n{asm}");
+    assert!(asm.contains("asr.l"), "expected an arithmetic shift:\n{asm}");
+}
+
+#[test]
 fn rt_divide_by_zero_terminates() {
     // UB in C, but it must not hang the machine — the harness caps at 5M steps
     // and returns whatever is at $100, so a hang shows up as a wrong value

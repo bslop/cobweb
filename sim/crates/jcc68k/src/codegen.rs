@@ -1398,6 +1398,49 @@ impl Gen {
                 self.line(&format!("and.l #{},d0", n - 1));
                 true
             }
+            // Signed /2^k and %2^k. These used to fall through to the helper,
+            // which is the expensive case: __divsi3 is a shift-subtract loop
+            // costing ~1,450 cycles, and jag_rr's road renderer spent 43% of
+            // its 68000 cycles inside it — much of that on `/1024` and `/256`,
+            // constants a reader would assume were free.
+            //
+            // ASR rounds toward -infinity and C truncates toward zero, so a
+            // negative dividend needs a +(2^k - 1) bias first. The branch is
+            // taken only for negatives and still costs ~30 cycles against the
+            // helper's ~1,450.
+            BinOp::Div if k <= 31 => {
+                let l = self.l();
+                self.line("tst.l d0");
+                self.line(&format!("bpl.s .Lsdiv_{l}"));
+                self.line(&format!("add.l #{},d0", n - 1));
+                self.lbl(&format!(".Lsdiv_{l}"));
+                match k {
+                    1..=8 => self.line(&format!("asr.l #{k},d0")),
+                    _ => {
+                        self.line(&format!("moveq #{k},d1"));
+                        self.line("asr.l d1,d0");
+                    }
+                }
+                true
+            }
+            // a % 2^k keeps the sign of a: mask the magnitude, restore the sign.
+            BinOp::Mod if k <= 31 => {
+                if k == 0 {
+                    self.line("moveq #0,d0");
+                    return true;
+                }
+                let l = self.l();
+                self.line("tst.l d0");
+                self.line(&format!("bpl.s .Lsmod_{l}"));
+                self.line("neg.l d0");
+                self.line(&format!("and.l #{},d0", n - 1));
+                self.line("neg.l d0");
+                self.line(&format!("bra.s .Lsmodend_{l}"));
+                self.lbl(&format!(".Lsmod_{l}"));
+                self.line(&format!("and.l #{},d0", n - 1));
+                self.lbl(&format!(".Lsmodend_{l}"));
+                true
+            }
             _ => false,
         }
     }
