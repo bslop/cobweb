@@ -33,6 +33,13 @@ const M68K_DATA_WAIT_X10: u32 = 5;
 /// `m68k_dram_poll_max` in the run state is the warning.
 pub const M68K_DRAM_POLL_BUDGET: u32 = 128;
 
+/// How many DRAM reads by other instructions a poll candidate survives before
+/// it is replaced. A compiled poll interleaves its own read with its spilled
+/// locals', so this must be greater than the number of other DRAM operands in
+/// the loop body — and small enough that a genuine stream of unrelated reads
+/// retires a stale candidate. 16 covers every compiled poll seen so far.
+const POLL_MISS_TOLERANCE: u32 = 16;
+
 /// ── OBJECT-PROCESSOR TAX ON THE 68000 ───────────────────────────────────────
 ///
 /// The two constants above are a CONSTANT wait per bus cycle. The RISC cores
@@ -140,13 +147,51 @@ pub struct M68k {
     /// `M68K_OP_TAX_MILLI_NUM`). Carried between instructions so a charge
     /// smaller than one cycle per access still accumulates instead of vanishing.
     op_tax_debt: u64,
-    /// Address the 68000 is currently re-reading, and how many instructions in
-    /// a row have read it. See `M68K_DRAM_POLL_BUDGET`.
+    /// The (PC, address) pair the 68000 is currently re-reading, and how many
+    /// times that same instruction has read that same address. See
+    /// `M68K_DRAM_POLL_BUDGET`.
+    ///
+    /// ☠️ KEYED ON THE PC, NOT ON THE ADDRESS ALONE. The first version required
+    /// the run to be *consecutive* same-address reads, which only holds when the
+    /// loop body touches exactly ONE DRAM address. Real compiled polls do not:
+    /// in a large function the loop's own locals are spilled to the stack, so
+    /// `while ((int)(frame_count - t0) < tgt) ;` reads three different addresses
+    /// per iteration and the run reset every time. Measured on jag_openlara's
+    /// FMV player, which spins on `frame_count` for three fields out of four and
+    /// on a decode mailbox up to 240,000 times a frame: the detector reported
+    /// `poll_max 2` — the same value it reports for a ROM with no spin at all.
+    /// A detector that reads the same on a known-bad and a known-good build is
+    /// not a weak detector, it is an absent one.
+    poll_pc: u32,
     poll_addr: Option<u32>,
     poll_run: u32,
-    /// Longest same-address DRAM read run of the whole session, and where.
+    /// DRAM reads by OTHER instructions seen since the candidate last matched.
+    /// A poll loop interleaves its own read with its locals', so the candidate
+    /// has to survive a few misses or it can never establish a run at all.
+    poll_miss: u32,
+    /// The distinct addresses those other reads touched. ☠️ THIS IS WHAT KEEPS
+    /// A BULK COPY FROM READING AS A POLL. Tolerating other reads (above) is
+    /// necessary but not sufficient: `for (i=0;i<n;i++) dst[i]=src[i];` with
+    /// its locals spilled has a same-PC same-address read every iteration (the
+    /// loop counter) while `src[i]` walks — and the first version of this
+    /// change reported jag_openlara's GPU-kernel copy as a 555-deep poll.
+    /// A poll's other reads are the SAME few slots forever; a streaming loop's
+    /// are all different. More distinct addresses than this holds ⇒ progress,
+    /// and the candidate is dropped.
+    poll_miss_seen: [u32; 4],
+    poll_miss_n: u8,
+    /// Longest same-instruction/same-address DRAM read run of the whole
+    /// session, and one address the offending loop reads. ⚠ When a loop reads
+    /// several DRAM operands, each is a repeat of itself, so this names
+    /// whichever the detector locked onto first — the LOOP is the finding, not
+    /// the address.
     pub poll_max: u32,
     pub poll_max_addr: u32,
+    /// PC of the instruction doing the polling. ⭐ This is the half you can
+    /// act on: the address alone sends you hunting through a link map, while
+    /// the PC lands in a disassembly (or a `--map` symbolisation) on the exact
+    /// loop to bound.
+    pub poll_max_pc: u32,
     /// Whole 68000 cycles lost to Object-Processor bus occupancy since reset.
     /// ⭐ This is the counter the model previously had no way to express: the
     /// 68k had no load-dependent bus term, so there was nothing to count.
@@ -183,10 +228,15 @@ impl M68k {
             fetch_ba: 0,
             bus_debt: 0,
             op_tax_debt: 0,
+            poll_pc: 0,
             poll_addr: None,
             poll_run: 0,
+            poll_miss: 0,
+            poll_miss_seen: [0; 4],
+            poll_miss_n: 0,
             poll_max: 0,
             poll_max_addr: 0,
+            poll_max_pc: 0,
             op_tax_cycles: 0,
             isr_depth: 0,
             instret: 0,
@@ -332,18 +382,44 @@ impl M68k {
         // Same-address DRAM read run — the shape of a mailbox or status poll.
         // A write clears it: a loop that stores is not a pure spin.
         if bus.m68k_dram_wrote {
+            // A store means the loop is doing work and yielding the bus.
             self.poll_addr = None;
             self.poll_run = 0;
+            self.poll_miss = 0;
+            self.poll_miss_n = 0;
         } else if let Some(a) = bus.m68k_dram_read_addr {
-            if self.poll_addr == Some(a) {
+            if self.poll_addr == Some(a) && self.poll_pc == pc0 {
+                // The same instruction reading the same address again: the
+                // signature of a poll, whatever else the loop body touches.
                 self.poll_run += 1;
-            } else {
+                self.poll_miss = 0;
+            } else if self.poll_addr.is_none() || self.poll_miss >= POLL_MISS_TOLERANCE {
+                // No candidate, or the one we had has gone quiet — adopt this.
+                self.poll_pc = pc0;
                 self.poll_addr = Some(a);
                 self.poll_run = 1;
+                self.poll_miss = 0;
+                self.poll_miss_n = 0;
+            } else if self.poll_miss_seen[..self.poll_miss_n as usize].contains(&a) {
+                // A read we have seen before alongside this candidate — the
+                // loop's own spilled locals. Tolerate it.
+                self.poll_miss += 1;
+            } else if (self.poll_miss_n as usize) < self.poll_miss_seen.len() {
+                self.poll_miss_seen[self.poll_miss_n as usize] = a;
+                self.poll_miss_n += 1;
+                self.poll_miss += 1;
+            } else {
+                // A FIFTH distinct companion address: this loop is walking
+                // memory, not waiting on it. Not a poll — drop the candidate.
+                self.poll_addr = None;
+                self.poll_run = 0;
+                self.poll_miss = 0;
+                self.poll_miss_n = 0;
             }
             if self.poll_run > self.poll_max {
                 self.poll_max = self.poll_run;
-                self.poll_max_addr = a;
+                self.poll_max_addr = self.poll_addr.unwrap_or(a);
+                self.poll_max_pc = self.poll_pc;
             }
         }
 
@@ -771,6 +847,31 @@ mod poll_tests {
         // measurement from a clean slate.
         cpu.poll_max = 0;
         cpu.poll_max_addr = 0;
+        cpu.poll_max_pc = 0;
+        let mut dbg = crate::debug::Debugger::new();
+        for _ in 0..steps {
+            cpu.step(&mut bus, &mut dbg);
+        }
+        cpu
+    }
+
+    /// `run`, but with a0 seeded so a `(a0)+` source walks real memory.
+    fn run_with_a0(prog: &[u8], steps: u32, seed: Option<(u32, u16)>, a0: u32) -> M68k {
+        let mut bus = Bus::new();
+        for (i, b) in prog.iter().enumerate() {
+            bus.write8(0x4000 + i as u32, *b);
+        }
+        if let Some((addr, v)) = seed {
+            bus.write16(addr, v);
+        }
+        let mut cpu = M68k::new();
+        cpu.reset(&mut bus);
+        cpu.sr = 0x2700;
+        cpu.set_pc(0x4000);
+        cpu.a[0] = a0;
+        cpu.poll_max = 0;
+        cpu.poll_max_addr = 0;
+        cpu.poll_max_pc = 0;
         let mut dbg = crate::debug::Debugger::new();
         for _ in 0..steps {
             cpu.step(&mut bus, &mut dbg);
@@ -809,6 +910,61 @@ mod poll_tests {
         let prog = [0x33, 0xC0, 0x00, 0x00, 0x10, 0x00, 0x66, 0xF8];
         let cpu = run(&prog, 40, None);
         assert_eq!(cpu.poll_max, 0, "a storing loop is not a poll");
+    }
+
+    /// ☠️ THE REGRESSION THIS DETECTOR WAS BLIND TO (jag_openlara, 2026-08-18).
+    /// A poll whose loop body also reads a spilled local — which is every poll
+    /// a C compiler emits inside a large function — reset the run on each
+    /// iteration and reported `poll_max 2`, indistinguishable from a ROM with
+    /// no spin. The run must survive reads from OTHER instructions.
+    ///
+    ///     loop: move.w ($2000).l,d1     ; a spilled local, different address
+    ///           move.w ($1000).l,d0     ; the poll itself — sets the flags
+    ///           bne.s  loop
+    #[test]
+    fn a_poll_survives_other_reads_in_the_same_loop() {
+        let prog = [
+            0x32, 0x39, 0x00, 0x00, 0x20, 0x00, // move.w ($2000).l,d1
+            0x30, 0x39, 0x00, 0x00, 0x10, 0x00, // move.w ($1000).l,d0
+            0x66, 0xF2, // bne.s loop
+        ];
+        let cpu = run(&prog, 60, Some((0x1000, 1)));
+        assert!(
+            cpu.poll_max >= 15,
+            "a spin with a spilled local in the loop must still register, got {}",
+            cpu.poll_max
+        );
+        // With more than one DRAM read in the loop, EVERY one of them is a
+        // same-instruction same-address repeat, so any of them is a fair thing
+        // to name: the culprit is the non-yielding loop, not one address in it.
+        assert!(
+            cpu.poll_max_addr == 0x1000 || cpu.poll_max_addr == 0x2000,
+            "the blamed address must be one the loop actually reads, got {:#X}",
+            cpu.poll_max_addr
+        );
+    }
+
+    /// ☠️ A BULK COPY IS NOT A POLL, even though its spilled loop counter is a
+    /// same-PC same-address read every iteration. Tolerating companion reads
+    /// (the test above) is necessary; without also noticing that they WALK,
+    /// this reported jag_openlara's GPU-kernel copy loop as a 555-deep poll.
+    ///
+    ///     loop: move.w ($1000).l,d0     ; stands in for the spilled counter
+    ///           move.w (a0)+,d1         ; the copy's source — a NEW address
+    ///           bne.s  loop             ; each time round
+    #[test]
+    fn a_walking_read_is_not_a_poll() {
+        let prog = [
+            0x30, 0x39, 0x00, 0x00, 0x10, 0x00, // move.w ($1000).l,d0
+            0x32, 0x18, //                         move.w (a0)+,d1
+            0x66, 0xF6, //                         bne.s loop
+        ];
+        let cpu = run_with_a0(&prog, 200, Some((0x1000, 1)), 0x2000);
+        assert!(
+            cpu.poll_max <= M68K_DRAM_POLL_BUDGET,
+            "a streaming copy must not be reported as a poll, got {}",
+            cpu.poll_max
+        );
     }
 
     /// Instruction fetch is a DRAM read too, since code lives in DRAM. If
