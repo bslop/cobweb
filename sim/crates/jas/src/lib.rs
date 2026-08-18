@@ -513,12 +513,41 @@ impl<'a> Assembler<'a> {
                 self.m68k_mode = self.opts.start_m68k;
             }
             ".68000" | ".68k" | ".m68k" => self.m68k_mode = true,
+            // `.org` after the first one is a PAD, not a bare counter move.
+            //
+            // It used to just assign `self.pc`, leaving the output stream where
+            // it was. Every label and the .map then reported the org'd address
+            // while the bytes sat wherever the previous block happened to end —
+            // silently, with no diagnostic. That is how a Jerry interrupt vector
+            // table (three `.org`-separated 16-byte slots) came out with irq1's
+            // handler four bytes low: the DSP vectored to $F1B010 and executed
+            // the middle of a `movei` immediate. Nothing in the assembler, the
+            // linker or the emulator said a word; it looked like a kernel bug
+            // and cost a debugging session to find.
+            //
+            // The FIRST `.org` still just sets the origin (there is nothing to
+            // pad from), and a backwards `.org` is now a hard error — the output
+            // is an append-only stream, so rewinding it cannot mean anything.
             ".org" | "org" => {
                 if let Some(v) = self.eval_or_err(line.args, line.n) {
-                    self.pc = v;
                     if !self.org_set {
                         self.org = v;
                         self.org_set = true;
+                        self.pc = v;
+                    } else if v > self.pc {
+                        for _ in 0..(v - self.pc) {
+                            self.put_byte(0, line);
+                        }
+                    } else if v < self.pc {
+                        self.err(
+                            line.n,
+                            format!(
+                                ".org 0x{v:X} goes BACKWARDS (location counter is \
+                                 already 0x{:X}) — the output is an append-only \
+                                 stream and cannot be rewound",
+                                self.pc
+                            ),
+                        );
                     }
                 }
             }

@@ -760,3 +760,45 @@ fn m68k_start_flag_assembles_pure_68k() {
     let out = assemble("        movem.l a1-a2,-(sp)\n        move.w #$4001,d0\n        rts\n", &opts);
     assert_eq!(out.errors(), 0, "pure-68k with --68000 must assemble: {:#?}", out.diags);
 }
+
+/// A forward `.org` must PAD the output, not merely move the location counter.
+///
+/// Regression: `.org` used to assign `pc` and emit nothing, so a Jerry
+/// interrupt-vector table (three `.org`-separated 16-byte slots) whose first
+/// slot held fewer than 16 bytes came out with every later handler low by the
+/// shortfall. Labels and the .map reported the org'd address; the bytes were
+/// somewhere else; nothing warned. The DSP vectored to $F1B010 and executed the
+/// middle of a `movei` immediate.
+#[test]
+fn forward_org_pads_the_output() {
+    let opts = Options { target: Target::Dsp, org: mem::D_RAM, ..Default::default() };
+    let out = assemble(
+        "\t.dsp\n\t.org\t$F1B000\n\tnop\n\t.org\t$F1B010\n\tnop\n\t.org\t$F1B020\nhere:\n\tnop\n\t.globl here\n",
+        &opts,
+    );
+    assert_eq!(out.errors(), 0, "assembly errors: {:#?}", out.diags);
+    // Three NOPs, at 0x00 / 0x10 / 0x20, with zero fill between them.
+    assert_eq!(out.bytes.len(), 0x22, "forward .org did not pad");
+    assert_eq!(&out.bytes[0x00..0x02], &[0xE4, 0x00]);
+    assert_eq!(&out.bytes[0x02..0x10], &[0u8; 14], "gap not zero-filled");
+    assert_eq!(&out.bytes[0x10..0x12], &[0xE4, 0x00]);
+    assert_eq!(&out.bytes[0x12..0x20], &[0u8; 14], "gap not zero-filled");
+    assert_eq!(&out.bytes[0x20..0x22], &[0xE4, 0x00]);
+    // …and the label agrees with where the byte actually landed.
+    let here = *out.symbols.get("here").expect("`here` missing from the symbol table");
+    assert_eq!(here, 0x00F1_B020);
+}
+
+/// A backwards `.org` cannot mean anything for an append-only byte stream, so
+/// it is a hard error rather than a silent overlap.
+#[test]
+fn backwards_org_is_an_error() {
+    let opts = Options { target: Target::Dsp, org: mem::D_RAM, ..Default::default() };
+    let out = assemble("\t.dsp\n\t.org\t$F1B010\n\tnop\n\t.org\t$F1B000\n\tnop\n", &opts);
+    assert!(out.errors() > 0, "backwards .org was accepted");
+    assert!(
+        out.diags.iter().any(|d| format!("{d:?}").contains("BACKWARDS")),
+        "wrong diagnostic: {:#?}",
+        out.diags
+    );
+}
