@@ -1866,6 +1866,33 @@ fn rt_division_sign_combinations_wide() {
 }
 
 #[test]
+fn rt_division_narrow_divisor_fast_path() {
+    // __udivsi3 takes a two-DIVU path when the divisor fits in 16 bits. The
+    // boundaries are where it breaks: divisor 1 and 0xFFFF, a dividend with
+    // bit 31 set, and the 0x10000 divisor that must NOT take the path.
+    let cases: &[(u32, u32)] = &[
+        (0, 1), (1, 1), (0xFFFFFFFF, 1),
+        (0xFFFFFFFF, 0xFFFF), (0xFFFFFFFF, 0x10000), (0xFFFFFFFF, 0x10001),
+        (0x10000, 0xFFFF), (0xFFFE, 0xFFFF), (0x80000000, 0xFFFF),
+        (1000000000, 1024), (1000000007, 19), (65535, 65535), (65536, 2),
+    ];
+    for &(a, b) in cases {
+        let src = format!("int main(void){{ unsigned a={a}u, b={b}u; return a/b; }}");
+        assert_eq!(run(&src), a / b, "{a}/{b} unsigned");
+        let src = format!("int main(void){{ unsigned a={a}u, b={b}u; return a%b; }}");
+        assert_eq!(run(&src), a % b, "{a}%{b} unsigned");
+    }
+    // signed goes through the same core after taking the signs off
+    for (a, b) in [(1000000007i32, 19i32), (-1000000007, 19), (1000000007, -19), (-1000000007, -19),
+                   (-2147483648, 3), (7, 65535), (-7, 65535)] {
+        let src = format!("int main(void){{ int a={a}, b={b}; return a/b; }}");
+        assert_eq!(run(&src), (a.wrapping_div(b)) as u32, "{a}/{b} signed");
+        let src = format!("int main(void){{ int a={a}, b={b}; return a%b; }}");
+        assert_eq!(run(&src), (a.wrapping_rem(b)) as u32, "{a}%{b} signed");
+    }
+}
+
+#[test]
 fn rt_unsigned_high_bit_operands() {
     // Values with bit 31 set must be treated as magnitudes, not negatives.
     assert_eq!(run("int main(void){ unsigned a=0xFFFFFFFFu,b=0x10000u; return a/b; }"), 0xFFFF);

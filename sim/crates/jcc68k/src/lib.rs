@@ -138,6 +138,39 @@ __udivsi3_regs:
 	movem.l	d2-d4,-(a7)
 	move.l	d0,d2			; dividend
 	move.l	d1,d3			; divisor
+; ── fast path: a divisor that fits in 16 bits ───────────────────────────────
+; The 68000 HAS a divide — DIVU.W, 32÷16 → 16 — it just cannot do 32÷32. Two
+; DIVUs give the full 32-bit quotient whenever the divisor fits in a word, at
+; ~340 cycles against the shift-subtract loop's ~1,450.
+;
+;   q_hi = hi16 / v          r_hi = hi16 % v        (q_hi < 2^16 since v >= 1)
+;   q_lo = (r_hi:lo16) / v                          (< 2^16 since r_hi < v)
+;   quotient = q_hi:q_lo     remainder = (r_hi:lo16) % v
+;
+; Neither DIVU can overflow: that is what `r_hi < v` buys, and it is why the
+; second dividend is built from the FIRST division's remainder rather than
+; from the dividend again.
+	cmp.l	#$FFFF,d3
+	bhi.w	__udiv_wide		; divisor >= 65536 — no 16-bit form
+	tst.w	d3
+	beq.w	__udiv_wide		; /0 is UB; keep the loop's terminating behaviour
+	move.l	d2,d4
+	clr.w	d4
+	swap	d4			; d4 = hi16, zero-extended
+	divu.w	d3,d4			; d4 = [r_hi : q_hi]
+	move.l	d4,d1			; keep q_hi
+	move.w	d2,d4			; d4 = [r_hi : lo16] — the rest of the dividend
+	divu.w	d3,d4			; d4 = [rem : q_lo]
+	move.l	d1,d0
+	swap	d0			; d0 = [q_hi : r_hi]
+	move.w	d4,d0			; d0 = [q_hi : q_lo] = quotient
+	move.l	d4,d1
+	clr.w	d1
+	swap	d1			; d1 = remainder
+	movem.l	(a7)+,d2-d4
+	rts
+
+__udiv_wide:
 	moveq	#0,d0			; quotient
 	moveq	#0,d4			; remainder
 	moveq	#31,d1
