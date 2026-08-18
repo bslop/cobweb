@@ -2090,7 +2090,7 @@ fn state_json(jag: &Jaguar) -> String {
         bank.iter().map(|v| format!("\"0x{v:08X}\"")).collect::<Vec<_>>().join(",")
     };
     format!(
-        "{{\"frame\":{},\"pc\":{},\"pc_hex\":{},\"sr\":{},\"instret\":{},\"m68k_op_tax_cycles\":{},\"illegal\":{},\
+        "{{\"frame\":{},\"pc\":{},\"pc_hex\":{},\"sr\":{},\"instret\":{},\"m68k_op_tax_cycles\":{},\"m68k_dram_poll_max\":{},\"m68k_dram_poll_addr\":\"0x{:06X}\",\"illegal\":{},\
          \"last_illegal_op\":\"0x{:04X}\",\
          \"gpu\":{{\"running\":{},\"pc_hex\":{},\"instret\":{},\"cycles\":{},\"granted\":{},\"timing\":{},\
          \"flags\":\"0x{:08X}\",\"regs0\":[{}],\"regs1\":[{}]}},\
@@ -2106,6 +2106,12 @@ fn state_json(jag: &Jaguar) -> String {
         // 68k cycles lost to Object-Processor DRAM occupancy. Previously
         // unrepresentable: the 68k had no load-dependent bus term at all.
         cpu.op_tax_cycles,
+        // Longest run of same-address 68000 DRAM operand reads, and where.
+        // Real silicon stops the CPU dead somewhere between 16 and ~128 of
+        // these (jag-core M68K_DRAM_POLL_BUDGET); jsim runs them to completion,
+        // so without this number a hardware-fatal spin is invisible here.
+        cpu.poll_max,
+        cpu.poll_max_addr,
         cpu.illegal_count,
         cpu.last_illegal_op,
         jag.gpu.running,
