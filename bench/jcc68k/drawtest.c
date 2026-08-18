@@ -14,6 +14,7 @@
 #define REG32(a) (*(volatile unsigned       *)(a))
 
 #define OLP   REG32(0xF00020)   /* object list pointer — halves swapped! */
+#define OBF   REG16(0xF00026)   /* object processor flag — write 0 after OLP */
 #define VMODE REG16(0xF00028)
 #define BORD1 REG16(0xF0002A)
 #define BORD2 REG16(0xF0002C)
@@ -91,15 +92,14 @@ static void paint(void)
             fb[y * W + x] = rgb(31, 0, 31);
 }
 
-int main(void)
+/* ☠ THE OP DESTROYS THIS LIST EVERY FIELD, so it has to be rebuilt — building
+ * it once and spinning draws exactly ONE field and then goes blank forever.
+ * Hardware-confirmed 2026-08-17; jsim renders a build-once ROM perfectly, which
+ * is why this survived so long. */
+static void build_list(void)
 {
     unsigned fb_addr = (unsigned)fb;
     unsigned link    = ((unsigned)&op_list[4]) >> 3;   /* STOP lives at [4] */
-    unsigned olp;
-    int ntsc;
-    unsigned width, hmid, height, vmid;
-
-    paint();
 
     /* One TYPE-0 bitmap object, then a STOP object. */
     op_list[0] = (fb_addr << 8) | (link >> 8);
@@ -112,6 +112,17 @@ int main(void)
                | BASE_X;
     op_list[4] = 0;                                    /* STOP */
     op_list[5] = 4;
+}
+
+int main(void)
+{
+    unsigned fb_addr = (unsigned)fb;
+    unsigned olp;
+    int ntsc;
+    unsigned width, hmid, height, vmid;
+
+    paint();
+    build_list();
 
     ntsc   = (CONFIG & 0x10) != 0;
     width  = ntsc ? 1409u : 1381u;
@@ -132,6 +143,7 @@ int main(void)
 
     olp = (unsigned)op_list;
     OLP = (olp >> 16) | (olp << 16);                   /* halves swapped */
+    OBF = 0;                       /* MANDATORY after every OLP write */
 
     /* Published BEFORE VIDEN. Video registers are write-only so reading them
        back proves nothing, and jag_resident measured that DRAM traffic during
@@ -157,5 +169,16 @@ int main(void)
 
     VMODE = 0x06C7;                                    /* VIDEN last */
 
-    for (;;) { }
+    /* Keep handing the OP a fresh list. Rebuilding FREE-RUNNING rather than once
+     * per vertical-blank window matters: a VC-gated rebuild fired at the wrong
+     * phase misses every SECOND field, so the object draws on alternate fields
+     * and a capture averages object+background 50/50 — which shows up as a blue
+     * floor under every colour and reads exactly like a colour bug. Measured:
+     * solid red went (120,0,116) -> (218,0,0) on switching to free-running.
+     * Correctness needs only that the list is never stale for a whole field. */
+    for (;;) {
+        build_list();
+        OLP = (olp >> 16) | (olp << 16);
+        OBF = 0;
+    }
 }
