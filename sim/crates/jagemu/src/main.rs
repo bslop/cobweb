@@ -274,6 +274,19 @@ static BLIT_HIST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool:
 /// is impossible to make silently; `--blit-top 0` prints the tail itself.
 static BLIT_TOP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(20);
 
+/// Set by `--audio` on `jagemu run`. The DSP's I2S interrupt is only ticked
+/// while audio capture is on (scheduler.rs), so WITHOUT this flag a
+/// `run --pc-histogram --core dsp` of a sound kernel profiles a core that is
+/// spinning on an interrupt that structurally cannot arrive — the audio path
+/// is invisible to every profiling and watch command. This makes it reachable.
+static AUDIO_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn apply_audio(jag: &mut Jaguar) {
+    if AUDIO_ON.load(std::sync::atomic::Ordering::Relaxed) {
+        jag.enable_audio_capture();
+    }
+}
+
 fn apply_watchdog(jag: &mut Jaguar) {
     let n = WATCHDOG_FRAMES.load(std::sync::atomic::Ordering::Relaxed);
     if n > 0 {
@@ -324,6 +337,7 @@ fn boot_input(
     jag.gpu.fidelity = fid;
     jag.dsp.fidelity = fid;
     apply_watchdog(&mut jag);
+    apply_audio(&mut jag);
     if buttons != 0 && press_after < frames {
         jag.run_frames(press_after);
         jag.set_pad(0, buttons);
@@ -462,6 +476,7 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
         has_flag(args, "--blit-histogram"),
         std::sync::atomic::Ordering::Relaxed,
     );
+    AUDIO_ON.store(has_flag(args, "--audio"), std::sync::atomic::Ordering::Relaxed);
     if let Some(n) = flag_val(args, "--blit-top").map(parse_u32).transpose()? {
         BLIT_TOP.store(n, std::sync::atomic::Ordering::Relaxed);
     }
@@ -540,6 +555,7 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
         let fid = fidelity_arg(args)?;
         jag.gpu.fidelity = fid;
         jag.dsp.fidelity = fid;
+        apply_audio(&mut jag);
         jag.bus.add_watch(lo, hi);
         if btn != 0 && after < frames {
             jag.run_frames(after);
@@ -611,6 +627,7 @@ fn boot_profiled(
     jag.gpu.fidelity = fid;
     jag.dsp.fidelity = fid;
     apply_watchdog(&mut jag);
+    apply_audio(&mut jag);
     // Warmup: run to `start` with the profiler off, so one-time boot/level-load
     // loops don't count as steady-state. A button press scheduled inside the
     // warmup window still fires there; a later one fires in the armed window.
