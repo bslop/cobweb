@@ -90,20 +90,22 @@ impl PixFmt {
 /// Per-field Object Processor state, persisted in `Tom` across the scanlines of
 /// one field and reset at each frame boundary (`started = false`).
 ///
-/// The OP re-walks the object list **every display line**; the only state that
-/// must persist between lines is the chosen canvas geometry and the screen
-/// anchor (the base object's origin). Multi-line bitmaps advance their source
-/// pointer *statelessly* — at half-line `vc` an object draws source line
-/// `(vc - ypos)/2`.
+/// The OP re-walks the object list **every display line**, and DRAWING MUTATES
+/// THE LIST: each displayed line advances that object's DATA by one DWIDTH,
+/// counts HEIGHT down and steps YPOS with the beam, written back to DRAM.
 ///
-/// ⚠️ Drawing is stateless, but the LIST IS STILL CONSUMED. This type used to
-/// say we "never mutate the game's DRAM list (which it rebuilds each vblank)" —
-/// and that parenthesis was an *assumption about the program*, not a property of
-/// the hardware. A ROM that does not rebuild draws one field on silicon and goes
-/// blank forever, while jsim rendered it perfectly; `jag_rr` lost most of a
-/// hardware investigation to exactly that gap. `op_consume_list` now spends the
-/// headers at the end of active display, which is when the real OP has finished
-/// walking them and when a program's vblank rebuild is still in time.
+/// ⚠️ This type used to call drawing *stateless* and say we "never mutate the
+/// game's DRAM list (which it rebuilds each vblank)". That parenthesis was an
+/// **assumption about the program**, not a property of the hardware, and nothing
+/// enforced it — which left jsim blind to BOTH ways a real list dies:
+///
+///   * a **build-once** list, which silicon spends after a single field, and
+///   * a **free-running rebuild**, which resets DATA on every scanline so
+///     hardware draws source line 0 over the entire screen.
+///
+/// `jag_rr` hit both on 2026-08-17 and jsim rendered each perfectly, which is
+/// worse than not modelling the OP at all: an emulator that shows a correct
+/// picture for a ROM that is blank on silicon actively exonerates the bug.
 pub struct OpState {
     /// Has the canvas been sized/cleared for the current field yet?
     pub started: bool,
@@ -526,14 +528,32 @@ fn op_walk_line(
         let o = decode_obj(bus, addr8);
         match o.otype {
             0 | 1 => {
-                // Active on this line iff the scanline is within the object's
-                // vertical span. Source line = (vc - ypos)/2 (stateless — no
-                // header write-back, so a static list can never be corrupted).
-                if vc32 >= o.ypos {
-                    let src_line = (vc32 - o.ypos) / 2;
-                    if src_line < o.height {
-                        draw_object_line(bus, &o, src_line, anchor_x, line, written);
-                    }
+                // Draw from the object's CURRENT DATA pointer and write the
+                // header back, exactly as the OP does: DATA advances one DWIDTH
+                // per displayed line, HEIGHT counts down, YPOS tracks the beam.
+                //
+                // This used to derive the source line as (vc - ypos)/2 and never
+                // write back — "stateless, so a static list can never be
+                // corrupted". That made jsim blind to BOTH ways a real list dies:
+                // a build-once list (which silicon spends after one field) and a
+                // FREE-RUNNING rebuild (which resets DATA every scanline, so
+                // hardware draws line 0 over the whole screen). `jag_rr` hit both
+                // on 2026-08-17 and jsim rendered each of them perfectly.
+                if vc32 >= o.ypos && o.height > 0 {
+                    draw_object_line(bus, &o, 0, anchor_x, line, written);
+                    let stride = o.dwidth_phrases * 8;
+                    let hi = peek32(bus, addr8);
+                    let lo = peek32(bus, addr8 + 4);
+                    let next_data = o.data.wrapping_add(stride);
+                    poke32_dram(
+                        bus,
+                        addr8,
+                        (hi & 0x7FF) | (((next_data >> 3) & 0x1F_FFFF) << 11),
+                    );
+                    let lo2 = (lo & !(0x3FF << 14) & !(0x7FF << 3))
+                        | (((o.height - 1) & 0x3FF) << 14)
+                        | (((o.ypos + 2) & 0x7FF) << 3);
+                    poke32_dram(bus, addr8 + 4, lo2);
                 }
                 // The OP ALWAYS follows LINK (an inactive object still chains on).
                 addr = bank | o.link;
