@@ -109,9 +109,32 @@ const RUNTIME: &str = r#"
 	.globl __divfix
 
 ; D0 = a * b  (32×32→32, low 32 bits)
+; ── fast path: both operands fit in signed 16 bits ──────────────────────────
+; MULS.W is exact for those — the product of two 16-bit signed values always
+; fits in 32 bits — so one instruction replaces the three MULUs, the shifts and
+; the movem of d2-d5. ~140 cycles against ~330.
+;
+; The test is `sign_extend(low16(x)) == x`, which is exactly "x fits in 16 bits
+; signed" and costs one EXT and one CMP. A wide operand pays ~15% extra for the
+; check and takes the original path; in practice most C multiplies are an index
+; times an element size, and both are small.
 __mulsi3:
 	move.l	4(a7),d0
 	move.l	8(a7),d1
+	move.l	d2,-(a7)
+	move.l	d0,d2
+	ext.l	d2			; d2 = sign_extend(low16(a))
+	cmp.l	d0,d2
+	bne.w	__mul_wide
+	move.l	d1,d2
+	ext.l	d2
+	cmp.l	d1,d2
+	bne.w	__mul_wide
+	muls.w	d1,d0
+	move.l	(a7)+,d2
+	rts
+__mul_wide:
+	move.l	(a7)+,d2
 	movem.l	d2-d5,-(a7)
 	move.l	d0,d2			; a
 	move.l	d1,d3			; b
