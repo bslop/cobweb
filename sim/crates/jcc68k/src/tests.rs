@@ -1948,6 +1948,30 @@ fn cg_signed_pow2_div_avoids_the_helper() {
 }
 
 #[test]
+fn rt_multiply_narrow_operand_fast_path() {
+    // __mulsi3 takes a single MULS.W when both operands fit in signed 16 bits.
+    // The boundaries are where that stops being exact, and where the "fits"
+    // test itself flips: 0x7FFF/0x8000 either side, and one narrow operand
+    // paired with a wide one (which must NOT take the path).
+    let cases: &[(i32, i32)] = &[
+        (0, 0), (1, 1), (-1, 1), (-1, -1),
+        (32767, 32767), (-32768, -32768), (32767, -32768), (-32768, 32767),
+        (32768, 2), (2, 32768), (-32769, 3), (3, -32769),
+        (65536, 65536), (0x7FFFFFFF, 3), (3, 0x7FFFFFFF),
+        (-2147483648, -1), (123, 456), (-123, 456), (100000, 100000),
+    ];
+    for &(a, b) in cases {
+        let src = format!("int main(void){{ int a={a}, b={b}; return a*b; }}");
+        assert_eq!(run(&src), a.wrapping_mul(b) as u32, "{a}*{b}");
+    }
+    // unsigned operands with bit 15 or bit 31 set must not be treated as narrow
+    for (a, b) in [(0x8000u32, 2u32), (0xFFFFu32, 0xFFFFu32), (0xFFFFFFFFu32, 3u32)] {
+        let src = format!("int main(void){{ unsigned a={a}u, b={b}u; return a*b; }}");
+        assert_eq!(run(&src), a.wrapping_mul(b), "{a}*{b} unsigned");
+    }
+}
+
+#[test]
 fn rt_divide_by_zero_terminates() {
     // UB in C, but it must not hang the machine — the harness caps at 5M steps
     // and returns whatever is at $100, so a hang shows up as a wrong value
