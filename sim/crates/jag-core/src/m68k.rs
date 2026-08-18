@@ -17,6 +17,22 @@ const M68K_FETCH_WAIT_X10: u32 = 3;
 /// Extra 68k cycles per DATA bus cycle, tenths (calibrated).
 const M68K_DATA_WAIT_X10: u32 = 5;
 
+/// Longest run of same-address 68000 DRAM operand reads that real silicon
+/// survives. **[HW]**, jag_viewpoint 2026-08-18: with the poll count as the
+/// only variable and the GPU halted, 16 iterations completed and 1024 stopped
+/// (within the first ~64), so the survivable budget is between 16 and ~128.
+///
+/// The 68000 is the lowest-priority bus master (refresh > OP > Blitter > GPU >
+/// DSP > 68k), and a tight poll never yields the bus, so on the machine it can
+/// simply stop. **jsim runs such a loop to completion**, which is exactly the
+/// class of design error a simulator is supposed to catch: a rehosted game's
+/// mailbox handshake or vblank wait passes every emulator and dies on silicon.
+///
+/// This is reported, not enforced: stalling the core would change behaviour
+/// for every project on a threshold whose exact value is not yet measured.
+/// `m68k_dram_poll_max` in the run state is the warning.
+pub const M68K_DRAM_POLL_BUDGET: u32 = 128;
+
 /// ── OBJECT-PROCESSOR TAX ON THE 68000 ───────────────────────────────────────
 ///
 /// The two constants above are a CONSTANT wait per bus cycle. The RISC cores
@@ -124,6 +140,13 @@ pub struct M68k {
     /// `M68K_OP_TAX_MILLI_NUM`). Carried between instructions so a charge
     /// smaller than one cycle per access still accumulates instead of vanishing.
     op_tax_debt: u64,
+    /// Address the 68000 is currently re-reading, and how many instructions in
+    /// a row have read it. See `M68K_DRAM_POLL_BUDGET`.
+    poll_addr: Option<u32>,
+    poll_run: u32,
+    /// Longest same-address DRAM read run of the whole session, and where.
+    pub poll_max: u32,
+    pub poll_max_addr: u32,
     /// Whole 68000 cycles lost to Object-Processor bus occupancy since reset.
     /// ⭐ This is the counter the model previously had no way to express: the
     /// 68k had no load-dependent bus term, so there was nothing to count.
@@ -160,6 +183,10 @@ impl M68k {
             fetch_ba: 0,
             bus_debt: 0,
             op_tax_debt: 0,
+            poll_addr: None,
+            poll_run: 0,
+            poll_max: 0,
+            poll_max_addr: 0,
             op_tax_cycles: 0,
             isr_depth: 0,
             instret: 0,
@@ -241,13 +268,17 @@ impl M68k {
     #[inline]
     fn fetch16(&mut self, bus: &mut Bus) -> u16 {
         self.fetch_ba += 1;
+        bus.m68k_in_fetch = true;
         let w = bus.read16(self.pc);
+        bus.m68k_in_fetch = false;
         self.pc = self.pc.wrapping_add(2);
         w
     }
     #[inline]
     fn fetch32(&mut self, bus: &mut Bus) -> u32 {
+        bus.m68k_in_fetch = true;
         let l = bus.read32(self.pc);
+        bus.m68k_in_fetch = false;
         self.pc = self.pc.wrapping_add(4);
         l
     }
@@ -283,6 +314,8 @@ impl M68k {
     /// 68000 apart from a spinning one.
     pub fn step(&mut self, bus: &mut Bus, dbg: &mut Debugger) -> u32 {
         bus.m68k_bus_cycles = 0;
+        bus.m68k_dram_read_addr = None;
+        bus.m68k_dram_wrote = false;
         self.fetch_ba = 0;
         let pc0 = self.pc;
         let was_stopped = self.stopped;
@@ -296,6 +329,24 @@ impl M68k {
         // byte-copy loop) pin two knobs, and the third mix validates the fit.
         // A flat blended constant matched whichever probe calibrated it and
         // was 45% wrong on real programs (wip/m68k-bus-wait, superseded).
+        // Same-address DRAM read run — the shape of a mailbox or status poll.
+        // A write clears it: a loop that stores is not a pure spin.
+        if bus.m68k_dram_wrote {
+            self.poll_addr = None;
+            self.poll_run = 0;
+        } else if let Some(a) = bus.m68k_dram_read_addr {
+            if self.poll_addr == Some(a) {
+                self.poll_run += 1;
+            } else {
+                self.poll_addr = Some(a);
+                self.poll_run = 1;
+            }
+            if self.poll_run > self.poll_max {
+                self.poll_max = self.poll_run;
+                self.poll_max_addr = a;
+            }
+        }
+
         let total = std::mem::take(&mut bus.m68k_bus_cycles);
         let dram = std::mem::take(&mut bus.m68k_dram_cycles);
         let fetch = self.fetch_ba.min(total);
@@ -695,5 +746,85 @@ impl M68k {
         };
         self.d[0] = result;
         Some(20)
+    }
+}
+
+#[cfg(test)]
+mod poll_tests {
+    use super::*;
+    use crate::bus::Bus;
+
+    /// Load a program at $4000 and run it, returning the core.
+    fn run(prog: &[u8], steps: usize, seed: Option<(u32, u16)>) -> M68k {
+        let mut bus = Bus::new();
+        for (i, b) in prog.iter().enumerate() {
+            bus.write8(0x4000 + i as u32, *b);
+        }
+        if let Some((addr, v)) = seed {
+            bus.write16(addr, v);
+        }
+        let mut cpu = M68k::new();
+        cpu.reset(&mut bus);
+        cpu.sr = 0x2700;
+        cpu.set_pc(0x4000);
+        // The loader above went through the 68k write path; start the
+        // measurement from a clean slate.
+        cpu.poll_max = 0;
+        cpu.poll_max_addr = 0;
+        let mut dbg = crate::debug::Debugger::new();
+        for _ in 0..steps {
+            cpu.step(&mut bus, &mut dbg);
+        }
+        cpu
+    }
+
+    /// A mailbox/status spin — the shape that stops the 68000 dead on silicon
+    /// while every simulator runs it to completion.
+    ///
+    ///     loop: move.w ($1000).l,d0
+    ///           bne.s  loop
+    #[test]
+    fn same_address_dram_spin_is_counted() {
+        let prog = [0x30, 0x39, 0x00, 0x00, 0x10, 0x00, 0x66, 0xF8];
+        let cpu = run(&prog, 40, Some((0x1000, 1)));
+        assert!(
+            cpu.poll_max >= 15,
+            "a 20-iteration spin should register as a long poll run, got {}",
+            cpu.poll_max
+        );
+        assert_eq!(cpu.poll_max_addr, 0x1000, "wrong address blamed");
+        assert!(
+            cpu.poll_max > M68K_DRAM_POLL_BUDGET / 16,
+            "the detector must be sensitive well below the hardware budget"
+        );
+    }
+
+    /// The same loop shape, but STORING. Not a spin: the bus is released, and
+    /// hardware has no trouble with it, so it must not be reported.
+    ///
+    ///     loop: move.w d0,($1000).l
+    ///           bne.s  loop
+    #[test]
+    fn a_loop_that_writes_is_not_a_spin() {
+        let prog = [0x33, 0xC0, 0x00, 0x00, 0x10, 0x00, 0x66, 0xF8];
+        let cpu = run(&prog, 40, None);
+        assert_eq!(cpu.poll_max, 0, "a storing loop is not a poll");
+    }
+
+    /// Instruction fetch is a DRAM read too, since code lives in DRAM. If
+    /// fetches counted, every straight-line program would look like a spin.
+    #[test]
+    fn instruction_fetch_is_not_an_operand_read() {
+        // nop x 8, then bra.s back to the top: reads nothing but itself.
+        let mut prog = Vec::new();
+        for _ in 0..8 {
+            prog.extend_from_slice(&[0x4E, 0x71]); // nop
+        }
+        prog.extend_from_slice(&[0x60, 0xEE]); // bra.s back to the top
+        let cpu = run(&prog, 40, None);
+        assert_eq!(
+            cpu.poll_max, 0,
+            "fetches must not be mistaken for operand reads"
+        );
     }
 }

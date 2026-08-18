@@ -258,6 +258,18 @@ pub struct Bus {
     /// NOT be charged for Tom/Jerry register cycles, which are not on the DRAM
     /// bus. Zeroed alongside `m68k_bus_cycles` by `M68k::step`.
     pub m68k_dram_cycles: u32,
+    /// Address of the first DRAM read the CURRENT 68000 instruction made for
+    /// OPERAND data — instruction fetch excluded, since code lives in DRAM too
+    /// and every instruction would otherwise look like a read of itself.
+    /// Cleared by `M68k::step`; the poll detector in m68k.rs is the only
+    /// consumer. See `M68K_DRAM_POLL_BUDGET` for what it is for.
+    pub m68k_dram_read_addr: Option<u32>,
+    /// Set while the 68000 is fetching, so a fetch is not counted as an
+    /// operand read.
+    pub m68k_in_fetch: bool,
+    /// The current 68000 instruction wrote to DRAM — a loop that writes is not
+    /// a pure spin, so it clears the poll run.
+    pub m68k_dram_wrote: bool,
     /// 2 MB main DRAM.
     pub dram: Box<[u8]>,
     /// Cartridge ROM image (empty if none loaded).
@@ -367,6 +379,9 @@ impl Bus {
         Bus {
             m68k_on_bus: true,
             m68k_dram_cycles: 0,
+            m68k_dram_read_addr: None,
+            m68k_in_fetch: false,
+            m68k_dram_wrote: false,
             m68k_bus_cycles: 0,
             dram: vec![0u8; mem::DRAM_SIZE].into_boxed_slice(),
             cart: Vec::new(),
@@ -440,6 +455,9 @@ impl Bus {
         let a = addr & ADDR_MASK;
         if mem::is_dram(a) {
             self.m68k_dram_cycles += 1;
+            if !self.m68k_in_fetch && self.m68k_dram_read_addr.is_none() {
+                self.m68k_dram_read_addr = Some(a);
+            }
             self.dram[a as usize]
         } else if (mem::CART_START..mem::CART_END).contains(&a) {
             let idx = (a - mem::CART_START) as usize;
@@ -477,6 +495,7 @@ impl Bus {
         self.watch_note(a, 8, v as u32);
         if mem::is_dram(a) {
             self.m68k_dram_cycles += 1;
+            self.m68k_dram_wrote = true;
             self.dram[a as usize] = v;
         } else if mem::is_tom(a) {
             self.tom_write8(a, v);
@@ -495,6 +514,9 @@ impl Bus {
         if mem::is_dram(a) && a + 1 < mem::DRAM_END {
             self.m68k_bus_cycles += 1;
             self.m68k_dram_cycles += 1;
+            if !self.m68k_in_fetch && self.m68k_dram_read_addr.is_none() {
+                self.m68k_dram_read_addr = Some(a);
+            }
             let i = a as usize;
             u16::from_be_bytes([self.dram[i], self.dram[i + 1]])
         } else if mem::is_tom(a) {
@@ -520,6 +542,7 @@ impl Bus {
         if mem::is_dram(a) && a + 1 < mem::DRAM_END {
             self.m68k_bus_cycles += 1;
             self.m68k_dram_cycles += 1;
+            self.m68k_dram_wrote = true;
             let i = a as usize;
             let b = v.to_be_bytes();
             self.dram[i] = b[0];
@@ -568,6 +591,9 @@ impl Bus {
         if mem::is_dram(a) && a + 3 < mem::DRAM_END {
             self.m68k_bus_cycles += 2; // a long is two 16-bit bus cycles
             self.m68k_dram_cycles += 2;
+            if !self.m68k_in_fetch && self.m68k_dram_read_addr.is_none() {
+                self.m68k_dram_read_addr = Some(a);
+            }
             let i = a as usize;
             u32::from_be_bytes([
                 self.dram[i],
@@ -592,6 +618,7 @@ impl Bus {
         if mem::is_dram(a) && a + 3 < mem::DRAM_END {
             self.m68k_bus_cycles += 2;
             self.m68k_dram_cycles += 2;
+            self.m68k_dram_wrote = true;
             let i = a as usize;
             let b = v.to_be_bytes();
             self.dram[i..i + 4].copy_from_slice(&b);
