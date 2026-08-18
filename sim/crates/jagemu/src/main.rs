@@ -1070,14 +1070,14 @@ fn cmd_video(args: &[String]) -> Result<(), String> {
     let every = flag_val(args, "--every").map(parse_u64).transpose()?.unwrap_or(8);
     let start = flag_val(args, "--start").map(parse_u64).transpose()?.unwrap_or(0);
     let cols = flag_val(args, "--cols").map(parse_u32).transpose()?.unwrap_or(4).max(1);
-    let (btn, _after) = press_args(args)?;
+    let (btn, after) = press_args(args)?;
     let out = flag_val(args, "-o").or_else(|| flag_val(args, "--out")).unwrap_or("video.png");
     let dir = flag_val(args, "--dir");
 
     let mut jag = Jaguar::new();
     jag.load(&data).map_err(|e| e.to_string())?;
     attach_sd(&mut jag);
-    let frames = jag_headless::capture_sequence(&mut jag, start, count, every, btn);
+    let frames = jag_headless::capture_sequence(&mut jag, start, count, every, btn, after);
 
     // Optionally write each frame individually.
     if let Some(d) = dir {
@@ -1938,7 +1938,7 @@ fn daemon_dispatch(jag: &mut Jaguar, entry: u32, args: &[String]) -> String {
             let count = flag_val(args, "--count").map(parse_u32).transpose()?.unwrap_or(12).clamp(1, 256);
             let every = flag_val(args, "--every").map(parse_u64).transpose()?.unwrap_or(6);
             let cols = flag_val(args, "--cols").map(parse_u32).transpose()?.unwrap_or(4).max(1);
-            let frames = jag_headless::capture_sequence(jag, 0, count, every, 0);
+            let frames = jag_headless::capture_sequence(jag, 0, count, every, 0, 0);
             let (w, h, rgba) = jag_headless::filmstrip(&frames, cols, 2);
             let png = jag_headless::png::encode_rgba(w, h, &rgba);
             std::fs::write(out, &png).map_err(|e| e.to_string())?;
