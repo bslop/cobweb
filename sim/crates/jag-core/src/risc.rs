@@ -442,6 +442,16 @@ impl Risc {
             self.flags = self.win_r32(bus, self.kind.flags_addr());
             self.running = true;
             self.pending_jump = None;
+            // A fresh start is NOT in a delay slot. Without this, `prev_was_jump`
+            // survives from wherever the core last halted — for a kernel that
+            // ends in a `jr` idle spin, that is always true — so the FIRST
+            // instruction of every re-kick was counted as being in a jump's
+            // delay slot. A kernel whose entry point is the usual `movei` then
+            // reported one `slot_movei` per kick: jag_sonic2 read 20 of them,
+            // all at its entry `$F03000`, on a build that renders correctly on
+            // real silicon. `slot_movei` is documented hardware-fatal, so a
+            // false one costs a session chasing a hazard that is not there.
+            self.prev_was_jump = false;
         }
 
         // CPU→RISC forced interrupt: the 68k (or the other RISC) sets FORCEINT0
@@ -834,6 +844,53 @@ mod tests {
         let mut gpu = Risc::new(RiscKind::Gpu);
         gpu.run(&mut bus, budget);
         bus
+    }
+
+    /// A kernel that is re-kicked must not report its ENTRY instruction as
+    /// living in a jump's delay slot.
+    ///
+    /// Regression: `run()` cleared `pending_jump` on a fresh start but left
+    /// `prev_was_jump` set from wherever the core last halted. A kernel that
+    /// ends in a `jr` idle spin — the normal shape — therefore reported one
+    /// `slot_movei` per kick, because the usual entry instruction is a `movei`.
+    /// jag_sonic2 read 20 of them, all at its entry `$F03000`, on a build that
+    /// renders correctly on real silicon. `slot_movei` is documented
+    /// hardware-fatal, so a false one costs a session chasing a hazard that is
+    /// not there.
+    #[test]
+    fn a_re_kicked_kernel_entry_is_not_in_a_delay_slot() {
+        let base = mem::G_RAM;
+        // jump (r0) ; nop      — halts the core with prev_was_jump set, exactly
+        //                        as an idle spin's back-edge leaves it.
+        // then, on the NEXT kick: movei #0,r1 at the entry.
+        let spin = [enc(52, 0, 0), enc(57, 0, 0)];
+        let entry = [enc(38, 0, 1), 0x0000, 0x0000, enc(57, 0, 0)];
+
+        let mut bus = Bus::new();
+        for (i, &w) in spin.iter().enumerate() {
+            bus.write16(base + 0x100 + (i as u32) * 2, w);
+        }
+        for (i, &w) in entry.iter().enumerate() {
+            bus.write16(base + (i as u32) * 2, w);
+        }
+        let mut gpu = Risc::new(RiscKind::Gpu);
+
+        // First kick: run the jump so prev_was_jump is left set, then halt.
+        bus.write32(mem::G_PC, base + 0x100);
+        bus.write32(mem::G_CTRL, mem::RISCGO);
+        gpu.run(&mut bus, 2);
+        bus.write32(mem::G_CTRL, 0);
+        gpu.run(&mut bus, 1); // observe GO low -> running = false
+
+        // Second kick at the entry `movei`. That is a fresh start, not a slot.
+        bus.write32(mem::G_PC, base);
+        bus.write32(mem::G_CTRL, mem::RISCGO);
+        gpu.run(&mut bus, 4);
+
+        assert_eq!(
+            gpu.pipe.stats.slot_movei, 0,
+            "a re-kicked kernel's entry movei was counted as being in a delay slot"
+        );
     }
 
     #[test]
