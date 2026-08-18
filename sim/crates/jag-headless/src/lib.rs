@@ -158,18 +158,33 @@ pub fn capture_audio(
 }
 
 /// Capture `count` frames spaced `every` frames apart, starting after
-/// `start_frame`, optionally holding `buttons`. Returns the captured frames.
+/// `start_frame`, optionally holding `buttons` from frame `press_after`.
+///
+/// `press_after` is what makes a filmstrip able to get PAST a screen that waits
+/// for input. It used to be absent: the pad was set at `start_frame`, i.e. the
+/// moment before the first capture, so a title screen dismissed by START stayed
+/// on every frame of the strip no matter what the caller passed. `jagemu video`
+/// accepted `--press-after` and threw it away, which is why the corpus recorded
+/// "jagemu video cannot press a button" as a fact about the tool.
+///
+/// Pressing at `press_after` and *holding* matches `boot_input`, so a filmstrip
+/// and a screenshot of the same ROM now reach the same place.
 pub fn capture_sequence(
     jag: &mut Jaguar,
     start_frame: u64,
     count: u32,
     every: u64,
     buttons: u32,
+    press_after: u64,
 ) -> Vec<Framebuffer> {
-    if start_frame > 0 {
+    if buttons != 0 && press_after < start_frame {
+        jag.run_frames(press_after);
+        jag.set_pad(0, buttons);
+        jag.run_frames(start_frame - press_after);
+    } else if start_frame > 0 {
         jag.run_frames(start_frame);
     }
-    if buttons != 0 {
+    if buttons != 0 && press_after >= start_frame {
         jag.set_pad(0, buttons);
     }
     let mut frames = Vec::with_capacity(count as usize);
