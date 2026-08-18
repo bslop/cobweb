@@ -2090,7 +2090,7 @@ fn state_json(jag: &Jaguar) -> String {
         bank.iter().map(|v| format!("\"0x{v:08X}\"")).collect::<Vec<_>>().join(",")
     };
     format!(
-        "{{\"frame\":{},\"pc\":{},\"pc_hex\":{},\"sr\":{},\"instret\":{},\"m68k_op_tax_cycles\":{},\"m68k_dram_poll_max\":{},\"m68k_dram_poll_addr\":\"0x{:06X}\",\"illegal\":{},\
+        "{{\"frame\":{},\"pc\":{},\"pc_hex\":{},\"sr\":{},\"instret\":{},\"m68k_op_tax_cycles\":{},\"m68k_dram_poll_max\":{},\"m68k_dram_poll_addr\":\"0x{:06X}\",\"m68k_dram_poll_pc\":\"0x{:06X}\",\"illegal\":{},\
          \"last_illegal_op\":\"0x{:04X}\",\
          \"gpu\":{{\"running\":{},\"pc_hex\":{},\"instret\":{},\"cycles\":{},\"granted\":{},\"timing\":{},\
          \"flags\":\"0x{:08X}\",\"regs0\":[{}],\"regs1\":[{}]}},\
@@ -2112,6 +2112,8 @@ fn state_json(jag: &Jaguar) -> String {
         // so without this number a hardware-fatal spin is invisible here.
         cpu.poll_max,
         cpu.poll_max_addr,
+        // ⭐ and the PC that is doing it — the half you can act on.
+        cpu.poll_max_pc,
         cpu.illegal_count,
         cpu.last_illegal_op,
         jag.gpu.running,
