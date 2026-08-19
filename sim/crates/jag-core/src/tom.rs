@@ -314,14 +314,29 @@ pub fn op_render_line(vc: u16, cpu: &mut M68k, gpu: &mut Risc, bus: &mut Bus) {
     let mut written = [false; LINE_W];
     op_walk_line(vc, anchor_x, &mut line, &mut written, cpu, gpu, bus);
 
+    // ⭐ BGEN IS SAMPLED PER SCANLINE, NOT ONCE PER FIELD.
+    // `op_begin_field` clears the whole canvas to BG, which is right for a ROM
+    // that sets BG once. But BG ($F00058) is a live register: a program that
+    // rewrites it during active display gets a different background on each
+    // line -- that is how raster bars are done on this machine, and it is also
+    // how a coprocessor reports on itself when the 68000 is asleep and no
+    // object is drawing (jag_viewpoint, 2026-08-19: Tom writes the value it
+    // reads to BG, so a live counter paints a gradient and a stuck one paints
+    // a flat colour -- a distinction the field-start clear erased by
+    // construction). Repaint this row from the CURRENT BG before compositing;
+    // for the overwhelming case of a ROM that never touches BG mid-field the
+    // pixels are identical to what the field-start clear already put there.
+    let bgv = bus.tom.win.r16(mem::BG);
+    let (br, bgc, bb) = decode_pixel(bgv, fmt);
     let w = width.min(LINE_W as u32);
     for x in 0..w {
         let i = x as usize;
-        if !written[i] {
-            continue;
+        if written[i] {
+            let (r, g, b) = decode_pixel(line[i], fmt);
+            bus.tom.fb.put(x, row, r, g, b);
+        } else {
+            bus.tom.fb.put(x, row, br, bgc, bb);
         }
-        let (r, g, b) = decode_pixel(line[i], fmt);
-        bus.tom.fb.put(x, row, r, g, b);
     }
 }
 
