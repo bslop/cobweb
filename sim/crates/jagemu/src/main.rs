@@ -31,6 +31,12 @@ fn main() -> ExitCode {
     if let Some(r) = flag_val(rest, "--sd-rate").and_then(|s| s.parse::<u32>().ok()) {
         SD_RATE.store(r, std::sync::atomic::Ordering::Relaxed);
     }
+    // ⭐ --full-window: composite into the whole display window so BGEN -- the
+    // background colour, and with it every BG-based probe ladder -- is in the
+    // capture. Default off; see jag_core::tom::set_full_window.
+    if rest.iter().any(|a| a == "--full-window") {
+        jag_core::tom::set_full_window(true);
+    }
     let result = match cmd {
         "info" => cmd_info(rest),
         "run" => cmd_run(rest),
@@ -80,7 +86,10 @@ fn usage() {
          \x20      [--gpu-map g.map] [--dsp-map d.map] [--start S] [--top K] [--bucket N]\n\
          \x20      [--prof-json p.json]      # full per-PC profile; diff two with profdiff.py\n\
          \x20 jagemu run <rom> --watchdog N   # warn if a core runs N frames without clearing GO\n\
-         \x20 jagemu screenshot <rom> [--frames N] [-o out.png]\n\
+         \x20 jagemu screenshot <rom> [--frames N] [--full-window] [-o out.png]\n\
+         \x20                   --full-window: composite the WHOLE display window,\n\
+         \x20                   so BGEN (the background colour, and any BG probe\n\
+         \x20                   ladder) is in the PNG. Default: bitmap bounding box\n\
          \x20 jagemu video <rom> [--count N] [--every K] [--start S] [--cols C] [--dir D] -o film.png\n\
          \x20 jagemu audio <rom> [--frames N] [--press a] -o out.wav\n\
          \x20 jagemu audiocheck <wav|rom> [--against <wav|rom>] [--frames N] [--press a]\n\
