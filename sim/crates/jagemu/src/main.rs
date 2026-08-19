@@ -2101,6 +2101,7 @@ fn state_json(jag: &Jaguar) -> String {
     format!(
         "{{\"frame\":{},\"pc\":{},\"pc_hex\":{},\"sr\":{},\"instret\":{},\"m68k_op_tax_cycles\":{},\"m68k_dram_poll_max\":{},\"m68k_dram_poll_addr\":\"0x{:06X}\",\"m68k_dram_poll_pc\":\"0x{:06X}\",\"illegal\":{},\
          \"last_illegal_op\":\"0x{:04X}\",\
+         \"m68k_stray_writes\":{},\"m68k_stray_write_addr\":\"0x{:06X}\",\"m68k_stray_write_pc\":\"0x{:06X}\",\"m68k_cart_writes\":{},\
          \"gpu\":{{\"running\":{},\"pc_hex\":{},\"instret\":{},\"cycles\":{},\"granted\":{},\"timing\":{},\
          \"flags\":\"0x{:08X}\",\"regs0\":[{}],\"regs1\":[{}]}},\
          \"dsp\":{{\"running\":{},\"instret\":{},\"cycles\":{},\"timing\":{},\
@@ -2125,6 +2126,18 @@ fn state_json(jag: &Jaguar) -> String {
         cpu.poll_max_pc,
         cpu.illegal_count,
         cpu.last_illegal_op,
+        // 68000 writes that landed outside DRAM/Tom/Jerry. This model drops
+        // them; silicon does not decode every address line, so an unmapped
+        // write can alias onto a live device — which makes a rehost carrying
+        // stale addresses from the original machine (a Genesis port still
+        // writing $FFxxxx once the 68000 truncates to 24 bits) silently fine
+        // here and fatal there. The PC is the half you can act on.
+        cpu.stray_writes,
+        cpu.stray_write_addr,
+        cpu.stray_write_pc,
+        // Stores into cartridge ROM, counted apart: also a no-op, but an
+        // ordinary mistake rather than one silicon can turn into a device poke.
+        cpu.cart_writes,
         jag.gpu.running,
         jstr(&format!("0x{:06X}", jag.gpu.pc)),
         jag.gpu.instret,

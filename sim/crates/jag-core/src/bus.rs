@@ -264,6 +264,15 @@ pub struct Bus {
     /// Cleared by `M68k::step`; the poll detector in m68k.rs is the only
     /// consumer. See `M68K_DRAM_POLL_BUDGET` for what it is for.
     pub m68k_dram_read_addr: Option<u32>,
+    /// A 68000 write that landed outside DRAM, Tom and Jerry — i.e. one this
+    /// model DROPS. On silicon such an access is not guaranteed to vanish:
+    /// the Jaguar does not decode every address line, so an unmapped write can
+    /// alias onto a real device. A rehost carrying stale addresses from the
+    /// original machine (a Genesis port still writing $FFxxxx after the 68000
+    /// truncates to 24 bits) is therefore silently fine here and can be fatal
+    /// there. Set per access; the CPU consumes and clears it so it can attach
+    /// the PC.
+    pub m68k_stray_write: Option<(u32, u8)>,
     /// Set while the 68000 is fetching, so a fetch is not counted as an
     /// operand read.
     pub m68k_in_fetch: bool,
@@ -380,6 +389,7 @@ impl Bus {
             m68k_on_bus: true,
             m68k_dram_cycles: 0,
             m68k_dram_read_addr: None,
+            m68k_stray_write: None,
             m68k_in_fetch: false,
             m68k_dram_wrote: false,
             m68k_bus_cycles: 0,
@@ -502,7 +512,14 @@ impl Bus {
         } else if mem::is_jerry(a) {
             self.jerry_write8(a, v);
         } else {
-            // Cart-space and unmapped writes vanish silently (no bus error).
+            // Cart-space and unmapped writes vanish silently (no bus error) —
+            // in this model. Record the first of each access so the CPU can
+            // name the instruction; see m68k_stray_write. Cart space is a
+            // legitimate destination for a write that goes nowhere (a ROM),
+            // so it is reported separately from the rest of the hole.
+            if self.m68k_stray_write.is_none() {
+                self.m68k_stray_write = Some((a, if mem::is_cart(a) { 1 } else { 0 }));
+            }
         }
     }
 

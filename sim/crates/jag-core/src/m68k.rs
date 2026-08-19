@@ -192,6 +192,14 @@ pub struct M68k {
     /// the PC lands in a disassembly (or a `--map` symbolisation) on the exact
     /// loop to bound.
     pub poll_max_pc: u32,
+    /// 68000 writes that landed nowhere this model maps. `stray_writes` counts
+    /// the unmapped hole; `cart_writes` counts stores into cartridge ROM, kept
+    /// apart because they are a different mistake. The first of each is kept
+    /// with the PC that issued it, which is the part that finds the bug.
+    pub stray_writes: u64,
+    pub stray_write_addr: u32,
+    pub stray_write_pc: u32,
+    pub cart_writes: u64,
     /// Whole 68000 cycles lost to Object-Processor bus occupancy since reset.
     /// ⭐ This is the counter the model previously had no way to express: the
     /// 68k had no load-dependent bus term, so there was nothing to count.
@@ -237,6 +245,10 @@ impl M68k {
             poll_max: 0,
             poll_max_addr: 0,
             poll_max_pc: 0,
+            stray_writes: 0,
+            stray_write_addr: 0,
+            stray_write_pc: 0,
+            cart_writes: 0,
             op_tax_cycles: 0,
             isr_depth: 0,
             instret: 0,
@@ -366,6 +378,7 @@ impl M68k {
         bus.m68k_bus_cycles = 0;
         bus.m68k_dram_read_addr = None;
         bus.m68k_dram_wrote = false;
+        bus.m68k_stray_write = None;
         self.fetch_ba = 0;
         let pc0 = self.pc;
         let was_stopped = self.stopped;
@@ -381,6 +394,20 @@ impl M68k {
         // was 45% wrong on real programs (wip/m68k-bus-wait, superseded).
         // Same-address DRAM read run — the shape of a mailbox or status poll.
         // A write clears it: a loop that stores is not a pure spin.
+        // A write into nowhere, attributed to the instruction that issued it.
+        // Recorded here rather than in the bus because only the CPU knows pc0.
+        if let Some((a, cart)) = bus.m68k_stray_write {
+            if cart != 0 {
+                self.cart_writes += 1;
+            } else {
+                if self.stray_writes == 0 {
+                    self.stray_write_addr = a;
+                    self.stray_write_pc = pc0;
+                }
+                self.stray_writes += 1;
+            }
+        }
+
         if bus.m68k_dram_wrote {
             // A store means the loop is doing work and yielding the bus.
             self.poll_addr = None;
@@ -898,6 +925,65 @@ mod poll_tests {
             cpu.poll_max > M68K_DRAM_POLL_BUDGET / 16,
             "the detector must be sensitive well below the hardware budget"
         );
+    }
+
+    /// A write into the unmapped hole. This model drops it; silicon does not
+    /// decode every address line, so it can alias onto a live device — which
+    /// is how a rehost carrying addresses from the original machine dies on
+    /// hardware while every emulator run is clean.
+    ///
+    ///     move.w #$1234,($500000).l
+    #[test]
+    fn an_unmapped_write_is_counted_and_attributed() {
+        let prog = [0x33, 0xFC, 0x12, 0x34, 0x00, 0x50, 0x00, 0x00];
+        let cpu = run(&prog, 1, None);
+        assert_eq!(cpu.stray_writes, 1, "an unmapped store must be counted");
+        assert_eq!(cpu.stray_write_addr, 0x0050_0000, "wrong address blamed");
+        assert_eq!(
+            cpu.stray_write_pc, 0x4000,
+            "the PC that ISSUED it is the point (the harness loads at $4000)"
+        );
+    }
+
+    /// ⭐ The case this counter exists for: a Genesis rehost still carrying a
+    /// work-RAM address, which the 68000 truncates to 24 bits and lands in the
+    /// hole at $FFxxxx. Invisible in every other way — no bus error, no
+    /// illegal opcode, and the store simply evaporates.
+    ///
+    ///     move.b #$56,($FF8000).l
+    #[test]
+    fn a_stale_genesis_workram_write_is_counted() {
+        let prog = [0x13, 0xFC, 0x00, 0x56, 0x00, 0xFF, 0x80, 0x00];
+        let cpu = run(&prog, 1, None);
+        assert_eq!(cpu.stray_writes, 1, "$FFxxxx is the hole, not DRAM");
+    }
+
+    /// Writes that land somewhere real must NOT be reported, or the counter is
+    /// noise and gets switched off: DRAM, and Tom's own registers.
+    ///
+    ///     move.w #$06C7,($F00028).l   ; VMODE
+    ///     move.w #$0000,($1C0000).l   ; DRAM
+    #[test]
+    fn mapped_writes_are_not_stray() {
+        let prog = [
+            0x33, 0xFC, 0x06, 0xC7, 0x00, 0xF0, 0x00, 0x28, // Tom VMODE
+            0x33, 0xFC, 0x00, 0x00, 0x00, 0x1C, 0x00, 0x00, // DRAM
+        ];
+        let cpu = run(&prog, 2, None);
+        assert_eq!(cpu.stray_writes, 0, "Tom and DRAM are mapped");
+    }
+
+    /// A store into cartridge ROM goes nowhere too, but it is an ordinary bug
+    /// rather than one silicon can turn into a device poke, so it is counted
+    /// separately and must not inflate the stray count.
+    ///
+    ///     move.w #$1111,($900000).l
+    #[test]
+    fn a_cart_write_is_counted_apart() {
+        let prog = [0x33, 0xFC, 0x11, 0x11, 0x00, 0x90, 0x00, 0x00];
+        let cpu = run(&prog, 1, None);
+        assert_eq!(cpu.cart_writes, 1, "a ROM store is a cart write");
+        assert_eq!(cpu.stray_writes, 0, "and must not inflate the stray count");
     }
 
     /// The same loop shape, but STORING. Not a spin: the bus is released, and
