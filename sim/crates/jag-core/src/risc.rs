@@ -87,6 +87,12 @@ pub struct Risc {
     pub instret: u64,
     /// Deferred jump target from a JUMP/JR (applied after the delay slot).
     pub pending_jump: Option<u32>,
+    /// Sliding window for the parked-with-GO detector (see
+    /// `timing::Stats::park_spin_max`): the low and high PC seen in the current
+    /// run, and how many instructions that run has executed.
+    park_lo: u32,
+    park_hi: u32,
+    park_run: u64,
     /// Pending interrupt latches (bits 0-5 = sources). On entry the core pushes
     /// PC to the R31 stack, sets IMASK, and vectors to `sram_base + 16*source`.
     pub int_latch: u32,
@@ -161,6 +167,9 @@ impl Risc {
             cycles: 0,
             instret: 0,
             pending_jump: None,
+            park_lo: 0,
+            park_hi: 0,
+            park_run: 0,
             int_latch: 0,
             fidelity: Fidelity::default(),
             pipe: timing::Pipeline::default(),
@@ -606,6 +615,34 @@ impl Risc {
         let r2 = (iw & 0x1F) as usize;
         self.prev_was_jump = matches!(op, 52 | 53);
 
+        // ── PARKED-WITH-GO DETECTOR ─────────────────────────────────────────
+        // A core still executing inside a <=4-byte window is spinning on
+        // itself, and a spinning core has NOT released the bus. See
+        // `Stats::park_spin_max` for the hardware bisect and the fix.
+        // A window rather than "jr to self" so it catches the equivalent
+        // shapes too (a 2-instruction mailbox wait holds the bus just as hard).
+        const PARK_SPAN: u32 = 4;
+        if self.park_run == 0 {
+            self.park_lo = self.pc;
+            self.park_hi = self.pc;
+            self.park_run = 1;
+        } else {
+            let lo = self.park_lo.min(self.pc);
+            let hi = self.park_hi.max(self.pc);
+            if hi.wrapping_sub(lo) <= PARK_SPAN {
+                self.park_lo = lo;
+                self.park_hi = hi;
+                self.park_run += 1;
+            } else {
+                self.park_lo = self.pc;
+                self.park_hi = self.pc;
+                self.park_run = 1;
+            }
+        }
+        if self.park_run > self.pipe.stats.park_spin_max {
+            self.pipe.stats.park_spin_max = self.park_run;
+        }
+
         if in_slot {
             if op == 38 {
                 self.pipe.stats.slot_movei += 1;
@@ -1005,6 +1042,44 @@ mod tests {
         ]);
         let (_, gpu) = run_fid(&interleaved, mem::G_RAM, 500, Fidelity::Silicon, &[]);
         assert_eq!(gpu.pipe.stats.stall_alu, 0);
+    }
+
+    /// ☠ A kernel PARKED ON `jr .idle` WITH GO STILL SET is counted, because
+    /// on real Tom it never stops arbitrating for the bus and the 68000 starves
+    /// until VI service stops — a frozen picture with no exception and no crash
+    /// handler. `jag_s3k` bisected it on silicon; `jag_sonic2` had the same
+    /// failure (a title screen that rendered perfectly and never advanced).
+    ///
+    /// No bus-cycle model can see it: `jr .idle` executes from the core's own
+    /// internal SRAM and makes no external access at all. Validated against the
+    /// real defect in `jag_sonic2`'s compositor, both directions:
+    /// parked 195,529 · clearing its own GO 3.
+    #[test]
+    fn park_spin_flags_a_kernel_that_never_releases_the_bus() {
+        // `.idle: jr .idle` — a branch to itself (target = pc + 2 + disp*2, so
+        // disp = -1), with a nop in its single delay slot. Runs to the budget
+        // because nothing will ever stop it.
+        let parked = [enc(53, (-1i16 as u16) & 0x1F, 0), enc(57, 0, 0)];
+        let (_, gpu) = run_fid(&parked, mem::G_RAM, 4000, Fidelity::Silicon, &[]);
+        assert!(
+            gpu.pipe.stats.park_spin_max > 1000,
+            "a self-parked kernel must be flagged, got {}",
+            gpu.pipe.stats.park_spin_max
+        );
+
+        // The same work, ended the way silicon wants: clear GO and stop. The
+        // park becomes unreachable, so the counter stays small.
+        let stopped = with_stop(&[
+            enc(35, 1, 1), // moveq #1,r1
+            enc(35, 2, 2), // moveq #2,r2
+            enc(0, 1, 2),  // add  r1,r2
+        ]);
+        let (_, gpu2) = run_fid(&stopped, mem::G_RAM, 4000, Fidelity::Silicon, &[]);
+        assert!(
+            gpu2.pipe.stats.park_spin_max < 100,
+            "a kernel that clears its own GO must NOT be flagged, got {}",
+            gpu2.pipe.stats.park_spin_max
+        );
     }
 
     /// DIV's quotient lands at cycle 18: an immediate consumer stalls 17
