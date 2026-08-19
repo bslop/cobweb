@@ -272,7 +272,24 @@ impl Scheduler {
     /// PWM DACs when I2S is silent.
     fn tick_audio(&mut self, ticks: i64, dsp: &mut Risc, bus: &mut Bus) {
         const SYSCLK: i64 = 26_590_906;
-        let sclk = bus.jerry.win.r16(mem::SCLK) as i64;
+        // ☠ SCLK IS ACCESSED AS A 32-BIT REGISTER, AND THE VALUE IS IN THE LOW
+        // BITS. This used to read `r16(SCLK)`, i.e. the HIGH half on a
+        // big-endian long — so a 32-bit write (what silicon wants) read back as
+        // 0 and silently defaulted the rate, while a 16-bit write (what silicon
+        // apparently ignores) worked perfectly here.
+        //
+        // **[HW]** `jag_openlara` has audio verified on the rig — a positive
+        // control, RMS 135 / peak 955 against an idle floor of 2 — and writes
+        // both registers 32-bit (`jerry.c:40`, commented "SCLK: 32-BIT reg!").
+        // Their SCLK=37 gives 26,590,906/(64*38) = 10.9 kHz, matching the
+        // "~11kHz" they annotate it with, so hardware plainly uses the whole
+        // value from a long write. `jag_sonic2` wrote 16-bit on the strength of
+        // a readback observed HERE, and its tone measured a clean 994 Hz in
+        // jsim and DIGITAL SILENCE on the television.
+        //
+        // User's rule, 2026-08-19: "if there's a discrepancy between the Jaguar
+        // and jsim, the Jaguar is right — fix jsim."
+        let sclk = (bus.jerry.win.r32(mem::SCLK) & 0xFFFF) as i64;
         let period = if sclk > 3 { 64 * (sclk + 1) } else { 603 };
         bus.audio_rate = (SYSCLK / period.max(1)) as u32;
 
