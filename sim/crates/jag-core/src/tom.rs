@@ -24,6 +24,36 @@ mod cry;
 const MAX_FB_W: u32 = 2048;
 const MAX_FB_H: u32 = 1024;
 
+/// ⭐ `--full-window`: composite into the whole display window instead of the
+/// bitmap bounding box, so **BGEN is in the capture**.
+///
+/// By default `op_begin_field` sizes the canvas to the bounding box of the
+/// bitmap objects, which is what you want for comparing a rendered picture
+/// against a reference. But `BG` (`$F00058`) is the Jaguar's diagnostic channel
+/// of last resort — BGEN paints it wherever no object draws, so it stays legible
+/// when the object list, the framebuffer and the blit are all broken, and at
+/// least three projects run probe "ladders" on it. Under the default sizing that
+/// band is **never in the PNG**: shorten the object to make room for it and the
+/// canvas shrinks with the object (`jag_viewpoint` measured a 320x32 image from
+/// an object shortened to 32 lines, and concluded from two such captures that a
+/// BG ladder could not be validated in simulation at all).
+///
+/// With this set the canvas is the 320x240 window anchored at `VDB` — exactly
+/// the default this function already uses for a field with no bitmap in the list
+/// — and the bitmaps composite into it at their real `XPOS`/`YPOS`. Off by
+/// default, so no existing capture, size assertion or golden image moves.
+static FULL_WINDOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set the `--full-window` capture mode (see [`FULL_WINDOW`]).
+pub fn set_full_window(on: bool) {
+    FULL_WINDOW.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Is `--full-window` capture mode on?
+pub fn full_window() -> bool {
+    FULL_WINDOW.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// A composited frame in RGBA8888, ready for PNG.
 #[derive(Clone)]
 pub struct Framebuffer {
@@ -308,7 +338,7 @@ fn op_begin_field(bus: &mut Bus, fmt: PixFmt) {
     };
     let area = |b: &Obj| -> u64 { content_w(b) as u64 * b.height.clamp(1, MAX_FB_H) as u64 };
 
-    let (width, height, anchor_x, anchor_y);
+    let (mut width, mut height, mut anchor_x, mut anchor_y);
     if let Some(base) = bitmaps.iter().max_by_key(|b| area(b)) {
         // Anchor on the largest bitmap's top-left, then grow the canvas to the
         // bounding box of *every* bitmap so secondary objects (HUD, lower
@@ -326,6 +356,17 @@ fn op_begin_field(bus: &mut Bus, fmt: PixFmt) {
         anchor_y = base.ypos as u16;
     } else {
         // No bitmap (sprite-only or not-yet-built list): default window at VDB.
+        width = 320;
+        height = 240;
+        anchor_x = 0;
+        anchor_y = bus.tom.win.r16(mem::VDB);
+    }
+
+    // ⭐ --full-window: the whole display window, so the BGEN band around the
+    // objects is in the capture. Same canvas this function already picks for a
+    // field with no bitmap; the bitmaps just composite into it at their real
+    // XPOS/YPOS instead of being anchored to the canvas origin.
+    if full_window() {
         width = 320;
         height = 240;
         anchor_x = 0;
