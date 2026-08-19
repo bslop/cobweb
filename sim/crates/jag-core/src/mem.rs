@@ -308,6 +308,14 @@ pub fn is_tom(addr: u32) -> bool {
 
 /// True if `addr` lies in the JERRY register / SRAM window.
 #[inline]
+/// Cartridge space — a write here goes nowhere on any Jaguar, because it is
+/// ROM. Distinguished from the rest of the unmapped hole because "wrote to the
+/// cart" is a different (and usually benign) mistake from "wrote to an address
+/// that does not decode", which silicon may alias onto a live device.
+pub fn is_cart(addr: u32) -> bool {
+    (CART_START..CART_END).contains(&addr)
+}
+
 pub fn is_jerry(addr: u32) -> bool {
     (JERRY_BASE..JERRY_END).contains(&addr)
 }
