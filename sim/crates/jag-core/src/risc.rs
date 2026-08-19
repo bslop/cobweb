@@ -90,9 +90,17 @@ pub struct Risc {
     /// Sliding window for the parked-with-GO detector (see
     /// `timing::Stats::park_spin_max`): the low and high PC seen in the current
     /// run, and how many instructions that run has executed.
-    park_lo: u32,
-    park_hi: u32,
+    /// The last few PCs this core issued, newest last. A park is detected by
+    /// the PC RECURRING inside this window, which is independent of how much
+    /// padding sits in the loop — a byte-span test is sensitive to that and
+    /// missed a real park with one extra instruction in it.
+    park_ring: [u32; Self::PARK_WINDOW],
+    park_n: usize,
     park_run: u64,
+    /// Set by the bus whenever this core touches EXTERNAL memory. A loop that
+    /// loads or stores is doing work and is visible to any bandwidth model;
+    /// the class this counter exists for is the loop that does neither.
+    park_touched_mem: bool,
     /// Pending interrupt latches (bits 0-5 = sources). On entry the core pushes
     /// PC to the R31 stack, sets IMASK, and vectors to `sram_base + 16*source`.
     pub int_latch: u32,
@@ -167,9 +175,10 @@ impl Risc {
             cycles: 0,
             instret: 0,
             pending_jump: None,
-            park_lo: 0,
-            park_hi: 0,
+            park_ring: [u32::MAX; Self::PARK_WINDOW],
+            park_n: 0,
             park_run: 0,
+            park_touched_mem: false,
             int_latch: 0,
             fidelity: Fidelity::default(),
             pipe: timing::Pipeline::default(),
@@ -536,6 +545,61 @@ impl Risc {
 
     /// Execute one instruction (plus its delay-slot/jump bookkeeping) and
     /// return its cost in RISC ticks.
+    /// LOADB/LOADW/LOAD/LOADP/LOAD(Rn+d)/STOREB/STOREW/STORE/STOREP — the ops
+    /// that reach memory. A loop containing one is doing work, and work is
+    /// visible to any bandwidth model; the class this counter exists for is the
+    /// loop that touches nothing. Without this a tight pixel-copy loop, which
+    /// recurs over a handful of PCs for millions of iterations, would be
+    /// reported as a parked kernel.
+    fn is_mem_op(op: u8) -> bool {
+        (39..=47).contains(&op)
+    }
+
+    /// Instructions of PC history a park has to recur within.
+    const PARK_WINDOW: usize = 8;
+
+    /// ── PARKED-WITH-GO DETECTOR ─────────────────────────────────────────────
+    /// A core still issuing instructions from a handful of recurring PCs, and
+    /// touching no external memory, is spinning on itself — and a spinning core
+    /// has NOT released the bus. See `timing::Stats::park_spin_max`.
+    ///
+    /// ☠ Lives HERE, in the common step, and not in `step_timed`: it is a
+    /// control-flow observation, not a timing one. The first version sat in the
+    /// timed path and therefore read **0 at the default `functional` fidelity**,
+    /// which is this repo's own vacuous-counter trap — a gate that clears a
+    /// parked kernel is the exact failure the counter exists to end.
+    ///
+    /// Keyed on PC RECURRENCE within a window of instructions rather than on a
+    /// byte span: a span test is sensitive to how much padding sits in the
+    /// loop, and `nop / jr T,halt / nop` is a real park one instruction wider
+    /// than `jr .idle / nop`.
+    fn note_park(&mut self, pc: u32) {
+        if self.park_touched_mem {
+            // The loop is doing work, and work is visible to a bandwidth model.
+            self.park_touched_mem = false;
+            self.park_ring = [u32::MAX; Self::PARK_WINDOW];
+            self.park_n = 0;
+            self.park_run = 0;
+            return;
+        }
+        let seen = self.park_ring[..self.park_n].contains(&pc);
+        if seen {
+            self.park_run += 1;
+            if self.park_run > self.pipe.stats.park_spin_max {
+                self.pipe.stats.park_spin_max = self.park_run;
+            }
+        } else {
+            self.park_run = 0;
+        }
+        if self.park_n < Self::PARK_WINDOW {
+            self.park_ring[self.park_n] = pc;
+            self.park_n += 1;
+        } else {
+            self.park_ring.rotate_left(1);
+            self.park_ring[Self::PARK_WINDOW - 1] = pc;
+        }
+    }
+
     fn step_one(&mut self, bus: &mut Bus) -> u32 {
         let was_pending = self.pending_jump.take();
         let in_slot = self.prev_was_jump;
@@ -546,13 +610,18 @@ impl Risc {
         let stats0 = self.prof.as_ref().map(|_| self.pipe.stats.clone());
         let mut cost = if self.fidelity == Fidelity::Functional {
             let iw = self.fetch16(bus);
-            self.prev_was_jump = matches!((iw >> 10) & 0x3F, 52 | 53);
+            let op = ((iw >> 10) & 0x3F) as u8;
+            self.prev_was_jump = matches!(op, 52 | 53);
+            self.park_touched_mem |= Self::is_mem_op(op);
             isa::execute(self, bus, iw);
             1
         } else {
             self.step_timed(bus, in_slot)
         };
         self.instret += 1;
+        // Park detection runs AFTER the step, so the decode below has already
+        // flagged whether this instruction touched external memory.
+        self.note_park(pc0);
         // Apply a jump issued by the *previous* instruction, now that this
         // (delay-slot) instruction has run.
         if let Some(target) = was_pending {
@@ -614,49 +683,7 @@ impl Risc {
         let r1 = ((iw >> 5) & 0x1F) as usize;
         let r2 = (iw & 0x1F) as usize;
         self.prev_was_jump = matches!(op, 52 | 53);
-
-        // ── PARKED-WITH-GO DETECTOR ─────────────────────────────────────────
-        // A core still executing inside a <=4-byte window is spinning on
-        // itself, and a spinning core has NOT released the bus. See
-        // `Stats::park_spin_max` for the hardware bisect and the fix.
-        // A window rather than "jr to self" so it catches the equivalent
-        // shapes too (a 2-instruction mailbox wait holds the bus just as hard).
-        const PARK_SPAN: u32 = 4;
-        if self.park_run == 0 {
-            self.park_lo = self.pc;
-            self.park_hi = self.pc;
-            self.park_run = 1;
-        } else {
-            let lo = self.park_lo.min(self.pc);
-            let hi = self.park_hi.max(self.pc);
-            if hi.wrapping_sub(lo) <= PARK_SPAN {
-                self.park_lo = lo;
-                self.park_hi = hi;
-                self.park_run += 1;
-            } else {
-                self.park_lo = self.pc;
-                self.park_hi = self.pc;
-                self.park_run = 1;
-            }
-        }
-        if self.park_run > self.pipe.stats.park_spin_max {
-            self.pipe.stats.park_spin_max = self.park_run;
-        }
-
-        if in_slot {
-            if op == 38 {
-                self.pipe.stats.slot_movei += 1;
-                if std::env::var_os("JSIM_HAZARD_TRACE").is_some() {
-                    eprintln!("HAZARD slot_movei pc={:#010X}", self.pc);
-                }
-            }
-            if op == 52 || op == 53 {
-                self.pipe.stats.slot_jump += 1;
-                if std::env::var_os("JSIM_HAZARD_TRACE").is_some() {
-                    eprintln!("HAZARD slot_jump pc={:#010X}", self.pc);
-                }
-            }
-        }
+        self.park_touched_mem |= Self::is_mem_op(op);
 
         // Issue cost: base + external fetch + addressing overheads.
         let contended = bus.m68k_on_bus;
@@ -1056,30 +1083,65 @@ mod tests {
     /// parked 195,529 · clearing its own GO 3.
     #[test]
     fn park_spin_flags_a_kernel_that_never_releases_the_bus() {
-        // `.idle: jr .idle` — a branch to itself (target = pc + 2 + disp*2, so
-        // disp = -1), with a nop in its single delay slot. Runs to the budget
-        // because nothing will ever stop it.
-        let parked = [enc(53, (-1i16 as u16) & 0x1F, 0), enc(57, 0, 0)];
-        let (_, gpu) = run_fid(&parked, mem::G_RAM, 4000, Fidelity::Silicon, &[]);
-        assert!(
-            gpu.pipe.stats.park_spin_max > 1000,
-            "a self-parked kernel must be flagged, got {}",
-            gpu.pipe.stats.park_spin_max
-        );
+        for fid in [Fidelity::Functional, Fidelity::Silicon] {
+            // Shape 1 (jag_s3k, jag_sonic2): `.idle: jr .idle` + delay slot.
+            let parked = [enc(53, (-1i16 as u16) & 0x1F, 0), enc(57, 0, 0)];
+            let (_, g) = run_fid(&parked, mem::G_RAM, 4000, fid, &[]);
+            assert!(
+                g.pipe.stats.park_spin_max > 1000,
+                "{fid:?}: self-parked kernel must be flagged, got {}",
+                g.pipe.stats.park_spin_max
+            );
 
-        // The same work, ended the way silicon wants: clear GO and stop. The
-        // park becomes unreachable, so the counter stays small.
-        let stopped = with_stop(&[
-            enc(35, 1, 1), // moveq #1,r1
-            enc(35, 2, 2), // moveq #2,r2
-            enc(0, 1, 2),  // add  r1,r2
-        ]);
-        let (_, gpu2) = run_fid(&stopped, mem::G_RAM, 4000, Fidelity::Silicon, &[]);
-        assert!(
-            gpu2.pipe.stats.park_spin_max < 100,
-            "a kernel that clears its own GO must NOT be flagged, got {}",
-            gpu2.pipe.stats.park_spin_max
-        );
+            // Shape 2 (jag_openlara): an instruction BEFORE the target, so the
+            // loop is one instruction wider. A byte-span test missed this.
+            //   halt: nop ; jr T,halt ; nop
+            let parked2 = [
+                enc(57, 0, 0),
+                enc(53, (-2i16 as u16) & 0x1F, 0),
+                enc(57, 0, 0),
+            ];
+            let (_, g2) = run_fid(&parked2, mem::G_RAM, 4000, fid, &[]);
+            assert!(
+                g2.pipe.stats.park_spin_max > 1000,
+                "{fid:?}: a park with a leading instruction must be flagged too, got {}",
+                g2.pipe.stats.park_spin_max
+            );
+
+            // A kernel that ends the way silicon wants: clear GO and stop.
+            let stopped = with_stop(&[enc(35, 1, 1), enc(35, 2, 2), enc(0, 1, 2)]);
+            let (_, g3) = run_fid(&stopped, mem::G_RAM, 4000, fid, &[]);
+            assert!(
+                g3.pipe.stats.park_spin_max < 100,
+                "{fid:?}: a kernel that clears its own GO must NOT be flagged, got {}",
+                g3.pipe.stats.park_spin_max
+            );
+        }
+    }
+
+    /// ⚠ A tight loop that MOVES DATA is not a park — it is doing work, and
+    /// work is visible to a bandwidth model. Without the memory-op test a pixel
+    /// copy, which recurs over a handful of PCs for millions of iterations,
+    /// would be reported as a parked kernel and the gate would cry wolf on
+    /// every renderer in the fleet.
+    #[test]
+    fn park_spin_does_not_flag_a_working_copy_loop() {
+        for fid in [Fidelity::Functional, Fidelity::Silicon] {
+            let copy = with_stop(&[
+                enc(35, 8, 1),  // moveq #8,r1   src
+                enc(35, 16, 2), // moveq #16,r2  dst
+                enc(41, 1, 3),  // load  (r1),r3
+                enc(47, 2, 3),  // store r3,(r2)
+                enc(53, (-3i16 as u16) & 0x1F, 0), // jr T,-3 → back to the load
+                enc(57, 0, 0),
+            ]);
+            let (_, g) = run_fid(&copy, mem::G_RAM, 4000, fid, &[]);
+            assert!(
+                g.pipe.stats.park_spin_max < 100,
+                "{fid:?}: a loop that loads and stores is WORK, not a park, got {}",
+                g.pipe.stats.park_spin_max
+            );
+        }
     }
 
     /// DIV's quotient lands at cycle 18: an immediate consumer stalls 17
