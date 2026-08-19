@@ -227,6 +227,42 @@ pub struct TimingStats {
     pub slot_movei: u64,
     /// JUMP/JR executed in a delay slot ("results are not predictable").
     pub slot_jump: u64,
+    /// ☠ Longest run of instructions executed inside a ≤4-byte window — i.e. a
+    /// RISC core PARKED IN A TIGHT SELF-LOOP while GO is still set.
+    ///
+    /// **[HW]** A kernel that finishes its work and parks on `jr .idle` looks
+    /// idle and is not: on real Tom a running core never stops arbitrating for
+    /// the bus, so the 68000 is starved and **VI service simply stops** — no
+    /// exception, no crash handler, a frozen picture that still scans out
+    /// because the OP walks the last list it was given. `jag_s3k` bisected it
+    /// on silicon (one variable per turn): compositor off → alive past 40 s;
+    /// Tom at ~7% duty → died in 30-40 s; kernel clearing its own GO → alive at
+    /// 160 s playing a level. `jag_sonic2` had the identical failure: a title
+    /// screen that rendered perfectly and never advanced, with its 68000 having
+    /// stopped taking VIs.
+    ///
+    /// **No emulator shows this**, because it is an *arbitration* artefact, not
+    /// a bandwidth one — `jr .idle` executes out of the core's own internal
+    /// SRAM and makes no external access at all, so a bus-cycle model sees
+    /// nothing. That is exactly the class a simulator is supposed to catch, so
+    /// it is counted here.
+    ///
+    /// **The fix, which costs nothing if the hardware disagrees:** end the
+    /// kernel by clearing its own GO, and let the park be unreachable.
+    /// ```text
+    ///     store   r0,(r1)          ; sentinel
+    ///     load    (r1),r1          ; force the write to LAND before stopping
+    ///     movei   #$F02114,r2      ; G_CTRL
+    ///     moveq   #2,r3            ; CPUINT (bit 1) + GO CLEAR (bit 0)
+    ///     store   r3,(r2)          ; real Tom stops HERE
+    /// ```
+    /// ⚠ Read back into the register holding the ADDRESS, not into the kernel's
+    /// first scratch register: a load still in flight when the core stops lands
+    /// after the next kick rewrites that register, which is a `waw_hazards`.
+    ///
+    /// Reported, never enforced — like `m68k_dram_poll_max`. A healthy kernel
+    /// that clears GO reads ~0 here; one parked on `jr .idle` reads millions.
+    pub park_spin_max: u64,
     /// Sites where BigPEmu semantics diverge from silicon (external load
     /// consumed across a taken jump without a scoreboard stall).
     pub bigpemu_divergence: u64,
