@@ -426,7 +426,34 @@ impl GameDrive {
                 self.files.insert(h, OpenFile { data, pos: 0 });
                 h as u32
             }
-            Err(_) => u32::MAX, // -1
+            Err(_) => {
+                // ☠☠ ON REAL HARDWARE THIS SUCCEEDS. Measured by `jag_quake`,
+                // 2026-08-19: `gd_fopen` with READ | OPEN_EXISTING returns a
+                // VALID HANDLE for a file that is not on the card, and the
+                // following `gd_fread` then reports success while delivering
+                // nothing. The failure presents as "the read worked and my data
+                // is garbage", never as "file not found".
+                //
+                // This model returns -1, which is friendlier and catches typos —
+                // but it means a missing asset is a clean error here and a silent
+                // corruption on the cart. That difference cost `jag_quake` a
+                // diagnosis: jsim said BLOB_ERR_OPEN while the console loaded
+                // nothing and rendered black.
+                //
+                // The return is left as -1 (peers rely on it, and matching the
+                // hardware would hide real typos); the warning carries the fact.
+                // ⭐ The lesson for ROM authors: validate CONTENT — a magic word
+                // — never the return code.
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    eprintln!("jsim WARNING: gd_fopen({want:?}) missing -> -1 here, \
+                               but REAL HARDWARE RETURNS A VALID HANDLE and the \
+                               read then silently delivers nothing (jag_quake, \
+                               2026-08-19). Validate a magic word, not the \
+                               return code.");
+                });
+                u32::MAX // -1
+            }
         }
     }
 
@@ -435,7 +462,29 @@ impl GameDrive {
         0
     }
 
+    /// ☠☠☠ FSIZE HANGS THE 68000 ON REAL HARDWARE — measured on silicon by
+    /// `jag_quake`, 2026-08-19, where it was the entire "the cart does not boot"
+    /// blocker. `gd_install`, `gd_card_in` and `gd_fopen` all return; `gd_fsize`
+    /// is entered and never comes back, with no error and no exception.
+    ///
+    /// This model returns the length, so a ROM that calls it looks perfectly
+    /// healthy here and dies on the cart — exactly the divergence a simulator
+    /// exists to prevent. The return is deliberately NOT changed (eight projects
+    /// build against this and a hang would be a hostile default), so the model
+    /// WARNS instead, once, unconditionally.
+    ///
+    /// ⚠ Note the bounded SPI waits in `gdbios.S` do not protect callers: those
+    /// guard the binding's own probe, while `gdfunc` does `jsr (4*n)(%a6)` into
+    /// RetroHQ's installed BIOS, whose spins are outside any timeout.
+    /// ⭐ Get the length from your own container instead.
     pub fn fsize(&self, handle: u16) -> u32 {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            eprintln!("jsim WARNING: gd_fsize() is modelled as returning a length, \
+                       but it HANGS the 68000 on real hardware (jag_quake, \
+                       measured 2026-08-19). Take the size from your own file \
+                       header instead — this call will pass here and hang the cart.");
+        });
         self.files.get(&handle).map(|f| f.data.len() as u32).unwrap_or(u32::MAX)
     }
 
