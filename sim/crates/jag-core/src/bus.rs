@@ -320,6 +320,27 @@ pub struct Bus {
     /// The driving master's PC at the current write (best-effort; engines
     /// refresh it per instruction while watches are armed).
     pub cur_master_pc: u32,
+    /// ☠ UNALIGNED 68000 DATA ACCESSES. A word or long access through an ODD
+    /// address is an address error on a real 68000; this model performs it
+    /// happily, and `m68k.rs` only takes address error 3 on an odd PC FETCH.
+    /// So the whole class was previously unrepresentable: a ROM could run for
+    /// hundreds of frames with `illegal 0`, `stray_writes 0` and balanced
+    /// interrupt counters while resetting real hardware on every boot — which
+    /// is exactly what `jag_soniccd` spent five runs chasing (2026-08-20, HW).
+    ///
+    /// Counted, not trapped. Eight projects build against this model and
+    /// turning a working ROM into an exception loop would be a hostile
+    /// default; the count plus the PC is what finds the bug, and the PC is the
+    /// half you can act on.
+    ///
+    /// ⚠ 68000 only. The RISC cores and the Blitter have their own alignment
+    /// rules and are not what this is about.
+    pub m68k_unaligned: u64,
+    pub m68k_unaligned_addr: u32,
+    pub m68k_unaligned_pc: u32,
+    /// Distinct PCs seen making one, capped. A single "first" is captured by
+    /// whichever access happens earliest, which is rarely the interesting one.
+    pub m68k_unaligned_pcs: Vec<u32>,
     /// Nonzero while inside a composed write (write32→write16→write8), so a
     /// single logical store logs once, at its true width.
     watch_suppress: u8,
@@ -338,6 +359,8 @@ pub struct Bus {
 /// Cap on retained watch hits — enough to see the pattern, bounded so a
 /// watched framebuffer clear can't eat memory.
 pub const WATCH_LOG_CAP: usize = 256;
+/// Distinct PCs kept for [`Bus::m68k_unaligned_pcs`].
+pub const UNALIGNED_PC_CAP: usize = 32;
 
 /// A bus master, for watchpoint attribution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -408,6 +431,10 @@ impl Bus {
             watch_log: Vec::new(),
             watch_total: 0,
             cur_master: Master::Host,
+            m68k_unaligned: 0,
+            m68k_unaligned_addr: 0,
+            m68k_unaligned_pc: 0,
+            m68k_unaligned_pcs: Vec::new(),
             cur_master_pc: 0,
             watch_suppress: 0,
             frame_mirror: 0,
@@ -448,6 +475,29 @@ impl Bus {
                     frame: self.frame_mirror,
                 });
             }
+        }
+    }
+
+    /// Note a 68000 word/long access through an odd address. See
+    /// [`Self::m68k_unaligned`].
+    #[inline]
+    fn note_unaligned(&mut self, addr: u32, pc: u32) {
+        if addr & 1 == 0 || !matches!(self.cur_master, Master::Cpu) {
+            return;
+        }
+        // Composed accesses re-enter at a narrower width; count the logical
+        // one only, the same reason watch_note suppresses.
+        if self.watch_suppress > 0 {
+            return;
+        }
+        if self.m68k_unaligned == 0 {
+            self.m68k_unaligned_addr = addr;
+            self.m68k_unaligned_pc = pc;
+        }
+        self.m68k_unaligned += 1;
+        if self.m68k_unaligned_pcs.len() < UNALIGNED_PC_CAP && !self.m68k_unaligned_pcs.contains(&pc)
+        {
+            self.m68k_unaligned_pcs.push(pc);
         }
     }
 
@@ -528,6 +578,8 @@ impl Bus {
     #[inline]
     pub fn read16(&mut self, addr: u32) -> u16 {
         let a = addr & ADDR_MASK;
+        let upc = self.cur_master_pc;
+        self.note_unaligned(a, upc);
         if mem::is_dram(a) && a + 1 < mem::DRAM_END {
             self.m68k_bus_cycles += 1;
             self.m68k_dram_cycles += 1;
@@ -555,6 +607,8 @@ impl Bus {
     #[inline]
     pub fn write16(&mut self, addr: u32, v: u16) {
         let a = addr & ADDR_MASK;
+        let upc = self.cur_master_pc;
+        self.note_unaligned(a, upc);
         self.watch_note(a, 16, v as u32);
         if mem::is_dram(a) && a + 1 < mem::DRAM_END {
             self.m68k_bus_cycles += 1;
@@ -605,6 +659,8 @@ impl Bus {
     #[inline]
     pub fn read32(&mut self, addr: u32) -> u32 {
         let a = addr & ADDR_MASK;
+        let upc = self.cur_master_pc;
+        self.note_unaligned(a, upc);
         if mem::is_dram(a) && a + 3 < mem::DRAM_END {
             self.m68k_bus_cycles += 2; // a long is two 16-bit bus cycles
             self.m68k_dram_cycles += 2;
@@ -631,6 +687,8 @@ impl Bus {
     #[inline]
     pub fn write32(&mut self, addr: u32, v: u32) {
         let a = addr & ADDR_MASK;
+        let upc = self.cur_master_pc;
+        self.note_unaligned(a, upc);
         self.watch_note(a, 32, v);
         if mem::is_dram(a) && a + 3 < mem::DRAM_END {
             self.m68k_bus_cycles += 2;

@@ -2102,6 +2102,7 @@ fn state_json(jag: &Jaguar) -> String {
         "{{\"frame\":{},\"pc\":{},\"pc_hex\":{},\"sr\":{},\"instret\":{},\"m68k_op_tax_cycles\":{},\"m68k_dram_poll_max\":{},\"m68k_dram_poll_addr\":\"0x{:06X}\",\"m68k_dram_poll_pc\":\"0x{:06X}\",\"illegal\":{},\
          \"last_illegal_op\":\"0x{:04X}\",\
          \"m68k_stray_writes\":{},\"m68k_stray_write_addr\":\"0x{:06X}\",\"m68k_stray_write_pc\":\"0x{:06X}\",\"m68k_cart_writes\":{},\
+         \"m68k_unaligned\":{},\"m68k_unaligned_addr\":\"0x{:06X}\",\"m68k_unaligned_pc\":\"0x{:06X}\",\"m68k_unaligned_pcs\":[{}],\
          \"gpu\":{{\"running\":{},\"pc_hex\":{},\"instret\":{},\"cycles\":{},\"granted\":{},\"timing\":{},\
          \"flags\":\"0x{:08X}\",\"regs0\":[{}],\"regs1\":[{}]}},\
          \"dsp\":{{\"running\":{},\"instret\":{},\"cycles\":{},\"timing\":{},\
@@ -2138,6 +2139,23 @@ fn state_json(jag: &Jaguar) -> String {
         // Stores into cartridge ROM, counted apart: also a no-op, but an
         // ordinary mistake rather than one silicon can turn into a device poke.
         cpu.cart_writes,
+        // ☠ Word/long 68000 accesses through an ODD address. An address error
+        // on real silicon; performed without complaint here, and m68k.rs only
+        // takes address error 3 on an odd PC FETCH — so before this counter the
+        // whole class was unrepresentable, and a ROM could run for hundreds of
+        // frames with every other number healthy while resetting a real console
+        // on every boot (jag_soniccd, 2026-08-20, HW: five runs).
+        jag.bus.m68k_unaligned,
+        jag.bus.m68k_unaligned_addr,
+        jag.bus.m68k_unaligned_pc,
+        // ⭐ and the distinct PCs, because one "first" is captured by whichever
+        // access happens earliest, which is rarely the interesting one.
+        jag.bus
+            .m68k_unaligned_pcs
+            .iter()
+            .map(|p| format!("\"0x{p:06X}\""))
+            .collect::<Vec<_>>()
+            .join(","),
         jag.gpu.running,
         jstr(&format!("0x{:06X}", jag.gpu.pc)),
         jag.gpu.instret,

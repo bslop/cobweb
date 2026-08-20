@@ -945,6 +945,56 @@ mod poll_tests {
         );
     }
 
+    /// ☠ A guard needs a test that proves it BLOCKS, not only one that proves
+    /// it passes good input. An odd-address word store is an address error on
+    /// real silicon and a silent success here; before this counter existed the
+    /// class could not be observed at all, so the assertion that matters is
+    /// that a deliberately unaligned store is COUNTED and attributed.
+    #[test]
+    fn unaligned_word_store_is_counted_with_its_pc() {
+        let mut bus = Bus::new();
+        let mut cpu = M68k::new();
+        let mut dbg = Debugger::default();
+        // move.w #$1234,($00100001).l — an ODD destination in DRAM.  ⚠ $33FC, not
+        // $31FC: the latter is absolute SHORT and eats only one extension word,
+        // so the operand decoded as $1234 and the store was aligned after all.
+        let prog: [u16; 4] = [0x33FC, 0x1234, 0x0010, 0x0001];
+        for (i, w) in prog.iter().enumerate() {
+            let a = 0x4000 + (i as u32) * 2;
+            bus.dram[a as usize] = (w >> 8) as u8;
+            bus.dram[a as usize + 1] = *w as u8;
+        }
+        cpu.pc = 0x4000;
+        bus.cur_master = crate::bus::Master::Cpu;
+        bus.cur_master_pc = cpu.pc;
+        cpu.step(&mut bus, &mut dbg);
+        assert_eq!(bus.m68k_unaligned, 1, "an odd-address word store must be counted");
+        assert_eq!(bus.m68k_unaligned_addr, 0x0010_0001, "wrong address blamed");
+        assert_eq!(bus.m68k_unaligned_pc, 0x4000, "wrong PC blamed");
+        assert_eq!(bus.m68k_unaligned_pcs, vec![0x4000], "the PC set must carry it");
+    }
+
+    /// And the other half: an ALIGNED store must not be counted, or the
+    /// counter reads as a permanent alarm and stops meaning anything.
+    #[test]
+    fn aligned_word_store_is_not_counted() {
+        let mut bus = Bus::new();
+        let mut cpu = M68k::new();
+        let mut dbg = Debugger::default();
+        // move.w #$1234,$00100000 — the same store, EVEN destination.
+        let prog: [u16; 4] = [0x33FC, 0x1234, 0x0010, 0x0000];
+        for (i, w) in prog.iter().enumerate() {
+            let a = 0x4000 + (i as u32) * 2;
+            bus.dram[a as usize] = (w >> 8) as u8;
+            bus.dram[a as usize + 1] = *w as u8;
+        }
+        cpu.pc = 0x4000;
+        bus.cur_master = crate::bus::Master::Cpu;
+        bus.cur_master_pc = cpu.pc;
+        cpu.step(&mut bus, &mut dbg);
+        assert_eq!(bus.m68k_unaligned, 0, "an aligned store must NOT be counted");
+    }
+
     /// ⭐ The case this counter exists for: a Genesis rehost still carrying a
     /// work-RAM address, which the 68000 truncates to 24 bits and lands in the
     /// hole at $FFxxxx. Invisible in every other way — no bus error, no
