@@ -1410,7 +1410,18 @@ fn cmd_peek(args: &[String]) -> Result<(), String> {
     let out = flag_val(args, "--out");
     // Raw-file dumps can be large; interactive hex dumps stay bounded at 4 KB.
     let cap = if out.is_some() { 0x20_0000 } else { 4096 };
-    let len = flag_val(args, "--len").map(parse_u32).transpose()?.unwrap_or(64).min(cap);
+    let asked = flag_val(args, "--len").map(parse_u32).transpose()?.unwrap_or(64);
+    let len = asked.min(cap);
+    // SAY SO WHEN THE REQUEST IS CLAMPED. A silent clamp hands back a
+    // complete-looking JSON object holding 3% of the region, and the caller
+    // reads the absent 97% as zeroes - an instrument manufacturing a finding.
+    // (jag_sonic2, 2026-08-20: "PLANE_BMP is empty below row 8".)
+    if asked > len {
+        eprintln!(
+            "jagemu: peek --len {asked} clamped to {len} (hex-view cap); \
+             use `jagemu dump --at ADDR --len N -o FILE` for the full region"
+        );
+    }
     let fid = fidelity_arg(args)?;
     let jag = boot_input(&data, frames, btn, after, fid)?;
     let mut buf = vec![0u8; len as usize];
