@@ -403,8 +403,34 @@ fn op_begin_field(bus: &mut Bus, fmt: PixFmt) {
     bus.tom.op.has_gpu_object = list_has_gpu_object(bus, olp);
     // Per-line DRAM appetite of the display list: every bitmap re-reads IWIDTH
     // phrases on each line it covers. Drives the OP bus-contention tax.
+    //
+    // ⭐ WEIGHTED BY THE LINES EACH OBJECT ACTUALLY COVERS. This used to sum
+    // IWIDTH over every bitmap and ignore HEIGHT, so a 32-line sprite was
+    // charged as though it spanned all 224 -- a ~7x over-tax on short objects.
+    // jag_s3k hit it putting Mega Drive sprites on the OP (2026-08-20): a real
+    // Jaguar stayed clean with 40 extra 32-line objects while jsim's display
+    // collapsed at 40, and the visible failure was not even the OP -- the
+    // over-taxed 68000 could not finish its list build in VBlank, so
+    // op_begin_field sampled a half-built list and sized the canvas from it.
+    //
+    // ⚠ Full-height objects are unaffected (lines == canvas), so this changes
+    // NOTHING for a list whose bitmaps all span the display -- which is every
+    // list jsim has been measured against until now.
+    //
+    // ⚠ KNOWN REMAINING GAP: the OP re-walks the whole list every scanline, so
+    // each object also costs a 16-byte HEADER fetch per line no matter how few
+    // lines it covers. That is not modelled here, and on silicon it is what
+    // actually limits list length (jag_s3k measured a flat chain going black at
+    // ~80 objects, while the same 80 objects built-but-unlinked rendered fine).
+    // Charging it would change every existing measurement, so it is recorded
+    // rather than folded in silently.
+    let canvas = (height.max(1) as u64).min(MAX_FB_H as u64);
+    let weighted: u64 = bitmaps
+        .iter()
+        .map(|b| b.iwidth_phrases as u64 * (b.height as u64).min(canvas))
+        .sum();
     bus.tom.op.phrases_per_line =
-        bitmaps.iter().map(|b| b.iwidth_phrases).sum::<u32>().min(4096);
+        (((weighted + canvas - 1) / canvas).min(4096)) as u32;
 }
 
 /// Structural scan of the object graph for a GPU (TYPE 2) object (both BRANCH
