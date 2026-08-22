@@ -259,6 +259,15 @@ fn lane(reg: [u32; 2], bpp: u32, idx: u32) -> u32 {
     ((phrase >> (64 - bpp - bits)) & ((1u64 << bpp) - 1)) as u32
 }
 
+/// Env-gated (JAGEMU_BLIT_YSTAT=1) raw source-Y extreme tracker: the address
+/// generator masks Y to 12 bits, but the RAW pointer says how far a textured
+/// span's V actually walks — the number that decides whether real silicon's
+/// generator can be driven out of the texture and (with a wide enough Y path)
+/// out of DRAM. Written for jag_quake's walk-death hunt (2026-08-22).
+pub static BLIT_YMIN: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+pub static BLIT_YMAX: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+pub static BLIT_YBIG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// Execute the blit described by the current A1/A2/B registers (latched here at
 /// the `B_CMD` write). `cmd` is the value just written to `B_CMD`. Follows the
 /// reference inner/outer-loop model in spec §8.
@@ -641,6 +650,27 @@ pub fn run(bus: &mut Bus, cmd: u32) {
     bus.tom.last_blit_ticks = BLIT_LAUNCH_TICKS + transfer;
     bus.tom.blit_busy += BLIT_LAUNCH_TICKS + transfer; // asynchronous: drains as wall time passes
     bus.tom.blit_settle = BLIT_SETTLE_TICKS; // silicon needs this long to show BUSY
+
+    if std::env::var_os("JAGEMU_BLIT_YSTAT").is_some() {
+        use std::sync::atomic::Ordering::Relaxed;
+        // the SOURCE generator's final raw Y after the whole job — for a
+        // textured span (SRCEN, A1=source) this is v after len steps of dt.
+        if srcen {
+            let y = gens[src].y;
+            BLIT_YMIN.fetch_min(y, Relaxed);
+            BLIT_YMAX.fetch_max(y, Relaxed);
+            if !(-256..=256).contains(&y) {
+                let n = BLIT_YBIG.fetch_add(1, Relaxed);
+                if n < 16 {
+                    eprintln!(
+                        "YSTAT: src y={} base={:06X} w={} bpp={} inner={} yinc≈{}",
+                        y, gens[src].base, gens[src].width_px, gens[src].bpp,
+                        inner, gens[src].yinc >> 16
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
