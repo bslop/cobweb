@@ -517,7 +517,9 @@ fn collect_bitmaps(bus: &Bus, olp: u32) -> Vec<Obj> {
         let o = decode_obj(bus, addr8);
         match o.otype {
             0 | 1 => {
-                if o.link != 0 {
+                // Scaled objects end their path (see op_walk_line: silicon
+                // never honours a scaled object's outbound LINK).
+                if o.otype != 1 && o.link != 0 {
                     stack.push(o.link);
                 }
                 out.push(o);
@@ -649,7 +651,20 @@ fn op_walk_line(
                         | (((o.ypos + 2) & 0x7FF) << 3);
                     poke32_dram(bus, addr8 + 4, lo2);
                 }
-                // The OP ALWAYS follows LINK (an inactive object still chains on).
+                // An UNSCALED object always follows LINK (an inactive object
+                // still chains on). A SCALED (TYPE 1) object does NOT: on real
+                // Tom its outbound LINK is not honoured and nothing after it
+                // in the list ever draws — jag_quake proved it on silicon
+                // (jaguar-shared JAGUAR_PORTING_NOTES.md, "OP SCALED-object
+                // LINK quirk": a second bitmap linked after a scaled view
+                // never draws; HUD-before-view chokes the OP outright). The
+                // model used to follow the link here, which let a
+                // sprite-after-scaled-fb list render in jsim designs that are
+                // impossible on hardware. Terminate the line walk instead —
+                // the same visible outcome silicon gives.
+                if o.otype == 1 {
+                    break;
+                }
                 addr = bank | o.link;
             }
             2 => {
