@@ -161,6 +161,19 @@ pub struct OpState {
     /// stream by 11.1%, i.e. +0.46 cycles per external access. See
     /// `timing::OP_TAX_MILLI_PER_PHRASE`.
     pub phrases_per_line: u32,
+    /// ☠ HARDWARE (jag_quake, 2026-08-22 — "the A10 / PADTEXT boot lottery"):
+    /// a SCALED bitmap object is fetched as one 4-phrase (32-byte) burst and
+    /// the OP dies if that burst straddles a 32-byte boundary — the screen
+    /// goes black at the first field and the machine is gone. Only the
+    /// object's ADDRESS matters, so a build boots or hangs by layout alone
+    /// (16 mod 32 dead, 0 mod 32 fine; exact across every PADTEXT value),
+    /// and jsim rendered every one of the dead layouts perfectly for months.
+    /// Counted per line-walk that reaches it; first offending address kept.
+    pub scaled_misaligned_hits: u64,
+    pub scaled_misaligned_addr: u32,
+    /// Plain BITMAP objects need 16 (double-phrase): an 8-mod-16 object drew
+    /// on alternate fields only (jag_quake, 2026-08-13). Counted per walk, not modelled.
+    pub bitmap_misaligned_hits: u64,
 }
 
 impl Default for OpState {
@@ -174,6 +187,9 @@ impl Default for OpState {
             anchor_y: 0,
             has_gpu_object: false,
             phrases_per_line: 0,
+            scaled_misaligned_hits: 0,
+            scaled_misaligned_addr: 0,
+            bitmap_misaligned_hits: 0,
         }
     }
 }
@@ -624,6 +640,30 @@ fn op_walk_line(
         let o = decode_obj(bus, addr8);
         match o.otype {
             0 | 1 => {
+                // ☠ Alignment is part of the object's validity on silicon. A
+                // SCALED object at a non-32-byte boundary kills the OP — black
+                // field, hung machine (see `OpState::scaled_misaligned_hits`).
+                // Model the visible outcome: nothing from this object on is
+                // drawn this field, and say why ONCE, with the address, because
+                // "boots on half the layouts" is otherwise undebuggable.
+                if o.otype == 1 && (addr8 & 31) != 0 {
+                    let op = &mut bus.tom.op;
+                    if op.scaled_misaligned_hits == 0 {
+                        op.scaled_misaligned_addr = addr8;
+                        eprintln!(
+                            "jsim: ☠ OP SCALED object at ${:06X} is {}-mod-32 — silicon hangs \
+                             on the first field (the PADTEXT/A10 boot lottery). The list \
+                             needs the scaled object on a 32-byte boundary.",
+                            addr8,
+                            addr8 & 31
+                        );
+                    }
+                    op.scaled_misaligned_hits += 1;
+                    break;
+                }
+                if o.otype == 0 && (addr8 & 15) != 0 {
+                    bus.tom.op.bitmap_misaligned_hits += 1;
+                }
                 // Draw from the object's CURRENT DATA pointer and write the
                 // header back, exactly as the OP does: DATA advances one DWIDTH
                 // per displayed line, HEIGHT counts down, YPOS tracks the beam.
@@ -930,6 +970,61 @@ mod tests {
             second.width,
             second.height
         );
+    }
+
+    /// A SCALED object at the same geometry as `setup_a3d_style`'s bitmap:
+    /// TYPE=1 in the first phrase, a third phrase carrying 1:1 scale factors,
+    /// STOP after three phrases. `ol` is the object's own address.
+    fn setup_scaled(bus: &mut Bus, fb: u32, ol: u32, w_px: u32, h: u32, base_x: u32, base_y: u32) {
+        let screen_pwidth = (w_px * 2) / 8;
+        let link = (ol + 24) >> 3; // STOP after the 3-phrase scaled object
+        bus.write32(ol, (fb << 8) | (link >> 8));
+        bus.write32(ol + 4, (link << 24) | (h << 14) | (base_y << 4) | 1); // TYPE 1
+        bus.write32(ol + 8, screen_pwidth >> 4);
+        bus.write32(
+            ol + 12,
+            (screen_pwidth << 28) | (screen_pwidth << 18) | (1 << 15) | (4 << 12) | base_x,
+        );
+        bus.write32(ol + 16, 0); // HSCALE/VSCALE/REMAINDER = 1.0 (3.5 fixed: $20)
+        bus.write32(ol + 20, (0x20 << 16) | (0x20 << 8) | 0x20);
+        bus.write32(ol + 24, 0);
+        bus.write32(ol + 28, 4); // STOP
+        bus.tom.win.w16(mem::VMODE, 0x06C7);
+        bus.write32(mem::OLP, (ol >> 16) | (ol << 16));
+    }
+
+    /// ☠ HARDWARE: a SCALED object the OP fetches across a 32-byte boundary
+    /// kills the field (and the machine) — jag_quake's "A10 / PADTEXT boot
+    /// lottery", 2026-08-22: the same ROM booted or hung by the link address
+    /// of its display list alone, and jsim drew every dead layout perfectly.
+    /// Guard both halves: 0 mod 32 draws, 16 mod 32 is black and COUNTED.
+    #[test]
+    fn op_scaled_object_needs_32_byte_alignment() {
+        let (fb, w, h) = (0x10_0000u32, 320u32, 240u32);
+        let center = ((120 * 320 + 160) * 4) as usize;
+
+        let mut good = Bus::new();
+        for i in 0..(w * h) {
+            good.write16(fb + i * 2, 0xF800);
+        }
+        setup_scaled(&mut good, fb, 0x1000, w, h, 16, 16); // 0 mod 32
+        let f = compose_frame(&mut good);
+        assert_eq!(&f.rgba[center..center + 4], &[255, 0, 0, 255], "aligned scaled object must draw");
+        assert_eq!(good.tom.op.scaled_misaligned_hits, 0);
+
+        let mut bad = Bus::new();
+        for i in 0..(w * h) {
+            bad.write16(fb + i * 2, 0xF800);
+        }
+        setup_scaled(&mut bad, fb, 0x1010, w, h, 16, 16); // 16 mod 32: the lottery's dead half
+        let f = compose_frame(&mut bad);
+        assert_ne!(
+            &f.rgba[center..center + 4],
+            &[255, 0, 0, 255],
+            "a 16-mod-32 scaled object must NOT draw — jsim is exonerating the A10 lottery again"
+        );
+        assert!(bad.tom.op.scaled_misaligned_hits > 0, "the fault must be counted");
+        assert_eq!(bad.tom.op.scaled_misaligned_addr, 0x1010);
     }
 
     #[test]

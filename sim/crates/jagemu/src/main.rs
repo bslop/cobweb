@@ -2119,6 +2119,7 @@ fn state_json(jag: &Jaguar) -> String {
          \"dsp\":{{\"running\":{},\"instret\":{},\"cycles\":{},\"timing\":{},\
          \"flags\":\"0x{:08X}\",\"regs0\":[{}],\"regs1\":[{}]}},\
          \"blitter\":{{\"bcmd_busy_reads\":{},\"bcmd_poll_in_settle\":{}}},\"risc_ram_narrow_writes\":{},\
+         \"op\":{{\"scaled_misaligned_hits\":{},\"scaled_misaligned_addr\":\"0x{:06X}\",\"bitmap_misaligned_hits\":{}}},\
          \"d\":[{}],\"a\":[{}]}}",
         jag.frame(),
         cpu.pc,
@@ -2189,6 +2190,10 @@ fn state_json(jag: &Jaguar) -> String {
         jag.bus.bcmd_busy_reads.load(std::sync::atomic::Ordering::Relaxed),
         jag.bus.bcmd_poll_in_settle.load(std::sync::atomic::Ordering::Relaxed),
         jag.bus.risc_ram_narrow_writes,
+        // OP object-alignment faults (jag_quake A10 lottery, 2026-08-22).
+        jag.bus.tom.op.scaled_misaligned_hits,
+        jag.bus.tom.op.scaled_misaligned_addr,
+        jag.bus.tom.op.bitmap_misaligned_hits,
         dregs.join(","),
         aregs.join(",")
     )

@@ -6,6 +6,30 @@ assigned at release.
 
 ## Unreleased
 
+### 2026-08-22 — jsim: OP SCALED objects need 32-byte alignment (the "A10 / PADTEXT boot lottery")
+
+- **HARDWARE** (jag_quake, wtS 993c1a2): the OP fetches a SCALED bitmap object
+  as one 4-phrase burst and dies if it straddles a 32-byte boundary — black
+  first field, hung machine. Only the object's ADDRESS matters, so the same
+  ROM boots or hangs by link layout alone (16 mod 32 dead, 0 mod 32 fine;
+  exact across every PADTEXT value ever rolled, two of which had never booted
+  in any build). jsim drew every dead layout perfectly for months and so
+  exonerated the bug — the build boots in jsim was the whole reason the hunt
+  went through bus races, loader quirks and kernel alignment first.
+- `tom.rs` `op_walk_line`: a TYPE-1 object at a non-32-aligned address now
+  ends the walk before drawing (black, as silicon), counts the hit
+  (`OpState::scaled_misaligned_hits`, first address in
+  `scaled_misaligned_addr`) and prints ONE `jsim: ☠ OP SCALED object at $…
+  is N-mod-32` line naming the address. Plain BITMAP objects at non-16
+  addresses are counted (`bitmap_misaligned_hits`; silicon draws them on
+  alternate fields only), not modelled.
+- `jagemu` state JSON: new `"op":{scaled_misaligned_hits, scaled_misaligned_addr,
+  bitmap_misaligned_hits}`.
+- Regression guard: `op_scaled_object_needs_32_byte_alignment` — 0 mod 32
+  draws, 16 mod 32 is black and counted. Controls on the real ROMs: the
+  pre-fix jag_quake pad-0 build now renders black with the warning; the
+  pad-272 build and the fixed build report 0 hits and render.
+
 ### 2026-07-27 — silicon: JRISC DIV truncates (jsim faithful)
 
 - **`calib` `p_divround`**, authored and flashed same day. Six cases where
