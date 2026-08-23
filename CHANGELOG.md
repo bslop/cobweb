@@ -6,6 +6,21 @@ assigned at release.
 
 ## Unreleased
 
+### 2026-08-23 — jsim: store→load same-DRAM-word round-trip detector
+
+- On silicon a JRISC load from a DRAM word the same core stored moments
+  earlier can return 0/stale under bus traffic. Three confirmed kills in
+  jag_quake (nin, GATHN, and the wall-death's nout — a garbage LOOP BOUND
+  that swept all of DRAM); jsim lands stores instantly, so the pattern was
+  invisible here. Each core now keeps a ring of its recent external stores;
+  an external 32-bit load of the same word within 4096 cycles counts, with
+  the load PC. One hit per store (a poll loop re-reading a flag it wrote
+  counts once). End-of-run WARNING lists up to 8 distinct (addr, PC, count)
+  sites; state JSON carries the counters. First audit of jag_quake's
+  kernels: 16 sites, ~1M raw hits.
+- Regression test `store_load_roundtrip_is_counted` (counts, dedup by
+  store, window, local-SRAM exemption).
+
 ### 2026-08-22 — jsim: zero-divisor DIVs now report their PC
 
 - `TimingStats::div_by_zero_first_pc` / `div_by_zero_last_pc`; the end-of-run

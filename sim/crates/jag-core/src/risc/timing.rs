@@ -316,6 +316,16 @@ pub struct TimingStats {
     /// with no site is a day of bisecting; with the PC it is one `grep`).
     pub div_by_zero_first_pc: u32,
     pub div_by_zero_last_pc: u32,
+    /// Store→load same-DRAM-word round trips within the hazard window (see
+    /// `Risc::check_ext_load`): silicon returns 0/stale there, jsim cannot.
+    pub store_load_roundtrips: u64,
+    pub store_load_first_pc: u32,
+    pub store_load_last_pc: u32,
+    pub store_load_last_addr: u32,
+    pub store_load_min_gap: u64,
+    /// First 8 distinct (addr, load PC, count) round-trip sites — the
+    /// actionable list; the counter alone was a number without a fix.
+    pub store_load_sites: [(u32, u32, u64); 8],
 }
 
 impl TimingStats {

@@ -324,6 +324,24 @@ fn report_hazard_diagnostics(jag: &Jaguar) {
             );
         }
     }
+    for (name, t) in [("Tom GPU", &jag.gpu.pipe.stats), ("Jerry DSP", &jag.dsp.pipe.stats)] {
+        if t.store_load_roundtrips > 0 {
+            eprintln!(
+                "jagemu: WARNING — {name} performed {} store->load round trip(s) on the same \
+                 DRAM word within the hazard window (min gap {} cycles). On real silicon that \
+                 load can return 0/stale under bus traffic (three confirmed kills: nin, GATHN, \
+                 and the wall-death's nout — a garbage LOOP BOUND that swept all of DRAM). jsim \
+                 lands stores instantly, so the value read here is always fresh and the bug is \
+                 invisible. Keep the value in a register or local SRAM. First at PC ${:06X}, \
+                 last at PC ${:06X}, last addr ${:06X}.",
+                t.store_load_roundtrips, t.store_load_min_gap,
+                t.store_load_first_pc, t.store_load_last_pc, t.store_load_last_addr
+            );
+            for &(a, pc, n) in t.store_load_sites.iter().filter(|e| e.2 > 0) {
+                eprintln!("jagemu:     round-trip site: addr ${a:06X} load PC ${pc:06X} x{n}");
+            }
+        }
+    }
     for (name, c) in [("Tom GPU", &jag.gpu), ("Jerry DSP", &jag.dsp)] {
         if let Some((pc, frames)) = c.stuck_at {
             eprintln!(
@@ -2208,7 +2226,7 @@ fn timing_json(t: &TimingStats) -> String {
          \"stall_div_busy\":{},\"jump_refill\":{},\"fetch_external\":{},\"mem_external\":{},\
          \"waw_hazards\":{},\"indexed_store_stale\":{},\"slot_movei\":{},\"slot_jump\":{},\
          \"bigpemu_divergence\":{},\"contention\":{},\"blit\":{},\
-         \"unaligned_risc32\":{},\"blit_count\":{},\"blit_launch\":{},\"blit_transfer\":{},\"blit_wait\":{},\"div_by_zero\":{},\"div_by_zero_first_pc\":\"0x{:06X}\",\"div_by_zero_last_pc\":\"0x{:06X}\",\"park_spin_max\":{}}}",
+         \"unaligned_risc32\":{},\"blit_count\":{},\"blit_launch\":{},\"blit_transfer\":{},\"blit_wait\":{},\"div_by_zero\":{},\"div_by_zero_first_pc\":\"0x{:06X}\",\"div_by_zero_last_pc\":\"0x{:06X}\",\"store_load_roundtrips\":{},\"store_load_first_pc\":\"0x{:06X}\",\"store_load_last_pc\":\"0x{:06X}\",\"store_load_last_addr\":\"0x{:06X}\",\"store_load_min_gap\":{},\"park_spin_max\":{}}}",
         t.stall_alu,
         t.stall_load,
         t.stall_div,
@@ -2232,6 +2250,11 @@ fn timing_json(t: &TimingStats) -> String {
         t.div_by_zero,
         t.div_by_zero_first_pc,
         t.div_by_zero_last_pc,
+        t.store_load_roundtrips,
+        t.store_load_first_pc,
+        t.store_load_last_pc,
+        t.store_load_last_addr,
+        t.store_load_min_gap,
         t.park_spin_max,
     )
 }
