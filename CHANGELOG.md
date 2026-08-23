@@ -6,6 +6,14 @@ assigned at release.
 
 ## Unreleased
 
+### 2026-08-22 — jsim: zero-divisor DIVs now report their PC
+
+- `TimingStats::div_by_zero_first_pc` / `div_by_zero_last_pc`; the end-of-run
+  WARNING names both, and the state JSON carries them. jag_quake's wall-death
+  (silicon-only, "turn toward a wall and die") was a `div` by a zero `|dt|`
+  in Jerry's v-run cap: the count alone had been visible for a day; the PC
+  found the site in one grep.
+
 ### 2026-08-22 — jsim: OP SCALED objects need 32-byte alignment (the "A10 / PADTEXT boot lottery")
 
 - **HARDWARE** (jag_quake, wtS 993c1a2): the OP fetches a SCALED bitmap object

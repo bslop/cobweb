@@ -311,6 +311,11 @@ pub struct TimingStats {
     /// wrong in a new way. Counting it is enough to convert a 195-second flash
     /// plus a power-cycle into a line of output.
     pub div_by_zero: u64,
+    /// PC of the FIRST zero-divisor DIV and of the most recent one — the half
+    /// of the count you can act on (jag_quake 2026-08-22: "70 DIVs by zero"
+    /// with no site is a day of bisecting; with the PC it is one `grep`).
+    pub div_by_zero_first_pc: u32,
+    pub div_by_zero_last_pc: u32,
 }
 
 impl TimingStats {

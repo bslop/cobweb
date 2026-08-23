@@ -318,8 +318,9 @@ fn report_hazard_diagnostics(jag: &Jaguar) {
                  returns 0xFFFFFFFF and continues; real silicon does NOT, and a kernel \
                  that divides by zero has black-screened a Jaguar while rendering fine \
                  here. Silicon's exact behaviour is unmeasured, so this is reported, not \
-                 modelled — but treat a nonzero count as a hardware failure.",
-                t.div_by_zero
+                 modelled — but treat a nonzero count as a hardware failure. \
+                 First at PC ${:06X}, last at PC ${:06X}.",
+                t.div_by_zero, t.div_by_zero_first_pc, t.div_by_zero_last_pc
             );
         }
     }
@@ -2207,7 +2208,7 @@ fn timing_json(t: &TimingStats) -> String {
          \"stall_div_busy\":{},\"jump_refill\":{},\"fetch_external\":{},\"mem_external\":{},\
          \"waw_hazards\":{},\"indexed_store_stale\":{},\"slot_movei\":{},\"slot_jump\":{},\
          \"bigpemu_divergence\":{},\"contention\":{},\"blit\":{},\
-         \"unaligned_risc32\":{},\"blit_count\":{},\"blit_launch\":{},\"blit_transfer\":{},\"blit_wait\":{},\"div_by_zero\":{},\"park_spin_max\":{}}}",
+         \"unaligned_risc32\":{},\"blit_count\":{},\"blit_launch\":{},\"blit_transfer\":{},\"blit_wait\":{},\"div_by_zero\":{},\"div_by_zero_first_pc\":\"0x{:06X}\",\"div_by_zero_last_pc\":\"0x{:06X}\",\"park_spin_max\":{}}}",
         t.stall_alu,
         t.stall_load,
         t.stall_div,
@@ -2229,6 +2230,8 @@ fn timing_json(t: &TimingStats) -> String {
         t.blit_transfer,
         t.blit_wait,
         t.div_by_zero,
+        t.div_by_zero_first_pc,
+        t.div_by_zero_last_pc,
         t.park_spin_max,
     )
 }

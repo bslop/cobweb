@@ -177,6 +177,10 @@ pub(super) fn execute(core: &mut Risc, bus: &mut Bus, iw: u16) {
                 // jsim's long-standing benign answer and stays, so timing and
                 // every calibration constant are unaffected — but the event is
                 // now visible instead of silent.
+                if core.pipe.stats.div_by_zero == 0 {
+                    core.pipe.stats.div_by_zero_first_pc = core.pc;
+                }
+                core.pipe.stats.div_by_zero_last_pc = core.pc;
                 core.pipe.stats.div_by_zero += 1;
                 core.set_reg(b, r2, 0xFFFF_FFFF);
                 core.div_remainder = d;
