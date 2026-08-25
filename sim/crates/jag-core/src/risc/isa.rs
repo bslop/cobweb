@@ -339,10 +339,12 @@ pub(super) fn execute(core: &mut Risc, bus: &mut Bus, iw: u16) {
             core.set_reg(b, r2, (w2 << 16) | w1);
         }
         39 => {
+            core.note_narrow_sram(s);
             let v = bus.read8(s) as u32;
             core.set_reg(b, r2, v);
         }
         40 => {
+            core.note_narrow_sram(s);
             let v = bus.read16(s) as u32;
             core.set_reg(b, r2, v);
         }
@@ -379,9 +381,11 @@ pub(super) fn execute(core: &mut Risc, bus: &mut Bus, iw: u16) {
         }
         45 => {
             // STOREB — addr=reg1, data=reg2
+            core.note_narrow_sram(s);
             bus.write8(s, d as u8);
         }
         46 => {
+            core.note_narrow_sram(s);
             bus.write16(s, d as u16);
         }
         47 => {

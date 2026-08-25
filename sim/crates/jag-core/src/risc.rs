@@ -290,6 +290,18 @@ impl Risc {
         )));
     }
 
+    /// Count a byte/word access that targets this core's own SRAM (see
+    /// `TimingStats::narrow_sram`).
+    pub fn note_narrow_sram(&mut self, a: u32) {
+        let b = self.kind.sram_base();
+        if a >= b && a < b + self.kind.sram_size() {
+            if self.pipe.stats.narrow_sram == 0 {
+                self.pipe.stats.narrow_sram_first_pc = self.pc;
+            }
+            self.pipe.stats.narrow_sram += 1;
+        }
+    }
+
     pub fn reset(&mut self) {
         self.regs = [[0; 32]; 2];
         self.pc = self.kind.sram_base();

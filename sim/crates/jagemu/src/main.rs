@@ -325,6 +325,19 @@ fn report_hazard_diagnostics(jag: &Jaguar) {
         }
     }
     for (name, t) in [("Tom GPU", &jag.gpu.pipe.stats), ("Jerry DSP", &jag.dsp.pipe.stats)] {
+        if t.narrow_sram > 0 {
+            eprintln!(
+                "jagemu: WARNING — {name} made {} byte/word (LOADB/LOADW/STOREB/STOREW) access(es) \
+                 to its OWN local SRAM (first at PC ${:06X}). Silicon's GPU/DSP RAM takes 32-bit \
+                 accesses ONLY: a narrow write never lands and a narrow read is undefined. jsim \
+                 models byte-addressable SRAM and executed them as if they worked — a 16-bit \
+                 histogram in Jerry SRAM sorted perfectly here and killed the console in 14 s \
+                 (jag_quake 2026-08-24). Use LOAD/STORE (32-bit) on local RAM.",
+                t.narrow_sram, t.narrow_sram_first_pc
+            );
+        }
+    }
+    for (name, t) in [("Tom GPU", &jag.gpu.pipe.stats), ("Jerry DSP", &jag.dsp.pipe.stats)] {
         if t.store_load_roundtrips > 0 {
             eprintln!(
                 "jagemu: WARNING — {name} performed {} store->load round trip(s) on the same \
