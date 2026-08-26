@@ -6,6 +6,26 @@ assigned at release.
 
 ## Unreleased
 
+### 2026-08-26 — jas: object-mode `.align` is SECTION-relative and raises `sh_addralign`
+
+- `.align N` / `.balign N` aligned the ABSOLUTE blob PC, and `.text/.data/.bss`
+  headers carried fixed `sh_addralign` (8/16/16). Sections are cut out of one
+  flat blob, so a `.bss` that opened 16 mod 32 put an `.align 32` symbol at
+  **section offset 16**, and the linker was free to place the section at
+  16 mod 32 regardless. `jag_openlara`'s OP list needs 32 (the OP fetches a
+  scaled object as one 32-byte burst, cobweb `905188f`) — `aligned(32)` in C
+  produced `op_list` at 0x38410, and the project fell back to defining the
+  symbol in its linker script.
+- In object mode `align_to` now pads relative to the current section's start
+  and records the largest request per section; `elf.rs` writes
+  `max(default, requested)` as `sh_addralign`. Flat images (`--gpu`, `--68000`
+  without `--elf-obj`) are unchanged: absolute alignment is right when the
+  image is the address space. `.align`/`.balign` route through `align_to`
+  (they had private loops). Regression test
+  `elf_obj_align_is_section_relative_and_raises_addralign` covers the exact
+  16-mod-32 shape.
+
+
 ### 2026-08-26 — jas: a memory-to-memory MOVE dropped its DESTINATION relocation
 
 - **`move.l sym,sym2+N` emitted ONE reloc — the source's — and encoded the

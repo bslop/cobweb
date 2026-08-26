@@ -653,6 +653,47 @@ fn elf_obj_mem_to_mem_move_relocates_both_operands() {
 }
 
 #[test]
+fn elf_obj_align_is_section_relative_and_raises_addralign() {
+    // `.align N` in object mode must align the SECTION-RELATIVE offset and
+    // raise that section's sh_addralign to N. It used to align the absolute
+    // blob PC while .bss kept addralign 16: a .bss opened at 16 mod 32 put an
+    // `.align 32` symbol at section offset 16, and the linker was free to
+    // land the section at 16 mod 32 anyway. jag_openlara's OP list needed 32
+    // (the OP fetches a scaled object as one 32-byte burst) and got the A10
+    // boot lottery instead (2026-08-26).
+    let src = "\t.68000\n\
+        \t.text\n\
+        \tnop\n\
+        \t.align 16\n\
+        \t.bss\n\
+        \t.align 32\n\
+        \t.globl first\n\
+        first:\n\
+        \t.ds.b 4\n\
+        \t.align 32\n\
+        \t.globl second\n\
+        second:\n\
+        \t.ds.b 4\n";
+    let opts = Options { org: 0x4000, start_m68k: true, object_mode: true, relocatable: true, check_hazards: false, ..Default::default() };
+    let out = assemble(src, &opts);
+    assert_eq!(out.errors(), 0, "{:#?}", out.diags);
+    // .bss opened at blob offset 16 (16 mod 32): section-relative alignment
+    // must put `first` at 0 and `second` at 32, not 16 and 48.
+    let bss_start = out.sections.iter().find(|(s, _)| *s == jas::Section::Bss).map(|&(_, o)| o).expect("bss span");
+    assert_eq!(bss_start % 32, 16, "test shape: .bss must open at 16 mod 32 in the blob");
+    let off = |n: &str| out.symbols[n] - (opts.org + bss_start);
+    assert_eq!(off("first"), 0, "first symbol at section offset 0");
+    assert_eq!(off("second"), 32, "second symbol at section offset 32");
+    assert_eq!(out.sec_align[jas::Section::Bss.idx()], 32);
+    let bytes = jas::elf::write(&out).expect("elf");
+    let e = Elf { b: &bytes };
+    // .bss is section header 5; addralign is at +32 in the 40-byte header
+    let shoff = e.u32(32) as usize;
+    assert_eq!(e.u32(shoff + 5 * 40 + 32), 32, ".bss sh_addralign raised to 32");
+    assert_eq!(e.u32(shoff + 1 * 40 + 32), 16, ".text sh_addralign = its .align 16");
+}
+
+#[test]
 fn elf_obj_rejects_jrisc_movei_reloc() {
     // A JRISC MOVEI of an extern has no ELF relocation type — must be a clear
     // error, not silent corruption.
