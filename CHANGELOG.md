@@ -6,6 +6,26 @@ assigned at release.
 
 ## Unreleased
 
+### 2026-08-26 — jas: a memory-to-memory MOVE dropped its DESTINATION relocation
+
+- **`move.l sym,sym2+N` emitted ONE reloc — the source's — and encoded the
+  destination as its bare addend.** `M68kEnc` carried a single
+  `Option<reloc>` and `assemble_words` did `src.or_else(dst)`. Every
+  global-to-global copy jcc68k emits (`fs_ph1 = op_list[1]` →
+  `move.l op_list+4,fs_ph1`) became a store to absolute `$0`..`$34` — the
+  68000 exception vector table. In `jag_openlara` that left the OP-list
+  shadow words zero, so the vblank ISR rebuilt a height-0 object every field
+  and the screen was BLACK on every PADTEXT roll; 24 such sites in the
+  shipping ROM (`objdump -d | grep 23f9` with a destination below `$4000`
+  finds them). Surfaced the day `video.c` moved from gcc onto jcc68k; the
+  ROM that still rendered had been built with `GCCHOT=1`.
+- `M68kEnc.reloc` is now `relocs: Vec<…>`; `shift_reloc` returns a list and
+  the MOVE path keeps both operands. Regression test
+  `elf_obj_mem_to_mem_move_relocates_both_operands` (two RELA entries, at the
+  source AND destination longs). Verified on the real ROM: 0 dropped
+  destinations, the shadow words populate, the display comes up.
+
+
 ### 2026-08-23 — jsim: store→load same-DRAM-word round-trip detector
 
 - On silicon a JRISC load from a DRAM word the same core stored moments

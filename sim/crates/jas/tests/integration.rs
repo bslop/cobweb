@@ -620,6 +620,39 @@ fn elf_obj_folds_equ_constants_not_relocs() {
 }
 
 #[test]
+fn elf_obj_mem_to_mem_move_relocates_both_operands() {
+    // `move.l src,dst+20` has TWO relocatable operands. The encoder carried
+    // ONE reloc per instruction and preferred the source, so the destination
+    // was emitted as its bare addend: jag_openlara's `move.l fs_ph5,op_list+20`
+    // became a store to absolute $14 (2026-08-26). Every mem-to-mem global copy
+    // in a jcc68k translation unit wrote into the 68000 exception vectors, the
+    // OP list stayed zero, and the display was black on every PADTEXT roll.
+    let src = "\t.68000\n\
+        \t.text\n\
+        \t.extern src\n\
+        \t.extern dst\n\
+        entry:\n\
+        \tmove.l src,dst+20\n";
+    let opts = Options { org: 0x4000, start_m68k: true, object_mode: true, relocatable: true, check_hazards: false, ..Default::default() };
+    let out = assemble(src, &opts);
+    assert_eq!(out.errors(), 0, "{:#?}", out.diags);
+    let bytes = jas::elf::write(&out).expect("elf");
+    let e = Elf { b: &bytes };
+    // move.l (abs).l,(abs).l = op 2 + src abs.l 4 + dst abs.l 4
+    let (_, _, toff, tsz) = e.sh(1);
+    assert_eq!(tsz, 10, ".text size");
+    assert_eq!(&bytes[toff + 2..toff + 6], &[0, 0, 0, 0], "source placeholder");
+    assert_eq!(&bytes[toff + 6..toff + 10], &[0, 0, 0, 0x14], "destination placeholder carries the addend");
+    // TWO relocs: offset 2 (src) and offset 6 (dst)
+    let (ty, _, roff, rsz) = e.sh(2);
+    assert_eq!((ty, rsz), (4, 24), "two RELA entries");
+    let r_off = |i: usize| u32::from_be_bytes(bytes[roff + i * 12..roff + i * 12 + 4].try_into().unwrap());
+    let mut offs = vec![r_off(0), r_off(1)];
+    offs.sort();
+    assert_eq!(offs, vec![2, 6], "relocs at the source AND destination longs");
+}
+
+#[test]
 fn elf_obj_rejects_jrisc_movei_reloc() {
     // A JRISC MOVEI of an extern has no ELF relocation type — must be a clear
     // error, not silent corruption.

@@ -907,7 +907,7 @@ impl<'a> Assembler<'a> {
             for w in &enc.words {
                 self.bytes.extend_from_slice(&w.to_be_bytes());
             }
-            if let Some((woff, kind, symbol, addend)) = enc.reloc {
+            for (woff, kind, symbol, addend) in enc.relocs {
                 self.relocs.push(Reloc { offset: base + woff * 2, kind, symbol, addend });
             }
             self.emitted.push(Emitted {

@@ -16,11 +16,17 @@
 use crate::object::RelKind;
 use crate::{Assembler, EncodeErr};
 
-/// Result of encoding: the instruction words (opcode + extensions), plus an
-/// optional relocation `(word-index, kind, symbol, addend)`.
+/// Result of encoding: the instruction words (opcode + extensions), plus the
+/// relocations `(word-index, kind, symbol, addend)` they carry.
+///
+/// A LIST, not an Option: a memory-to-memory `move.l abs.l,abs.l` has TWO
+/// relocatable operands. Carrying only one dropped the DESTINATION, so
+/// `move.l fs_ph5,op_list+20` assembled as a store to absolute $14 — the
+/// bare addend — and jag_openlara wrote its OP list into the exception
+/// vector table (2026-08-26).
 pub(crate) struct M68kEnc {
     pub(crate) words: Vec<u16>,
-    pub(crate) reloc: Option<(u32, RelKind, String, i64)>,
+    pub(crate) relocs: Vec<(u32, RelKind, String, i64)>,
 }
 
 fn msg(m: impl Into<String>) -> EncodeErr {
@@ -397,7 +403,7 @@ pub(crate) fn encode(mnem: &str, args: &str, here: u32, asm: &Assembler) -> Resu
             if let Some((sym, addend)) = asm.reloc_symbol_pub(target) {
                 return Ok(M68kEnc {
                     words: vec![opbase, addend as u16],
-                    reloc: Some((1, RelKind::Pc16, sym, addend)),
+                    relocs: vec![(1, RelKind::Pc16, sym, addend)],
                 });
             }
         }
@@ -409,7 +415,7 @@ pub(crate) fn encode(mnem: &str, args: &str, here: u32, asm: &Assembler) -> Resu
             return Ok(if force_short {
                 one(opbase)
             } else {
-                M68kEnc { words: vec![opbase, 0], reloc: None }
+                M68kEnc { words: vec![opbase, 0], relocs: vec![] }
             });
         }
         if force_short {
@@ -423,7 +429,7 @@ pub(crate) fn encode(mnem: &str, args: &str, here: u32, asm: &Assembler) -> Resu
         }
         // 16-bit form
         if (-32768..=32767).contains(&disp) {
-            return Ok(M68kEnc { words: vec![opbase, disp as u16], reloc: None });
+            return Ok(M68kEnc { words: vec![opbase, disp as u16], relocs: vec![] });
         }
         return Err(msg("branch displacement out of 16-bit range (68000 has no long branch)"));
     }
@@ -439,7 +445,7 @@ pub(crate) fn encode(mnem: &str, args: &str, here: u32, asm: &Assembler) -> Resu
         let dn = dreg(&dn_s).ok_or_else(|| msg("dbcc needs a data register"))?;
         let dest = asm.eval_pub(tgt.trim()).map_err(msg)?;
         let disp = dest as i64 - (here as i64 + 2);
-        return Ok(M68kEnc { words: vec![0x50C8 | (cc << 8) | dn, disp as u16], reloc: None });
+        return Ok(M68kEnc { words: vec![0x50C8 | (cc << 8) | dn, disp as u16], relocs: vec![] });
     }
 
     // ── moveq ────────────────────────────────────────────────────────────────
@@ -573,7 +579,7 @@ pub(crate) fn encode(mnem: &str, args: &str, here: u32, asm: &Assembler) -> Resu
     // ── stop (privileged: load SR, halt until interrupt) ─────────────────────
     if low == "stop" {
         let v = asm.eval_pub(args.trim().trim_start_matches('#')).map_err(msg)?;
-        return Ok(M68kEnc { words: vec![0x4E72, v as u16], reloc: None });
+        return Ok(M68kEnc { words: vec![0x4E72, v as u16], relocs: vec![] });
     }
 
     // ── link / unlk ───────────────────────────────────────────────────────────
@@ -581,7 +587,7 @@ pub(crate) fn encode(mnem: &str, args: &str, here: u32, asm: &Assembler) -> Resu
         let (an_s, disp) = split2(args)?;
         let an = areg(&an_s).ok_or_else(|| msg("link needs an address register"))?;
         let d = asm.eval_pub(disp.trim().trim_start_matches('#')).map_err(msg)? as u16;
-        return Ok(M68kEnc { words: vec![0x4E50 | an, d], reloc: None });
+        return Ok(M68kEnc { words: vec![0x4E50 | an, d], relocs: vec![] });
     }
     if base == "unlk" {
         let an = areg(args.trim()).ok_or_else(|| msg("unlk needs an address register"))?;
@@ -640,7 +646,7 @@ pub(crate) fn encode(mnem: &str, args: &str, here: u32, asm: &Assembler) -> Resu
             _ => words.push(v as u16),
         }
         words.extend_from_slice(&ea.ext);
-        return Ok(M68kEnc { words, reloc: shift_reloc(&ea, /*after*/ 1 + imm_words(sz)) });
+        return Ok(M68kEnc { words, relocs: shift_reloc(&ea, /*after*/ 1 + imm_words(sz)) });
     }
 
     // ── register/EA arithmetic+logic: add sub and or eor cmp ──────────────────
@@ -737,7 +743,7 @@ pub(crate) fn encode(mnem: &str, args: &str, here: u32, asm: &Assembler) -> Resu
             let n = asm.eval_pub(imm.trim()).map_err(msg)? as u16;
             let mut words = vec![0x0800 | (ty << 6) | ea.field(), n];
             words.extend_from_slice(&ea.ext);
-            return Ok(M68kEnc { words, reloc: None });
+            return Ok(M68kEnc { words, relocs: vec![] });
         }
         let dn = dreg(bit.trim()).ok_or_else(|| msg("bit op needs #n or Dn"))?;
         return Ok(with_src(0x0100 | (dn << 9) | (ty << 6) | ea.field(), &ea));
@@ -772,38 +778,35 @@ fn ea_rel_kind(ea: &Ea) -> RelKind {
 
 /// If the EA carries a reloc, shift its word offset by `base_words` (the words
 /// emitted before the EA extension).
-fn shift_reloc(ea: &Ea, base_words: usize) -> Option<(u32, RelKind, String, i64)> {
+fn shift_reloc(ea: &Ea, base_words: usize) -> Vec<(u32, RelKind, String, i64)> {
     ea.reloc
         .as_ref()
         .map(|(s, a)| ((base_words + ea.reloc_ext_off) as u32, ea_rel_kind(ea), s.clone(), *a))
+        .into_iter()
+        .collect()
 }
 
 fn one(w: u16) -> M68kEnc {
-    M68kEnc { words: vec![w], reloc: None }
+    M68kEnc { words: vec![w], relocs: vec![] }
 }
 
 /// opcode + a single source EA's extension words.
 fn with_src(op: u16, ea: &Ea) -> M68kEnc {
     let mut words = vec![op];
     words.extend_from_slice(&ea.ext);
-    M68kEnc { words, reloc: shift_reloc(ea, 1) }
+    M68kEnc { words, relocs: shift_reloc(ea, 1) }
 }
 
 /// MOVE: opcode + source ext + dest ext (source first).
 fn assemble_words(op: u16, s: &Ea, d: &Ea) -> M68kEnc {
     let mut words = vec![op];
     words.extend_from_slice(&s.ext);
-    let reloc = s
-        .reloc
-        .as_ref()
-        .map(|(sym, a)| (1u32, ea_rel_kind(s), sym.clone(), *a))
-        .or_else(|| {
-            d.reloc
-                .as_ref()
-                .map(|(sym, a)| ((1 + s.ext.len()) as u32, ea_rel_kind(d), sym.clone(), *a))
-        });
+    // BOTH operands may relocate (`move.l sym,sym2`). This used to keep the
+    // source and silently drop the destination.
+    let mut relocs = shift_reloc(s, 1);
+    relocs.extend(shift_reloc(d, 1 + s.ext.len()));
     words.extend_from_slice(&d.ext);
-    M68kEnc { words, reloc }
+    M68kEnc { words, relocs }
 }
 
 fn shift_kind(base: &str) -> Option<(u16, u16)> {
@@ -864,7 +867,7 @@ fn encode_movem(args: &str, sz: Sz, here: u32, asm: &Assembler) -> Result<M68kEn
         let op = 0x4880 | ((long as u16) << 6) | ea.field();
         let mut words = vec![op, m];
         words.extend_from_slice(&ea.ext);
-        return Ok(M68kEnc { words, reloc: None });
+        return Ok(M68kEnc { words, relocs: vec![] });
     }
     if let Some(mask) = reglist_mask(&b) {
         // mem -> reg
@@ -872,7 +875,7 @@ fn encode_movem(args: &str, sz: Sz, here: u32, asm: &Assembler) -> Result<M68kEn
         let op = 0x4C80 | ((long as u16) << 6) | ea.field();
         let mut words = vec![op, mask];
         words.extend_from_slice(&ea.ext);
-        return Ok(M68kEnc { words, reloc: None });
+        return Ok(M68kEnc { words, relocs: vec![] });
     }
     Err(msg("movem needs a register list on one side"))
 }
