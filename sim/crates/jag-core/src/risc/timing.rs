@@ -305,6 +305,13 @@ pub struct TimingStats {
     /// counts, because a silently-correct read is how one project shipped a
     /// misaligned vertex array nobody could reproduce off-silicon.
     pub unaligned_risc32: u64,
+    /// Silicon DRAM store->load staleness hits: a same-core load that returned
+    /// the PRE-write value because the posted write had not drained yet — the
+    /// round-trip hazard functional jsim never showed (jag_quake's edge-table
+    /// garble, 2026-08-26). Gated by JAGEMU_DRAM_STALE (window in cycles).
+    pub dram_stale: u64,
+    /// PC of the most recent stale-returning load (the round-trip site to fix).
+    pub dram_stale_pc: u32,
     /// Transfer component of `blit` (phrase-access ticks).
     pub blit_transfer: u64,
     /// Ticks this core spent executing loads of B_CMD that OBSERVED BUSY —
