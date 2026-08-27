@@ -113,6 +113,19 @@ pub struct Risc {
     /// loads or stores is doing work and is visible to any bandwidth model;
     /// the class this counter exists for is the loop that does neither.
     park_touched_mem: bool,
+    /// Silicon DRAM store->load staleness. A ring of recent same-core DRAM
+    /// writes (addr, pre-write value, expiry cycle); a load of one of these
+    /// within its window returns the pre-write value, as silicon does before
+    /// the posted write drains. `dram_stale_win` is the window in cycles;
+    /// 0 disables the model (functional-equivalent). See dread32/dwrite32.
+    posted_wr: [(u32, u32, u64); Self::POSTED_N],
+    posted_head: usize,
+    dram_stale_win: u64,
+    /// Substitute the stale value (JAGEMU_DRAM_STALE_SUBST=1)? Default false:
+    /// COUNT the round trips (a lint) without corrupting the render, because a
+    /// global-window substitution poisons control values silicon tolerates and
+    /// collapses the frame. On only for A/B experiments.
+    dram_stale_subst: bool,
     /// Pending interrupt latches (bits 0-5 = sources). On entry the core pushes
     /// PC to the R31 stack, sets IMASK, and vectors to `sram_base + 16*source`.
     pub int_latch: u32,
@@ -249,6 +262,11 @@ impl Risc {
             park_n: 0,
             park_run: 0,
             park_touched_mem: false,
+            posted_wr: [(0, 0, 0); Self::POSTED_N],
+            posted_head: 0,
+            dram_stale_win: std::env::var("JAGEMU_DRAM_STALE")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+            dram_stale_subst: std::env::var("JAGEMU_DRAM_STALE_SUBST").is_ok(),
             int_latch: 0,
             fidelity: Fidelity::default(),
             pipe: timing::Pipeline::default(),
@@ -328,7 +346,9 @@ impl Risc {
         self.pipe.reset();
         self.prev_was_jump = false;
         self.budget_debt = 0;
-        // fidelity is a harness setting, not machine state: survives reset.
+        self.posted_wr = [(0, 0, 0); Self::POSTED_N];
+        self.posted_head = 0;
+        // fidelity and dram_stale_win are harness settings: survive reset.
     }
 
     /// G_HIDATA as currently *visible*. A LOADP's high long lands with the same
@@ -492,7 +512,33 @@ impl Risc {
             if addr & 3 != 0 {
                 self.pipe.stats.unaligned_risc32 += 1;
             }
-            bus.read32(addr & !3)
+            let a = addr & !3;
+            if self.dram_stale_win != 0
+                && self.fidelity == Fidelity::Silicon
+                && mem::is_dram(a)
+            {
+                // Return the OLDEST still-posted write's pre-write value: that
+                // is what DRAM still holds until the posted write drains.
+                let now = self.cycles;
+                let mut best: Option<(u64, u32)> = None;
+                for &(pa, po, pe) in &self.posted_wr {
+                    if pa == a && pe > now && best.map_or(true, |(be, _)| pe < be) {
+                        best = Some((pe, po));
+                    }
+                }
+                if let Some((_, po)) = best {
+                    // DETECTION (the durable win): count the round trip and
+                    // remember its PC so the offending load can be found in a
+                    // local jsim run instead of via a rig garble. SUBSTITUTION
+                    // is opt-in — a global-window substitution over-corrupts.
+                    self.pipe.stats.dram_stale += 1;
+                    self.pipe.stats.dram_stale_pc = self.pc;
+                    if self.dram_stale_subst {
+                        return po;
+                    }
+                }
+            }
+            bus.read32(a)
         }
     }
 
@@ -536,7 +582,16 @@ impl Risc {
             if addr & 3 != 0 {
                 self.pipe.stats.unaligned_risc32 += 1;
             }
-            bus.write32(addr & !3, val);   // JRISC ignores the low 2 bits
+            let a = addr & !3;
+            if self.dram_stale_win != 0
+                && self.fidelity == Fidelity::Silicon
+                && mem::is_dram(a)
+            {
+                let old = bus.read32(a);   // the value a racing load still sees
+                self.posted_wr[self.posted_head] = (a, old, self.cycles + self.dram_stale_win);
+                self.posted_head = (self.posted_head + 1) % Self::POSTED_N;
+            }
+            bus.write32(a, val);   // JRISC ignores the low 2 bits
         }
     }
 
@@ -655,6 +710,8 @@ impl Risc {
 
     /// Instructions of PC history a park has to recur within.
     const PARK_WINDOW: usize = 8;
+    /// Posted-write ring depth for the Silicon DRAM staleness model.
+    const POSTED_N: usize = 64;
 
     /// ── PARKED-WITH-GO DETECTOR ─────────────────────────────────────────────
     /// A core still issuing instructions from a handful of recurring PCs, and
@@ -1180,6 +1237,59 @@ mod tests {
         gpu.fidelity = fid;
         gpu.run(&mut bus, budget);
         (bus, gpu)
+    }
+
+    /// DRAM store->load round-trip staleness (jag_quake edge-table garble,
+    /// 2026-08-26). A same-core load of a DRAM address written within the
+    /// window returns the PRE-write value on silicon; jsim landed it instantly
+    /// and hid the bug. The model COUNTS the round trip always (a lint) and
+    /// substitutes the stale value only when opted in.
+    #[test]
+    fn dram_store_load_roundtrip_is_stale() {
+        // movei #$00100000,r1 ; store r2(=7),(r1) ; load (r1),r3 ; store r3,($104)
+        let prog = [
+            enc(35, 7, 2),                 // moveq #7,r2
+            enc(38, 0, 1), 0x0000, 0x0010, // movei #$00100000,r1
+            enc(47, 1, 2),                 // store r2,(r1)   -> posts the write
+            enc(41, 1, 3),                 // load (r1),r3    -> reads it back
+            enc(38, 0, 4), 0x0004, 0x0010, // movei #$00100004,r4
+            enc(47, 4, 3),                 // store r3,(r4)
+            enc(57, 0, 0),
+        ];
+        // Backing DRAM already holds 99 at the address: a stale read sees 99.
+        // Substitution ON: the load returns the pre-write value (99), counted.
+        {
+            let mut bus = Bus::new();
+            bus.write32(0x0010_0000, 99);
+            for (i, &w) in prog.iter().enumerate() {
+                bus.write16(mem::G_RAM + (i as u32) * 2, w);
+            }
+            bus.write32(mem::G_PC, mem::G_RAM);
+            bus.write32(mem::G_CTRL, mem::RISCGO);
+            let mut gpu = Risc::new(RiscKind::Gpu);
+            gpu.fidelity = Fidelity::Silicon;
+            gpu.dram_stale_win = 1000;
+            gpu.dram_stale_subst = true;
+            gpu.run(&mut bus, 32);
+            assert_eq!(bus.read32(0x0010_0004), 99, "stale read should see the pre-write value");
+            assert_eq!(gpu.pipe.stats.dram_stale, 1, "the round trip must be counted");
+        }
+        // Substitution OFF (default): the value is fresh (7) but still COUNTED.
+        {
+            let mut bus = Bus::new();
+            bus.write32(0x0010_0000, 99);
+            for (i, &w) in prog.iter().enumerate() {
+                bus.write16(mem::G_RAM + (i as u32) * 2, w);
+            }
+            bus.write32(mem::G_PC, mem::G_RAM);
+            bus.write32(mem::G_CTRL, mem::RISCGO);
+            let mut gpu = Risc::new(RiscKind::Gpu);
+            gpu.fidelity = Fidelity::Silicon;
+            gpu.dram_stale_win = 1000;
+            gpu.run(&mut bus, 32);
+            assert_eq!(bus.read32(0x0010_0004), 7, "count-only mode must not corrupt the value");
+            assert_eq!(gpu.pipe.stats.dram_stale, 1, "the round trip is still detected");
+        }
     }
 
     /// A dependent ALU pair pays exactly the one-cycle bubble (TRM p.62);
