@@ -1866,6 +1866,17 @@ fn cmd_serve(args: &[String]) -> Result<(), String> {
     let fid = fidelity_arg(args)?;
     jag.gpu.fidelity = fid;
     jag.dsp.fidelity = fid;
+    // ☠ AND `serve` HONORS `--audio` FOR THE SAME REASON THE ONE-SHOT COMMANDS
+    // DO. The DSP's I2S interrupt is only ticked while audio capture is on, so
+    // without this a served session runs the 68000 and the GPU normally while
+    // the DSP spins forever in its I2S wait. Every peek then reports a sound
+    // kernel that reads its parameters and writes nothing back — which reads
+    // exactly like a broken kernel, and is not one.
+    AUDIO_ON.store(
+        has_flag(args, "--audio"),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    apply_audio(&mut jag);
     let entry = cart.entry;
 
     println!(
