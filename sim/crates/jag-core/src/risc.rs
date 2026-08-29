@@ -85,6 +85,15 @@ pub struct Risc {
     pub running: bool,
     pub cycles: u64,
     pub instret: u64,
+    /// ☠☠ STORE→LOAD ROUND-TRIP DETECTOR (jag_quake, 2026-08-23). On silicon
+    /// a JRISC load from a DRAM word the SAME core stored moments earlier can
+    /// return 0/stale under bus traffic (jaguar-shared notes, three confirmed
+    /// kills: nin, GATHN, and the wall-death's nout — the last one ran a loop
+    /// bound off garbage and swept all of DRAM). jsim's bus lands stores
+    /// instantly, so the pattern is INVISIBLE here without this: a ring of the
+    /// core's recent external stores, checked by every external 32-bit load.
+    pub recent_stores: [(u32, u64); 8],
+    pub recent_stores_idx: usize,
     /// Deferred jump target from a JUMP/JR (applied after the delay slot).
     pub pending_jump: Option<u32>,
     /// Sliding window for the parked-with-GO detector (see
@@ -155,6 +164,61 @@ pub struct Risc {
 }
 
 impl Risc {
+    /// Record an external 32-bit store for the round-trip detector.
+    #[inline]
+    pub fn note_ext_store(&mut self, addr: u32) {
+        if addr < 0x0020_0000 {
+            self.recent_stores[self.recent_stores_idx] = (addr & !3, self.cycles);
+            self.recent_stores_idx = (self.recent_stores_idx + 1) & 7;
+        }
+    }
+    /// Flag an external 32-bit load that re-reads a word this core stored
+    /// within the hazard window. Counts + keeps PCs; silicon returns stale
+    /// data here, jsim does not — so this is a detector, not a model.
+    #[inline]
+    pub fn check_ext_load(&mut self, addr: u32) {
+        if addr >= 0x0020_0000 {
+            return;
+        }
+        let a = addr & !3;
+        for i in 0..self.recent_stores.len() {
+            let (sa, sc) = self.recent_stores[i];
+            if sa == a {
+                // Consume the entry: one hit per STORE, so a poll loop that
+                // re-reads a flag it wrote counts once, not once per read.
+                self.recent_stores[i] = (0xFFFF_FFFF, 0);
+                let gap = self.cycles.saturating_sub(sc);
+                if gap <= 4096 {
+                    let pc = self.pc;
+                    let st = &mut self.pipe.stats;
+                    if st.store_load_roundtrips == 0 {
+                        st.store_load_first_pc = pc;
+                        st.store_load_min_gap = gap;
+                    }
+                    if gap < st.store_load_min_gap {
+                        st.store_load_min_gap = gap;
+                    }
+                    st.store_load_last_pc = pc;
+                    st.store_load_last_addr = a;
+                    st.store_load_roundtrips += 1;
+                    // Per-site aggregation (addr+PC), first 8 distinct sites:
+                    // the actionable half of the report.
+                    for e in st.store_load_sites.iter_mut() {
+                        if e.2 == 0 {
+                            *e = (a, pc, 1);
+                            break;
+                        }
+                        if e.0 == a && e.1 == pc {
+                            e.2 += 1;
+                            break;
+                        }
+                    }
+                }
+                return;
+            }
+        }
+    }
+
     pub fn new(kind: RiscKind) -> Self {
         Risc {
             kind,
@@ -174,6 +238,8 @@ impl Risc {
             running: false,
             cycles: 0,
             instret: 0,
+            recent_stores: [(0xFFFF_FFFF, 0); 8],
+            recent_stores_idx: 0,
             pending_jump: None,
             park_ring: [u32::MAX; Self::PARK_WINDOW],
             park_n: 0,
@@ -222,6 +288,18 @@ impl Risc {
             self.kind.sram_base(),
             self.kind.sram_size(),
         )));
+    }
+
+    /// Count a byte/word access that targets this core's own SRAM (see
+    /// `TimingStats::narrow_sram`).
+    pub fn note_narrow_sram(&mut self, a: u32) {
+        let b = self.kind.sram_base();
+        if a >= b && a < b + self.kind.sram_size() {
+            if self.pipe.stats.narrow_sram == 0 {
+                self.pipe.stats.narrow_sram_first_pc = self.pc;
+            }
+            self.pipe.stats.narrow_sram += 1;
+        }
     }
 
     pub fn reset(&mut self) {
@@ -382,6 +460,7 @@ impl Risc {
     /// resolve to this struct's authoritative fields; everything else goes to
     /// the bus (which routes SRAM/DRAM/cart correctly).
     fn dread32(&mut self, bus: &mut Bus, addr: u32) -> u32 {
+        self.check_ext_load(addr);
         let base = self.kind.ctrl_base();
         if (base..base + 0x40).contains(&addr) {
             match addr - base {
@@ -405,6 +484,7 @@ impl Risc {
     }
 
     fn dwrite32(&mut self, bus: &mut Bus, addr: u32, val: u32) {
+        self.note_ext_store(addr);
         let base = self.kind.ctrl_base();
         if (base..base + 0x40).contains(&addr) {
             match addr - base {
@@ -1508,6 +1588,34 @@ mod tests {
             "the taken jump's refill lands on its delay slot"
         );
         assert_eq!(p.total.jump_refill, gpu.pipe.stats.jump_refill);
+    }
+
+    /// A store→load of the same DRAM word by the same core must be COUNTED:
+    /// silicon can return 0/stale there under bus traffic (nin, GATHN, and the
+    /// wall-death's runaway nout, jag_quake 2026-08); jsim lands stores
+    /// instantly so only the counter makes the pattern visible. Register
+    /// round trips (chip-register addresses) and distant reloads don't count.
+    #[test]
+    fn store_load_roundtrip_is_counted() {
+        let mut core = Risc::new(RiscKind::Gpu);
+        core.cycles = 1000;
+        core.note_ext_store(0x0001_5184);      // DRAM word
+        core.cycles = 1030;
+        core.check_ext_load(0x0001_5184);      // reload 30 cycles later
+        assert_eq!(core.pipe.stats.store_load_roundtrips, 1, "round trip must count");
+        assert_eq!(core.pipe.stats.store_load_last_addr, 0x0001_5184);
+        assert_eq!(core.pipe.stats.store_load_min_gap, 30);
+
+        core.check_ext_load(0x0001_5188);      // different word: no count
+        assert_eq!(core.pipe.stats.store_load_roundtrips, 1);
+
+        core.cycles = 1000 + 10_000;
+        core.check_ext_load(0x0001_5184);      // far outside the window
+        assert_eq!(core.pipe.stats.store_load_roundtrips, 1, "distant reload is fine");
+
+        core.note_ext_store(0x00F1_CFFC);      // Jerry-local SRAM: never tracked
+        core.check_ext_load(0x00F1_CFFC);
+        assert_eq!(core.pipe.stats.store_load_roundtrips, 1, "local SRAM is safe");
     }
 
     /// A zero divisor must be COUNTED. jsim answers 0xFFFFFFFF and continues,

@@ -311,6 +311,29 @@ pub struct TimingStats {
     /// wrong in a new way. Counting it is enough to convert a 195-second flash
     /// plus a power-cycle into a line of output.
     pub div_by_zero: u64,
+    /// Byte/word (LOADB/LOADW/STOREB/STOREW) accesses by a JRISC core to its
+    /// OWN local SRAM. Silicon's GPU/DSP RAM takes 32-bit accesses only — a
+    /// narrow write never lands and a narrow read is undefined — while jsim
+    /// models byte-addressable SRAM and happily executes them (jag_quake
+    /// 2026-08-24: a 16-bit histogram in Jerry SRAM sorted perfectly here
+    /// and killed the console in 14 s). Counted, first PC kept.
+    pub narrow_sram: u64,
+    pub narrow_sram_first_pc: u32,
+    /// PC of the FIRST zero-divisor DIV and of the most recent one — the half
+    /// of the count you can act on (jag_quake 2026-08-22: "70 DIVs by zero"
+    /// with no site is a day of bisecting; with the PC it is one `grep`).
+    pub div_by_zero_first_pc: u32,
+    pub div_by_zero_last_pc: u32,
+    /// Store→load same-DRAM-word round trips within the hazard window (see
+    /// `Risc::check_ext_load`): silicon returns 0/stale there, jsim cannot.
+    pub store_load_roundtrips: u64,
+    pub store_load_first_pc: u32,
+    pub store_load_last_pc: u32,
+    pub store_load_last_addr: u32,
+    pub store_load_min_gap: u64,
+    /// First 8 distinct (addr, load PC, count) round-trip sites — the
+    /// actionable list; the counter alone was a number without a fix.
+    pub store_load_sites: [(u32, u32, u64); 32],
 }
 
 impl TimingStats {

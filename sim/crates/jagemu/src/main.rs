@@ -318,9 +318,41 @@ fn report_hazard_diagnostics(jag: &Jaguar) {
                  returns 0xFFFFFFFF and continues; real silicon does NOT, and a kernel \
                  that divides by zero has black-screened a Jaguar while rendering fine \
                  here. Silicon's exact behaviour is unmeasured, so this is reported, not \
-                 modelled — but treat a nonzero count as a hardware failure.",
-                t.div_by_zero
+                 modelled — but treat a nonzero count as a hardware failure. \
+                 First at PC ${:06X}, last at PC ${:06X}.",
+                t.div_by_zero, t.div_by_zero_first_pc, t.div_by_zero_last_pc
             );
+        }
+    }
+    for (name, t) in [("Tom GPU", &jag.gpu.pipe.stats), ("Jerry DSP", &jag.dsp.pipe.stats)] {
+        if t.narrow_sram > 0 {
+            eprintln!(
+                "jagemu: WARNING — {name} made {} byte/word (LOADB/LOADW/STOREB/STOREW) access(es) \
+                 to its OWN local SRAM (first at PC ${:06X}). Silicon's GPU/DSP RAM takes 32-bit \
+                 accesses ONLY: a narrow write never lands and a narrow read is undefined. jsim \
+                 models byte-addressable SRAM and executed them as if they worked — a 16-bit \
+                 histogram in Jerry SRAM sorted perfectly here and killed the console in 14 s \
+                 (jag_quake 2026-08-24). Use LOAD/STORE (32-bit) on local RAM.",
+                t.narrow_sram, t.narrow_sram_first_pc
+            );
+        }
+    }
+    for (name, t) in [("Tom GPU", &jag.gpu.pipe.stats), ("Jerry DSP", &jag.dsp.pipe.stats)] {
+        if t.store_load_roundtrips > 0 {
+            eprintln!(
+                "jagemu: WARNING — {name} performed {} store->load round trip(s) on the same \
+                 DRAM word within the hazard window (min gap {} cycles). On real silicon that \
+                 load can return 0/stale under bus traffic (three confirmed kills: nin, GATHN, \
+                 and the wall-death's nout — a garbage LOOP BOUND that swept all of DRAM). jsim \
+                 lands stores instantly, so the value read here is always fresh and the bug is \
+                 invisible. Keep the value in a register or local SRAM. First at PC ${:06X}, \
+                 last at PC ${:06X}, last addr ${:06X}.",
+                t.store_load_roundtrips, t.store_load_min_gap,
+                t.store_load_first_pc, t.store_load_last_pc, t.store_load_last_addr
+            );
+            for &(a, pc, n) in t.store_load_sites.iter().filter(|e| e.2 > 0) {
+                eprintln!("jagemu:     round-trip site: addr ${a:06X} load PC ${pc:06X} x{n}");
+            }
         }
     }
     for (name, c) in [("Tom GPU", &jag.gpu), ("Jerry DSP", &jag.dsp)] {
@@ -2130,6 +2162,7 @@ fn state_json(jag: &Jaguar) -> String {
          \"dsp\":{{\"running\":{},\"instret\":{},\"cycles\":{},\"timing\":{},\
          \"flags\":\"0x{:08X}\",\"regs0\":[{}],\"regs1\":[{}]}},\
          \"blitter\":{{\"bcmd_busy_reads\":{},\"bcmd_poll_in_settle\":{}}},\"risc_ram_narrow_writes\":{},\
+         \"op\":{{\"scaled_misaligned_hits\":{},\"scaled_misaligned_addr\":\"0x{:06X}\",\"bitmap_misaligned_hits\":{}}},\
          \"d\":[{}],\"a\":[{}]}}",
         jag.frame(),
         cpu.pc,
@@ -2200,6 +2233,10 @@ fn state_json(jag: &Jaguar) -> String {
         jag.bus.bcmd_busy_reads.load(std::sync::atomic::Ordering::Relaxed),
         jag.bus.bcmd_poll_in_settle.load(std::sync::atomic::Ordering::Relaxed),
         jag.bus.risc_ram_narrow_writes,
+        // OP object-alignment faults (jag_quake A10 lottery, 2026-08-22).
+        jag.bus.tom.op.scaled_misaligned_hits,
+        jag.bus.tom.op.scaled_misaligned_addr,
+        jag.bus.tom.op.bitmap_misaligned_hits,
         dregs.join(","),
         aregs.join(",")
     )
@@ -2213,7 +2250,7 @@ fn timing_json(t: &TimingStats) -> String {
          \"stall_div_busy\":{},\"jump_refill\":{},\"fetch_external\":{},\"mem_external\":{},\
          \"waw_hazards\":{},\"indexed_store_stale\":{},\"slot_movei\":{},\"slot_jump\":{},\
          \"bigpemu_divergence\":{},\"contention\":{},\"blit\":{},\
-         \"unaligned_risc32\":{},\"blit_count\":{},\"blit_launch\":{},\"blit_transfer\":{},\"blit_wait\":{},\"div_by_zero\":{},\"park_spin_max\":{}}}",
+         \"unaligned_risc32\":{},\"blit_count\":{},\"blit_launch\":{},\"blit_transfer\":{},\"blit_wait\":{},\"div_by_zero\":{},\"div_by_zero_first_pc\":\"0x{:06X}\",\"div_by_zero_last_pc\":\"0x{:06X}\",\"store_load_roundtrips\":{},\"store_load_first_pc\":\"0x{:06X}\",\"store_load_last_pc\":\"0x{:06X}\",\"store_load_last_addr\":\"0x{:06X}\",\"store_load_min_gap\":{},\"park_spin_max\":{}}}",
         t.stall_alu,
         t.stall_load,
         t.stall_div,
@@ -2235,6 +2272,13 @@ fn timing_json(t: &TimingStats) -> String {
         t.blit_transfer,
         t.blit_wait,
         t.div_by_zero,
+        t.div_by_zero_first_pc,
+        t.div_by_zero_last_pc,
+        t.store_load_roundtrips,
+        t.store_load_first_pc,
+        t.store_load_last_pc,
+        t.store_load_last_addr,
+        t.store_load_min_gap,
         t.park_spin_max,
     )
 }

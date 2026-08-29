@@ -308,7 +308,7 @@ pub fn write(out: &Assembled) -> Result<Vec<u8>, String> {
         sec_size(Section::Text) as usize,
         0,
         0,
-        8,
+        out.sec_align[Section::Text.idx()].max(8),
         0,
     );
     // 2: .rela.text
@@ -335,7 +335,7 @@ pub fn write(out: &Assembled) -> Result<Vec<u8>, String> {
         sec_size(Section::Data) as usize,
         0,
         0,
-        16,
+        out.sec_align[Section::Data.idx()].max(16),
         0,
     );
     // 4: .rela.data
@@ -361,7 +361,7 @@ pub fn write(out: &Assembled) -> Result<Vec<u8>, String> {
         sec_size(Section::Bss) as usize,
         0,
         0,
-        16,
+        out.sec_align[Section::Bss.idx()].max(16),
         0,
     );
     // 6: .symtab

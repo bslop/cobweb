@@ -620,6 +620,80 @@ fn elf_obj_folds_equ_constants_not_relocs() {
 }
 
 #[test]
+fn elf_obj_mem_to_mem_move_relocates_both_operands() {
+    // `move.l src,dst+20` has TWO relocatable operands. The encoder carried
+    // ONE reloc per instruction and preferred the source, so the destination
+    // was emitted as its bare addend: jag_openlara's `move.l fs_ph5,op_list+20`
+    // became a store to absolute $14 (2026-08-26). Every mem-to-mem global copy
+    // in a jcc68k translation unit wrote into the 68000 exception vectors, the
+    // OP list stayed zero, and the display was black on every PADTEXT roll.
+    let src = "\t.68000\n\
+        \t.text\n\
+        \t.extern src\n\
+        \t.extern dst\n\
+        entry:\n\
+        \tmove.l src,dst+20\n";
+    let opts = Options { org: 0x4000, start_m68k: true, object_mode: true, relocatable: true, check_hazards: false, ..Default::default() };
+    let out = assemble(src, &opts);
+    assert_eq!(out.errors(), 0, "{:#?}", out.diags);
+    let bytes = jas::elf::write(&out).expect("elf");
+    let e = Elf { b: &bytes };
+    // move.l (abs).l,(abs).l = op 2 + src abs.l 4 + dst abs.l 4
+    let (_, _, toff, tsz) = e.sh(1);
+    assert_eq!(tsz, 10, ".text size");
+    assert_eq!(&bytes[toff + 2..toff + 6], &[0, 0, 0, 0], "source placeholder");
+    assert_eq!(&bytes[toff + 6..toff + 10], &[0, 0, 0, 0x14], "destination placeholder carries the addend");
+    // TWO relocs: offset 2 (src) and offset 6 (dst)
+    let (ty, _, roff, rsz) = e.sh(2);
+    assert_eq!((ty, rsz), (4, 24), "two RELA entries");
+    let r_off = |i: usize| u32::from_be_bytes(bytes[roff + i * 12..roff + i * 12 + 4].try_into().unwrap());
+    let mut offs = vec![r_off(0), r_off(1)];
+    offs.sort();
+    assert_eq!(offs, vec![2, 6], "relocs at the source AND destination longs");
+}
+
+#[test]
+fn elf_obj_align_is_section_relative_and_raises_addralign() {
+    // `.align N` in object mode must align the SECTION-RELATIVE offset and
+    // raise that section's sh_addralign to N. It used to align the absolute
+    // blob PC while .bss kept addralign 16: a .bss opened at 16 mod 32 put an
+    // `.align 32` symbol at section offset 16, and the linker was free to
+    // land the section at 16 mod 32 anyway. jag_openlara's OP list needed 32
+    // (the OP fetches a scaled object as one 32-byte burst) and got the A10
+    // boot lottery instead (2026-08-26).
+    let src = "\t.68000\n\
+        \t.text\n\
+        \tnop\n\
+        \t.align 16\n\
+        \t.bss\n\
+        \t.align 32\n\
+        \t.globl first\n\
+        first:\n\
+        \t.ds.b 4\n\
+        \t.align 32\n\
+        \t.globl second\n\
+        second:\n\
+        \t.ds.b 4\n";
+    let opts = Options { org: 0x4000, start_m68k: true, object_mode: true, relocatable: true, check_hazards: false, ..Default::default() };
+    let out = assemble(src, &opts);
+    assert_eq!(out.errors(), 0, "{:#?}", out.diags);
+    // .bss opened at blob offset 16 (16 mod 32): section-relative alignment
+    // must put `first` at 0 and `second` at 32, not 16 and 48.
+    let bss_start = out.sections.iter().find(|(s, _)| *s == jas::Section::Bss).map(|&(_, o)| o).expect("bss span");
+    assert_eq!(bss_start % 32, 16, "test shape: .bss must open at 16 mod 32 in the blob");
+    let off = |n: &str| out.symbols[n] - (opts.org + bss_start);
+    assert_eq!(off("first"), 0, "first symbol at section offset 0");
+    assert_eq!(off("second"), 32, "second symbol at section offset 32");
+    assert_eq!(out.sec_align[jas::Section::Bss.idx()], 32);
+    let bytes = jas::elf::write(&out).expect("elf");
+    let e = Elf { b: &bytes };
+    // .bss is section header 5; addralign is at +32 in the 40-byte header
+    let shoff = e.u32(32) as usize;
+    assert_eq!(e.u32(shoff + 5 * 40 + 32), 32, ".bss sh_addralign raised to 32");
+    assert_eq!(e.u32(shoff + 1 * 40 + 32), 16, ".text sh_addralign = its .align 16");
+}
+
+#[test]
 fn elf_obj_rejects_jrisc_movei_reloc() {
     // A JRISC MOVEI of an extern has no ELF relocation type — must be a clear
     // error, not silent corruption.

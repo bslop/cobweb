@@ -6,6 +6,93 @@ assigned at release.
 
 ## Unreleased
 
+### 2026-08-26 — jas: object-mode `.align` is SECTION-relative and raises `sh_addralign`
+
+- `.align N` / `.balign N` aligned the ABSOLUTE blob PC, and `.text/.data/.bss`
+  headers carried fixed `sh_addralign` (8/16/16). Sections are cut out of one
+  flat blob, so a `.bss` that opened 16 mod 32 put an `.align 32` symbol at
+  **section offset 16**, and the linker was free to place the section at
+  16 mod 32 regardless. `jag_openlara`'s OP list needs 32 (the OP fetches a
+  scaled object as one 32-byte burst, cobweb `905188f`) — `aligned(32)` in C
+  produced `op_list` at 0x38410, and the project fell back to defining the
+  symbol in its linker script.
+- In object mode `align_to` now pads relative to the current section's start
+  and records the largest request per section; `elf.rs` writes
+  `max(default, requested)` as `sh_addralign`. Flat images (`--gpu`, `--68000`
+  without `--elf-obj`) are unchanged: absolute alignment is right when the
+  image is the address space. `.align`/`.balign` route through `align_to`
+  (they had private loops). Regression test
+  `elf_obj_align_is_section_relative_and_raises_addralign` covers the exact
+  16-mod-32 shape.
+
+
+### 2026-08-26 — jas: a memory-to-memory MOVE dropped its DESTINATION relocation
+
+- **`move.l sym,sym2+N` emitted ONE reloc — the source's — and encoded the
+  destination as its bare addend.** `M68kEnc` carried a single
+  `Option<reloc>` and `assemble_words` did `src.or_else(dst)`. Every
+  global-to-global copy jcc68k emits (`fs_ph1 = op_list[1]` →
+  `move.l op_list+4,fs_ph1`) became a store to absolute `$0`..`$34` — the
+  68000 exception vector table. In `jag_openlara` that left the OP-list
+  shadow words zero, so the vblank ISR rebuilt a height-0 object every field
+  and the screen was BLACK on every PADTEXT roll; 24 such sites in the
+  shipping ROM (`objdump -d | grep 23f9` with a destination below `$4000`
+  finds them). Surfaced the day `video.c` moved from gcc onto jcc68k; the
+  ROM that still rendered had been built with `GCCHOT=1`.
+- `M68kEnc.reloc` is now `relocs: Vec<…>`; `shift_reloc` returns a list and
+  the MOVE path keeps both operands. Regression test
+  `elf_obj_mem_to_mem_move_relocates_both_operands` (two RELA entries, at the
+  source AND destination longs). Verified on the real ROM: 0 dropped
+  destinations, the shadow words populate, the display comes up.
+
+
+### 2026-08-23 — jsim: store→load same-DRAM-word round-trip detector
+
+- On silicon a JRISC load from a DRAM word the same core stored moments
+  earlier can return 0/stale under bus traffic. Three confirmed kills in
+  jag_quake (nin, GATHN, and the wall-death's nout — a garbage LOOP BOUND
+  that swept all of DRAM); jsim lands stores instantly, so the pattern was
+  invisible here. Each core now keeps a ring of its recent external stores;
+  an external 32-bit load of the same word within 4096 cycles counts, with
+  the load PC. One hit per store (a poll loop re-reading a flag it wrote
+  counts once). End-of-run WARNING lists up to 8 distinct (addr, PC, count)
+  sites; state JSON carries the counters. First audit of jag_quake's
+  kernels: 16 sites, ~1M raw hits.
+- Regression test `store_load_roundtrip_is_counted` (counts, dedup by
+  store, window, local-SRAM exemption).
+
+### 2026-08-22 — jsim: zero-divisor DIVs now report their PC
+
+- `TimingStats::div_by_zero_first_pc` / `div_by_zero_last_pc`; the end-of-run
+  WARNING names both, and the state JSON carries them. jag_quake's wall-death
+  (silicon-only, "turn toward a wall and die") was a `div` by a zero `|dt|`
+  in Jerry's v-run cap: the count alone had been visible for a day; the PC
+  found the site in one grep.
+
+### 2026-08-22 — jsim: OP SCALED objects need 32-byte alignment (the "A10 / PADTEXT boot lottery")
+
+- **HARDWARE** (jag_quake, wtS 993c1a2): the OP fetches a SCALED bitmap object
+  as one 4-phrase burst and dies if it straddles a 32-byte boundary — black
+  first field, hung machine. Only the object's ADDRESS matters, so the same
+  ROM boots or hangs by link layout alone (16 mod 32 dead, 0 mod 32 fine;
+  exact across every PADTEXT value ever rolled, two of which had never booted
+  in any build). jsim drew every dead layout perfectly for months and so
+  exonerated the bug — the build boots in jsim was the whole reason the hunt
+  went through bus races, loader quirks and kernel alignment first.
+- `tom.rs` `op_walk_line`: a TYPE-1 object at a non-32-aligned address now
+  ends the walk before drawing (black, as silicon), counts the hit
+  (`OpState::scaled_misaligned_hits`, first address in
+  `scaled_misaligned_addr`) and prints ONE `jsim: ☠ OP SCALED object at $…
+  is N-mod-32` line naming the address. Plain BITMAP objects at non-16
+  addresses are counted (`bitmap_misaligned_hits`; silicon draws them on
+  alternate fields only), not modelled.
+- `jagemu` state JSON: new `"op":{scaled_misaligned_hits, scaled_misaligned_addr,
+  bitmap_misaligned_hits}`.
+- Regression guard: `op_scaled_object_needs_32_byte_alignment` — 0 mod 32
+  draws, 16 mod 32 is black and counted. Controls on the real ROMs: the
+  pre-fix jag_quake pad-0 build now renders black with the warning; the
+  pad-272 build and the fixed build report 0 hits and render.
+
 ### 2026-07-27 — silicon: JRISC DIV truncates (jsim faithful)
 
 - **`calib` `p_divround`**, authored and flashed same day. Six cases where

@@ -55,6 +55,14 @@ pub enum Section {
 }
 
 impl Section {
+    /// index into per-section tables (`Assembled::sec_align`)
+    pub fn idx(self) -> usize {
+        match self {
+            Section::Text => 0,
+            Section::Data => 1,
+            Section::Bss => 2,
+        }
+    }
     pub fn name(self) -> &'static str {
         match self {
             Section::Text => ".text",
@@ -129,6 +137,10 @@ pub struct Assembled {
     /// Section marks: (section, byte offset where it starts). Consecutive marks
     /// of the same section are merged; always begins with (Text, 0).
     pub sections: Vec<(Section, u32)>,
+    /// Largest `.align` requested inside each section (Text, Data, Bss) — the
+    /// ELF writer raises `sh_addralign` to it so the LINKER honours what the
+    /// source asked for. 0 = nothing beyond the section default.
+    pub sec_align: [u32; 3],
     /// Names bound by *labels* (addresses in a section) as opposed to `equ`
     /// constants — object writers need the distinction (ELF `SHN_ABS`).
     pub label_syms: HashSet<String>,
@@ -293,6 +305,15 @@ struct Assembler<'a> {
     suppressed: std::collections::HashSet<usize>,
     /// section switch points (pass 2): (section, byte offset)
     sec_marks: Vec<(Section, u32)>,
+    /// section we are currently emitting into, and the PC where it began —
+    /// object-mode `.align` is taken RELATIVE TO THE SECTION START, not the
+    /// blob origin: sections are cut out of one flat blob and relocated by
+    /// the linker, so an absolute alignment is meaningless once linked.
+    /// (jag_openlara 2026-08-26: `.align 32` in a .bss that opened 16 mod 32
+    /// in the blob put `op_list` at section offset 16 — the A10 boot lottery.)
+    cur_sec: Section,
+    sec_start_pc: u32,
+    sec_align: [u32; 3],
     /// symbols defined as labels (vs `equ` constants)
     label_syms: HashSet<String>,
     pass: u8,
@@ -320,6 +341,9 @@ impl<'a> Assembler<'a> {
             m68k_mode: opts.start_m68k,
             suppressed: HashSet::new(),
             sec_marks: vec![(Section::Text, 0)],
+            cur_sec: Section::Text,
+            sec_start_pc: 0,
+            sec_align: [0; 3],
             label_syms: HashSet::new(),
             pass: 0,
         }
@@ -340,6 +364,9 @@ impl<'a> Assembler<'a> {
             self.ccaliases.clear();
             self.relocs.clear();
             self.m68k_mode = self.opts.start_m68k;
+            self.cur_sec = Section::Text;
+            self.sec_start_pc = self.pc;
+            self.sec_align = [0; 3];
             if pass == 2 {
                 self.emitted.clear();
                 self.bytes.clear();
@@ -389,6 +416,7 @@ impl<'a> Assembler<'a> {
             suppressed: self.suppressed.into_iter().collect(),
             diags: self.diags,
             sections,
+            sec_align: self.sec_align,
             label_syms: self.label_syms,
         }
     }
@@ -584,20 +612,14 @@ impl<'a> Assembler<'a> {
             ".byte" | "dc.b" | ".dc.b" => self.emit_data_checked(line, 1, false, &opl),
             ".align" => {
                 if let Some(v) = self.eval_or_err(line.args, line.n) {
-                    let a = v.max(1);
-                    while self.pc % a != 0 {
-                        self.put_byte(0, line);
-                    }
+                    self.align_to(v.max(1), line);
                 }
             }
             // GAS `.balign N` aligns the PC to an N-*byte* boundary (same as our
             // `.align` — jas's align is byte-granular, not power-of-two-exponent).
             ".balign" => {
                 if let Some(v) = self.eval_or_err(line.args, line.n) {
-                    let a = v.max(1);
-                    while self.pc % a != 0 {
-                        self.put_byte(0, line);
-                    }
+                    self.align_to(v.max(1), line);
                 }
             }
             // GAS `.section NAME [,flags]` — mapped onto the three base sections
@@ -698,10 +720,26 @@ impl<'a> Assembler<'a> {
         if self.pass == 2 {
             self.sec_marks.push((sec, self.bytes.len() as u32));
         }
+        if sec != self.cur_sec {
+            self.cur_sec = sec;
+            self.sec_start_pc = self.pc;
+        }
     }
 
     fn align_to(&mut self, a: u32, line: &Line) {
-        while self.pc % a != 0 {
+        // Flat images: absolute alignment (the image IS the address space).
+        // Object mode: relative to the section start, and remember the
+        // request so the ELF section header carries it to the linker.
+        let base = if self.opts.object_mode {
+            let i = self.cur_sec.idx();
+            if a > self.sec_align[i] {
+                self.sec_align[i] = a;
+            }
+            self.sec_start_pc
+        } else {
+            0
+        };
+        while self.pc.wrapping_sub(base) % a != 0 {
             self.put_byte(0, line);
         }
     }
@@ -907,7 +945,7 @@ impl<'a> Assembler<'a> {
             for w in &enc.words {
                 self.bytes.extend_from_slice(&w.to_be_bytes());
             }
-            if let Some((woff, kind, symbol, addend)) = enc.reloc {
+            for (woff, kind, symbol, addend) in enc.relocs {
                 self.relocs.push(Reloc { offset: base + woff * 2, kind, symbol, addend });
             }
             self.emitted.push(Emitted {
