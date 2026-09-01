@@ -440,6 +440,8 @@ pub enum Master {
     Gpu,
     Dsp,
     Blitter,
+    /// The Object Processor's header write-back (list self-modify).
+    Op,
     /// Host-side pokes (ROM load, debugger) — not machine activity.
     Host,
 }
@@ -451,6 +453,7 @@ impl Master {
             Master::Gpu => "gpu",
             Master::Dsp => "dsp",
             Master::Blitter => "blitter",
+            Master::Op => "op",
             Master::Host => "host",
         }
     }
@@ -529,7 +532,7 @@ impl Bus {
     /// Log `addr` if it falls in a watched range (called by every write path;
     /// the empty-vec check keeps the unwatched hot path to one branch).
     #[inline]
-    fn watch_note(&mut self, addr: u32, size: u8, value: u32) {
+    pub(crate) fn watch_note(&mut self, addr: u32, size: u8, value: u32) {
         if self.watches.is_empty() || self.watch_suppress > 0 {
             return;
         }

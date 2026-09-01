@@ -1190,6 +1190,16 @@ fn peek32(bus: &Bus, addr: u32) -> u32 {
 fn poke32_dram(bus: &mut Bus, addr: u32, v: u32) {
     let a = addr & crate::bus::ADDR_MASK;
     if mem::is_dram(a) && a + 3 < mem::DRAM_END {
+        // ☠ THIS PATH WAS INVISIBLE TO THE WATCHPOINT. The OP's header
+        // write-back mutates DRAM directly (deliberately, to stay out of the
+        // 68000's bus accounting) — but a watch armed over a region the OP
+        // scribbles into then reports "no writer" while the memory changes,
+        // which is exactly the shape that sent a hunt after a phantom zeroer
+        // in jag_s3k. Attribute the write to the OP and log it.
+        let saved = bus.cur_master;
+        bus.cur_master = crate::bus::Master::Op;
+        bus.watch_note(a, 32, v);
+        bus.cur_master = saved;
         bus.dram[a as usize..a as usize + 4].copy_from_slice(&v.to_be_bytes());
     }
 }
