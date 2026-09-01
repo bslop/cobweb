@@ -727,10 +727,22 @@ impl<'a> Assembler<'a> {
     }
 
     fn align_to(&mut self, a: u32, line: &Line) {
-        // Flat images: absolute alignment (the image IS the address space).
-        // Object mode: relative to the section start, and remember the
-        // request so the ELF section header carries it to the linker.
-        let base = if self.opts.object_mode {
+        // RELOCATABLE output: relative to the section start, and remember the
+        // request so the ELF section header carries it to the linker -- the
+        // linker is free to place the section anywhere, so an absolute
+        // alignment computed here is meaningless once linked.
+        //
+        // Everything else -- flat images AND a PINNED object (`-c` without
+        // `-r`/`--elf-obj`, which jln places at exactly its assembled `.org`)
+        // -- aligns ABSOLUTELY, because the assembled PC is the address the
+        // bytes will occupy and that is what the source is asking about.
+        // BEWARE: keying this on `object_mode` instead broke jag_soniccd: `.dphrase`
+        // before `_op_list` is there because Tom's OP fetches a BITMAP object
+        // as one 16-BYTE BURST and misreads a list at N-mod-16.  Section-
+        // relative alignment moved that list from $09AC70 (0 mod 16) to
+        // $09AC6E (14 mod 16) -- the exact fault that defeated three earlier
+        // attempts at OP compositing in that project.
+        let base = if self.opts.relocatable {
             let i = self.cur_sec.idx();
             if a > self.sec_align[i] {
                 self.sec_align[i] = a;

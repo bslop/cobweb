@@ -694,6 +694,43 @@ fn elf_obj_align_is_section_relative_and_raises_addralign() {
 }
 
 #[test]
+fn pinned_object_align_stays_ABSOLUTE() {
+    // The other direction of the test above, and the reason it matters.
+    //
+    // `-c` WITHOUT `-r`/`--elf-obj` emits a PINNED object: jln places it at
+    // exactly its assembled `.org`, so the assembled PC IS the final address
+    // and `.align` must be taken against it. Section-relative alignment here
+    // is not merely useless, it is WRONG.
+    //
+    // jag_soniccd (2026-09-01): `bss.s` puts `.dphrase` immediately before
+    // `_op_list` because Tom's OP fetches a BITMAP object as one 16-byte
+    // burst and misreads a list that is not 16-byte aligned. Keying the
+    // section-relative rule on `object_mode` (rather than `relocatable`)
+    // moved that list from $09AC70 to $09AC6E -- 14 mod 16 -- reintroducing
+    // the fault that had defeated three earlier attempts at OP compositing
+    // in that project.
+    let src = "\t.68000\n\
+        \t.text\n\
+        \tnop\n\
+        \tnop\n\
+        \tnop\n\
+        \t.bss\n\
+        \t.align 16\n\
+        \t.globl pinned\n\
+        pinned:\n\
+        \t.ds.b 4\n";
+    let opts = Options { org: 0x4000, start_m68k: true, object_mode: true, relocatable: false, check_hazards: false, ..Default::default() };
+    let out = assemble(src, &opts);
+    assert_eq!(out.errors(), 0, "{:#?}", out.diags);
+    let bss_start = out.sections.iter().find(|(s, _)| *s == jas::Section::Bss).map(|&(_, o)| o).expect("bss span");
+    assert_eq!(bss_start % 16, 6, "test shape: .bss must open at 6 mod 16 in the blob");
+    // Absolute alignment: 0x4006 rounds up to 0x4010, not to section start+16
+    // ($4016) which is what the section-relative rule would give.
+    assert_eq!(out.symbols["pinned"], 0x4010, "pinned object aligns the ABSOLUTE pc");
+    assert_eq!(out.symbols["pinned"] % 16, 0, "and the address is genuinely 16-aligned");
+}
+
+#[test]
 fn elf_obj_rejects_jrisc_movei_reloc() {
     // A JRISC MOVEI of an extern has no ELF relocation type — must be a clear
     // error, not silent corruption.
