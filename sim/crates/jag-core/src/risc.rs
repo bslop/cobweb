@@ -368,7 +368,16 @@ impl Risc {
         let source = 31 - active.leading_zeros(); // highest priority first
         let sp = self.regs[0][31].wrapping_sub(4);
         self.regs[0][31] = sp;
-        bus.write32(sp, self.pc);
+        // Hardware pushes the resume PC MINUS 2: every silicon-proven ISR
+        // (Varuna's Forces disassembly; the shared homebrew player in four
+        // projects) ends `addq #2,r30; jump (r30)`, so the pushed value must
+        // be resume-2 or that +2 overshoots. Pushing the exact resume PC
+        // worked for kernels that idle in 2-byte spin instructions (skipping
+        // one nop is invisible) and derailed the first kernel that takes
+        // interrupts over real code (jag_resident 2026-08-31: +2 landed mid-
+        // movei immediate, the core wandered into DRAM and halted while the
+        // ISR kept playing).
+        bus.write32(sp, self.pc.wrapping_sub(2));
         self.flags |= mem::IMASK;
         self.pc = self.kind.sram_base() + 16 * source;
         true
