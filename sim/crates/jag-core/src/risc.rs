@@ -63,6 +63,9 @@ pub struct Risc {
     /// 64 registers: two banks of 32 (REGPAGE / IMASK select).
     pub regs: [[u32; 32]; 2],
     pub pc: u32,
+    /// Nonzero while inside the post-REGPAGE-flip settle window (see
+    /// `Stats::regpage_hazard`); counts down per instruction.
+    regpage_settle: u8,
     /// Full flags register: Z/C/N at bits 0/1/2, IMASK bit 3, REGPAGE bit 14, …
     pub flags: u32,
     pub ctrl: u32,
@@ -241,6 +244,7 @@ impl Risc {
             recent_stores: [(0xFFFF_FFFF, 0); 8],
             recent_stores_idx: 0,
             pending_jump: None,
+            regpage_settle: 0,
             park_ring: [u32::MAX; Self::PARK_WINDOW],
             park_n: 0,
             park_run: 0,
@@ -502,6 +506,11 @@ impl Risc {
                     // and read back as 0.
                     let clr = (val >> 9) & 0x1F;
                     self.int_latch &= !clr;
+                    if (self.flags ^ val) & mem::REGPAGE != 0 && self.running {
+                        // Silicon flips the bank with a delay; the next few
+                        // instructions run on a mixed bank (see Stats).
+                        self.regpage_settle = 3;
+                    }
                     self.flags = val & !(0x1F << 9);
                 }
                 0x04 => self.mtxc = val,
@@ -708,6 +717,10 @@ impl Risc {
             self.step_timed(bus, in_slot)
         };
         self.instret += 1;
+        if self.regpage_settle > 0 {
+            self.regpage_settle -= 1;
+            self.pipe.stats.regpage_hazard += 1;
+        }
         // Park detection runs AFTER the step, so the decode below has already
         // flagged whether this instruction touched external memory.
         self.note_park(pc0);
