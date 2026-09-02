@@ -2162,7 +2162,7 @@ fn state_json(jag: &Jaguar) -> String {
          \"dsp\":{{\"running\":{},\"instret\":{},\"cycles\":{},\"timing\":{},\
          \"flags\":\"0x{:08X}\",\"regs0\":[{}],\"regs1\":[{}]}},\
          \"blitter\":{{\"bcmd_busy_reads\":{},\"bcmd_poll_in_settle\":{}}},\"risc_ram_narrow_writes\":{},\
-         \"op\":{{\"scaled_misaligned_hits\":{},\"scaled_misaligned_addr\":\"0x{:06X}\",\"bitmap_misaligned_hits\":{}}},\
+         \"op\":{{\"scaled_misaligned_hits\":{},\"scaled_misaligned_addr\":\"0x{:06X}\",\"bitmap_misaligned_hits\":{},\"bitmap_misaligned_addr\":\"0x{:06X}\",\"bitmap_misaligned_last\":\"0x{:06X}\"}},\
          \"d\":[{}],\"a\":[{}]}}",
         jag.frame(),
         cpu.pc,
@@ -2237,6 +2237,8 @@ fn state_json(jag: &Jaguar) -> String {
         jag.bus.tom.op.scaled_misaligned_hits,
         jag.bus.tom.op.scaled_misaligned_addr,
         jag.bus.tom.op.bitmap_misaligned_hits,
+        jag.bus.tom.op.bitmap_misaligned_addr,
+        jag.bus.tom.op.bitmap_misaligned_last,
         dregs.join(","),
         aregs.join(",")
     )
@@ -2248,7 +2250,7 @@ fn timing_json(t: &TimingStats) -> String {
     format!(
         "{{\"stall_alu\":{},\"stall_load\":{},\"stall_div\":{},\"stall_flags\":{},\
          \"stall_div_busy\":{},\"jump_refill\":{},\"fetch_external\":{},\"mem_external\":{},\
-         \"waw_hazards\":{},\"indexed_store_stale\":{},\"slot_movei\":{},\"slot_jump\":{},\
+         \"waw_hazards\":{},\"regpage_hazard\":{},\"indexed_store_stale\":{},\"slot_movei\":{},\"slot_jump\":{},\
          \"bigpemu_divergence\":{},\"contention\":{},\"blit\":{},\
          \"unaligned_risc32\":{},\"blit_count\":{},\"blit_launch\":{},\"blit_transfer\":{},\"blit_wait\":{},\"div_by_zero\":{},\"div_by_zero_first_pc\":\"0x{:06X}\",\"div_by_zero_last_pc\":\"0x{:06X}\",\"store_load_roundtrips\":{},\"store_load_first_pc\":\"0x{:06X}\",\"store_load_last_pc\":\"0x{:06X}\",\"store_load_last_addr\":\"0x{:06X}\",\"store_load_min_gap\":{},\"park_spin_max\":{}}}",
         t.stall_alu,
@@ -2260,6 +2262,7 @@ fn timing_json(t: &TimingStats) -> String {
         t.fetch_external,
         t.mem_external,
         t.waw_hazards,
+        t.regpage_hazard,
         t.indexed_store_stale,
         t.slot_movei,
         t.slot_jump,

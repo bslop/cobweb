@@ -6,6 +6,38 @@ assigned at release.
 
 ## Unreleased
 
+### 2026-09-01 — jas: section-relative `.align` is for RELOCATABLE objects only
+
+- `9da2f99` made object-mode `.align` section-relative, keyed on
+  `object_mode`. But `-c` alone emits a **PINNED** object — jas's own
+  `Options::relocatable` doc says *"Off by default (an object then pins to its
+  assembled `.org`)"* — and jln places it at exactly that org. For a pinned
+  object the assembled PC **is** the final address, so section-relative
+  alignment is not merely useless, it is wrong. That commit's own note said
+  flat-style builds were "unchanged"; the condition was broader than the
+  intent.
+- **Caught by jag_soniccd within minutes of pulling.** `bss.s` puts
+  `.dphrase` immediately before `_op_list` because Tom's OP fetches a BITMAP
+  object as one 16-byte burst and misreads a list that is not 16-byte
+  aligned. The change moved that list from `$09AC70` (0 mod 16) to `$09AC6E`
+  (**14 mod 16**) — the exact fault that defeated three separate attempts at
+  OP compositing in that project (its runs 23-25, found in run 26). The
+  assembler reported no warning and the build succeeded.
+- `align_to` now keys on `relocatable`. Flat images and pinned objects align
+  absolutely; `-r`/`--elf-obj` output stays section-relative and still raises
+  `sh_addralign`, so `9da2f99`'s jag_openlara fix is untouched (that build is
+  `--elf-obj`, which implies `-r`).
+- Regression test `pinned_object_align_stays_ABSOLUTE` — a `.bss` opening at
+  6 mod 16 with `.align 16`, asserting the symbol lands on the absolute
+  boundary. Proven to BLOCK: with the condition put back to `object_mode` it
+  fails `left: 16390, right: 16400`. The existing
+  `elf_obj_align_is_section_relative_and_raises_addralign` covers the other
+  direction and is unchanged.
+- Control: with this fix, jag_soniccd's cart is **byte-identical** to its
+  pre-pull build across all ten new commits — which is what a toolchain
+  update should do to a project none of it was aimed at.
+
+
 ### 2026-08-26 — jas: object-mode `.align` is SECTION-relative and raises `sh_addralign`
 
 - `.align N` / `.balign N` aligned the ABSOLUTE blob PC, and `.text/.data/.bss`

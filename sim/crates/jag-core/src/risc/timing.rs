@@ -220,6 +220,14 @@ pub struct TimingStats {
     /// Bug-13 write-after-write hazards (a write raced a pending load/div).
     /// Under `Silicon` the slow value lands last, as on hardware.
     pub waw_hazards: u64,
+    /// Register-touching instructions executed inside the 3-instruction
+    /// settle window after a store to the core's own FLAGS register changed
+    /// REGPAGE. Silicon applies the bank flip with a short delay, so these
+    /// instructions run on an UNPREDICTABLE bank (jag_resident 2026-08-31:
+    /// a movei one after the flip and a jump two after used different banks
+    /// and the DSP walked into DRAM - amber panic on hardware, clean in
+    /// jsim). Seed cross-bank data with moveta BEFORE the flip.
+    pub regpage_hazard: u64,
     /// Indexed stores that read a stale DATA register (TRM errata §2).
     pub indexed_store_stale: u64,
     /// MOVEI executed in a delay slot (forbidden by the scheduling handbook;

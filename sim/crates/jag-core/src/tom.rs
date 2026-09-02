@@ -174,6 +174,16 @@ pub struct OpState {
     /// Plain BITMAP objects need 16 (double-phrase): an 8-mod-16 object drew
     /// on alternate fields only (jag_quake, 2026-08-13). Counted per walk, not modelled.
     pub bitmap_misaligned_hits: u64,
+    /// ...and WHERE, first offender kept, exactly as the scaled counter does.
+    /// Without it the count answers "how often" and never "which object", which
+    /// is the only question that leads anywhere: jag_sonic2 2026-09-02 spent a
+    /// run narrowing 109,329 hits by rebuilding the ROM under one variable at a
+    /// time, when the address would have named the object immediately.
+    pub bitmap_misaligned_addr: u32,
+    /// ...and the LAST, because the first is almost always boot residue: the OP
+    /// walks whatever the BIOS left in OLP before the platform owns it, so the
+    /// first offender names the BIOS and the last names YOU.
+    pub bitmap_misaligned_last: u32,
 }
 
 impl Default for OpState {
@@ -189,6 +199,8 @@ impl Default for OpState {
             phrases_per_line: 0,
             scaled_misaligned_hits: 0,
             scaled_misaligned_addr: 0,
+            bitmap_misaligned_addr: 0,
+            bitmap_misaligned_last: 0,
             bitmap_misaligned_hits: 0,
         }
     }
@@ -662,6 +674,10 @@ fn op_walk_line(
                     break;
                 }
                 if o.otype == 0 && (addr8 & 15) != 0 {
+                    if bus.tom.op.bitmap_misaligned_hits == 0 {
+                        bus.tom.op.bitmap_misaligned_addr = addr8;
+                    }
+                    bus.tom.op.bitmap_misaligned_last = addr8;
                     bus.tom.op.bitmap_misaligned_hits += 1;
                 }
                 // Draw from the object's CURRENT DATA pointer and write the

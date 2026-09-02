@@ -63,6 +63,9 @@ pub struct Risc {
     /// 64 registers: two banks of 32 (REGPAGE / IMASK select).
     pub regs: [[u32; 32]; 2],
     pub pc: u32,
+    /// Nonzero while inside the post-REGPAGE-flip settle window (see
+    /// `Stats::regpage_hazard`); counts down per instruction.
+    regpage_settle: u8,
     /// Full flags register: Z/C/N at bits 0/1/2, IMASK bit 3, REGPAGE bit 14, …
     pub flags: u32,
     pub ctrl: u32,
@@ -241,6 +244,7 @@ impl Risc {
             recent_stores: [(0xFFFF_FFFF, 0); 8],
             recent_stores_idx: 0,
             pending_jump: None,
+            regpage_settle: 0,
             park_ring: [u32::MAX; Self::PARK_WINDOW],
             park_n: 0,
             park_run: 0,
@@ -368,7 +372,16 @@ impl Risc {
         let source = 31 - active.leading_zeros(); // highest priority first
         let sp = self.regs[0][31].wrapping_sub(4);
         self.regs[0][31] = sp;
-        bus.write32(sp, self.pc);
+        // Hardware pushes the resume PC MINUS 2: every silicon-proven ISR
+        // (Varuna's Forces disassembly; the shared homebrew player in four
+        // projects) ends `addq #2,r30; jump (r30)`, so the pushed value must
+        // be resume-2 or that +2 overshoots. Pushing the exact resume PC
+        // worked for kernels that idle in 2-byte spin instructions (skipping
+        // one nop is invisible) and derailed the first kernel that takes
+        // interrupts over real code (jag_resident 2026-08-31: +2 landed mid-
+        // movei immediate, the core wandered into DRAM and halted while the
+        // ISR kept playing).
+        bus.write32(sp, self.pc.wrapping_sub(2));
         self.flags |= mem::IMASK;
         self.pc = self.kind.sram_base() + 16 * source;
         true
@@ -493,6 +506,11 @@ impl Risc {
                     // and read back as 0.
                     let clr = (val >> 9) & 0x1F;
                     self.int_latch &= !clr;
+                    if (self.flags ^ val) & mem::REGPAGE != 0 && self.running {
+                        // Silicon flips the bank with a delay; the next few
+                        // instructions run on a mixed bank (see Stats).
+                        self.regpage_settle = 3;
+                    }
                     self.flags = val & !(0x1F << 9);
                 }
                 0x04 => self.mtxc = val,
@@ -699,6 +717,10 @@ impl Risc {
             self.step_timed(bus, in_slot)
         };
         self.instret += 1;
+        if self.regpage_settle > 0 {
+            self.regpage_settle -= 1;
+            self.pipe.stats.regpage_hazard += 1;
+        }
         // Park detection runs AFTER the step, so the decode below has already
         // flagged whether this instruction touched external memory.
         self.note_park(pc0);
