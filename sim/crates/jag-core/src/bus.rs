@@ -411,6 +411,12 @@ impl Default for Bus {
 
 impl Bus {
     pub fn new() -> Self {
+        let mut b = Self::build();
+        b.poison_coproc_sram();
+        b
+    }
+
+    fn build() -> Self {
         Bus {
             m68k_on_bus: true,
             m68k_dram_cycles: 0,
@@ -525,24 +531,51 @@ impl Bus {
     /// Seed DRAM at reset. Zero by default (matching every emulator); set
     /// `JAGEMU_DRAM_POISON` to a hex byte (e.g. `A5`) or `random` to emulate a
     /// cold real Jaguar, whose DRAM contains whatever it contains.
-    fn init_dram() -> Box<[u8]> {
-        let mut d = vec![0u8; mem::DRAM_SIZE];
+    /// The poison byte stream, shared by DRAM and the coprocessor SRAMs.
+    /// Returns None when JAGEMU_DRAM_POISON is unset (the default: zeroed).
+    pub fn poison_fill(buf: &mut [u8]) -> bool {
         match std::env::var("JAGEMU_DRAM_POISON") {
             Ok(v) if v.eq_ignore_ascii_case("random") => {
-                // xorshift64*, seeded fixed so a repro is REPRODUCIBLE
                 let mut s: u64 = 0x9E3779B97F4A7C15;
-                for b in d.iter_mut() {
+                for b in buf.iter_mut() {
                     s ^= s << 13; s ^= s >> 7; s ^= s << 17;
                     *b = (s >> 33) as u8;
                 }
+                true
             }
             Ok(v) => {
-                if let Ok(byte) = u8::from_str_radix(v.trim_start_matches("0x"), 16) {
-                    d.iter_mut().for_each(|b| *b = byte);
+                match u8::from_str_radix(v.trim_start_matches("0x"), 16) {
+                    Ok(byte) => { buf.iter_mut().for_each(|b| *b = byte); true }
+                    Err(_) => false,
                 }
             }
-            Err(_) => {}
+            Err(_) => false,
         }
+    }
+
+    /// ☠ POISON THE COPROCESSOR SRAMs TOO, NOT JUST DRAM.
+    /// GPU SRAM ($F03000) and DSP RAM ($F1B000) power up arbitrary on real
+    /// silicon and zeroed here, and a BENIGN initial value is worse than a
+    /// hostile one: it makes a whole class structurally invisible offline
+    /// however many frames you run. jag_s3k spent a day on a 14%-black-boot
+    /// rate that was the DSP being started before its voice state existed —
+    /// the kernel loaded a garbage per-voice body ADDRESS and jumped through
+    /// it. Its guard was a LOWER bound (`cmp #fm_alg0`), and zero is below
+    /// that bound, so with zeroed SRAM the guard ALWAYS caught it and the race
+    /// was always safe in emulation. Only registers are left alone.
+    fn poison_coproc_sram(&mut self) {
+        let mut buf = vec![0u8; mem::G_RAM_SIZE.max(mem::D_RAM_SIZE)];
+        if !Self::poison_fill(&mut buf) { return; }
+        for (base, size) in [(mem::G_RAM, mem::G_RAM_SIZE), (mem::D_RAM, mem::D_RAM_SIZE)] {
+            for i in 0..size {
+                self.poke(base + i as u32, &buf[i..i + 1]);
+            }
+        }
+    }
+
+    fn init_dram() -> Box<[u8]> {
+        let mut d = vec![0u8; mem::DRAM_SIZE];
+        Self::poison_fill(&mut d);
         d.into_boxed_slice()
     }
 
