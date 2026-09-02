@@ -198,10 +198,77 @@ pub struct Tom {
     pub blit_settle_faithful: bool,
 }
 
+/// ☠ A COPROCESSOR STARTED BEFORE ITS STATE IS WRITTEN RUNS ON POWER-UP GARBAGE.
+///
+/// Real Tom and Jerry power up with arbitrary SRAM; every emulator boots it to
+/// zero. So anything a kernel READS BEFORE IT WRITES reads a benign 0 offline
+/// and noise on silicon — the whole class is structurally invisible here, and a
+/// benign initial value is worse than a hostile one because it makes the defect
+/// nondeterministic rather than reproducible. `jag_s3k` lost a day to a **14%
+/// boot rate** from exactly this: its DSP started ~40 instructions before the
+/// voice blocks were cleared, harmless while those fields were data and fatal
+/// once a later change made one a jump target.
+///
+/// `JAGEMU_DRAM_POISON` covers main memory. This is the coprocessors' own
+/// SRAM, which is where kernel state and jump targets live.
+///
+/// ⭐ THE TWO ARE DELIBERATELY SEPARATE KNOBS, not one. They test different
+/// things — DRAM poison exercises the CPU's initialisation of shared
+/// structures, SRAM poison exercises kernel START-UP ORDERING — and, more
+/// usefully, **when a poisoned run fails you need to know which memory did
+/// it**. One combined flag hands you a failure with two candidate causes;
+/// two flags bisect it in a single extra run. Nothing stops setting both.
+/// (Both share `poison_fill` so they cannot drift apart.)
+///
+///   JAGEMU_SRAM_POISON=<hex byte>   fill GPU $F03000-$F03FFF and
+///   JAGEMU_SRAM_POISON=random       DSP $F1B000-$F1CFFF with that byte, or
+///                                   from a fixed-seed xorshift64* so a repro
+///                                   stays reproducible.
+///
+/// Registers are NOT poisoned — only the two SRAM ranges. Default unchanged.
+/// ⚠ An intermittent boot is a first-class suspect for an uninitialised
+/// coprocessor read; try this before blaming the hardware.
+fn sram_poison_spec() -> Option<String> {
+    std::env::var("JAGEMU_SRAM_POISON").ok().filter(|v| !v.is_empty())
+}
+
+/// Fill a byte range from a poison spec. Shared so the DRAM and SRAM poisons
+/// cannot drift apart in how they interpret `random` or a hex byte — one
+/// stream, two callers.
+///
+/// `salt` varies the sequence per region, so poisoned DRAM and poisoned SRAM
+/// do not hold the same bytes at the same offsets (which would let a
+/// pointer-sized read of one look valid against the other).
+pub fn poison_fill(dst: &mut [u8], spec: &str, salt: u32) {
+    if spec.eq_ignore_ascii_case("random") {
+        // xorshift64*, FIXED seed: garbage that is the SAME garbage every run,
+        // so a failure it exposes can be re-run rather than merely observed.
+        let mut x: u64 = 0x9E3779B97F4A7C15 ^ (salt as u64);
+        for b in dst.iter_mut() {
+            x ^= x >> 12; x ^= x << 25; x ^= x >> 27;
+            *b = (x.wrapping_mul(0x2545F4914F6CDD1D) >> 33) as u8;
+        }
+    } else if let Ok(v) = u8::from_str_radix(spec.trim_start_matches("0x"), 16) {
+        // ⚠ `00` is a legal spec and is exactly what an un-poisoned emulator
+        // hands you, so a sweep that only tries 00 is not a test. Use a
+        // non-zero byte AND `random`.
+        dst.fill(v);
+    }
+}
+
+fn poison_range(w: &mut Window, base: u32, len: usize, spec: &str) {
+    let start = (base - w.base) as usize;
+    poison_fill(&mut w.bytes[start..start + len], spec, base);
+}
+
 impl Tom {
     fn new() -> Self {
+        let mut win = Window::new(mem::TOM_BASE, 0x1_0000);
+        if let Some(spec) = sram_poison_spec() {
+            poison_range(&mut win, 0x00F0_3000, 0x1000, &spec);   // GPU SRAM
+        }
         Tom {
-            win: Window::new(mem::TOM_BASE, 0x1_0000),
+            win,
             int1_enable: 0,
             int1_pending: 0,
             fb: crate::tom::Framebuffer::solid(320, 240, 0, 0, 0),
@@ -236,7 +303,11 @@ pub struct Jerry {
 
 impl Jerry {
     fn new() -> Self {
-        Jerry { win: Window::new(mem::JERRY_BASE, 0x1_0000), pads: [0; 2], strobe: 0x81FE }
+        let mut win = Window::new(mem::JERRY_BASE, 0x1_0000);
+        if let Some(spec) = sram_poison_spec() {
+            poison_range(&mut win, 0x00F1_B000, 0x2000, &spec);   // DSP SRAM
+        }
+        Jerry { win, pads: [0; 2], strobe: 0x81FE }
     }
 }
 
