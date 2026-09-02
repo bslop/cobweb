@@ -419,7 +419,17 @@ impl Bus {
             m68k_in_fetch: false,
             m68k_dram_wrote: false,
             m68k_bus_cycles: 0,
-            dram: vec![0u8; mem::DRAM_SIZE].into_boxed_slice(),
+            // ☠ REAL TOM POWERS UP WITH GARBAGE IN DRAM; THIS ZEROES IT.
+            // That difference hides a whole defect class: anything the boot
+            // path READS BEFORE IT WRITES reads 0 here and reads noise on
+            // silicon, so the bug is invisible in emulation and
+            // nondeterministic on hardware. jag_s3k lost a black-screen hunt to
+            // exactly this in run 58 (the OP followed an uninitialised
+            // SPR_OBJS link into raw DRAM) and is chasing a 2-in-3 black-boot
+            // rate that has the same shape.
+            // JAGEMU_DRAM_POISON=<hex byte>|random seeds DRAM instead, so the
+            // class can be reproduced deterministically offline.
+            dram: Self::init_dram(),
             cart: Vec::new(),
             bootrom: Vec::new(),
             tom: Tom::new(),
@@ -512,6 +522,30 @@ impl Bus {
     // ── 8-bit access ────────────────────────────────────────────────────────
 
     #[inline]
+    /// Seed DRAM at reset. Zero by default (matching every emulator); set
+    /// `JAGEMU_DRAM_POISON` to a hex byte (e.g. `A5`) or `random` to emulate a
+    /// cold real Jaguar, whose DRAM contains whatever it contains.
+    fn init_dram() -> Box<[u8]> {
+        let mut d = vec![0u8; mem::DRAM_SIZE];
+        match std::env::var("JAGEMU_DRAM_POISON") {
+            Ok(v) if v.eq_ignore_ascii_case("random") => {
+                // xorshift64*, seeded fixed so a repro is REPRODUCIBLE
+                let mut s: u64 = 0x9E3779B97F4A7C15;
+                for b in d.iter_mut() {
+                    s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+                    *b = (s >> 33) as u8;
+                }
+            }
+            Ok(v) => {
+                if let Ok(byte) = u8::from_str_radix(v.trim_start_matches("0x"), 16) {
+                    d.iter_mut().for_each(|b| *b = byte);
+                }
+            }
+            Err(_) => {}
+        }
+        d.into_boxed_slice()
+    }
+
     pub fn read8(&mut self, addr: u32) -> u8 {
         self.m68k_bus_cycles += 1;
         self.access_count += 1;
