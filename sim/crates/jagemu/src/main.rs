@@ -2151,7 +2151,7 @@ fn state_json(jag: &Jaguar) -> String {
          \"dsp\":{{\"running\":{},\"instret\":{},\"cycles\":{},\"timing\":{},\
          \"flags\":\"0x{:08X}\",\"regs0\":[{}],\"regs1\":[{}]}},\
          \"blitter\":{{\"bcmd_busy_reads\":{},\"bcmd_poll_in_settle\":{}}},\"risc_ram_narrow_writes\":{},\
-         \"op\":{{\"scaled_misaligned_hits\":{},\"scaled_misaligned_addr\":\"0x{:06X}\",\"bitmap_misaligned_hits\":{}}},\
+         \"op\":{{\"scaled_misaligned_hits\":{},\"scaled_misaligned_addr\":\"0x{:06X}\",\"bitmap_misaligned_hits\":{},\"bitmap_misaligned_addr\":\"0x{:06X}\",\"bitmap_misaligned_last\":\"0x{:06X}\"}},\
          \"d\":[{}],\"a\":[{}]}}",
         jag.frame(),
         cpu.pc,
@@ -2226,6 +2226,8 @@ fn state_json(jag: &Jaguar) -> String {
         jag.bus.tom.op.scaled_misaligned_hits,
         jag.bus.tom.op.scaled_misaligned_addr,
         jag.bus.tom.op.bitmap_misaligned_hits,
+        jag.bus.tom.op.bitmap_misaligned_addr,
+        jag.bus.tom.op.bitmap_misaligned_last,
         dregs.join(","),
         aregs.join(",")
     )
