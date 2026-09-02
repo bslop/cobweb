@@ -210,7 +210,15 @@ pub struct Tom {
 /// once a later change made one a jump target.
 ///
 /// `JAGEMU_DRAM_POISON` covers main memory. This is the coprocessors' own
-/// SRAM, which is where kernel state and jump targets live:
+/// SRAM, which is where kernel state and jump targets live.
+///
+/// ⭐ THE TWO ARE DELIBERATELY SEPARATE KNOBS, not one. They test different
+/// things — DRAM poison exercises the CPU's initialisation of shared
+/// structures, SRAM poison exercises kernel START-UP ORDERING — and, more
+/// usefully, **when a poisoned run fails you need to know which memory did
+/// it**. One combined flag hands you a failure with two candidate causes;
+/// two flags bisect it in a single extra run. Nothing stops setting both.
+/// (Both share `poison_fill` so they cannot drift apart.)
 ///
 ///   JAGEMU_SRAM_POISON=<hex byte>   fill GPU $F03000-$F03FFF and
 ///   JAGEMU_SRAM_POISON=random       DSP $F1B000-$F1CFFF with that byte, or
@@ -224,21 +232,33 @@ fn sram_poison_spec() -> Option<String> {
     std::env::var("JAGEMU_SRAM_POISON").ok().filter(|v| !v.is_empty())
 }
 
+/// Fill a byte range from a poison spec. Shared so the DRAM and SRAM poisons
+/// cannot drift apart in how they interpret `random` or a hex byte — one
+/// stream, two callers.
+///
+/// `salt` varies the sequence per region, so poisoned DRAM and poisoned SRAM
+/// do not hold the same bytes at the same offsets (which would let a
+/// pointer-sized read of one look valid against the other).
+pub fn poison_fill(dst: &mut [u8], spec: &str, salt: u32) {
+    if spec.eq_ignore_ascii_case("random") {
+        // xorshift64*, FIXED seed: garbage that is the SAME garbage every run,
+        // so a failure it exposes can be re-run rather than merely observed.
+        let mut x: u64 = 0x9E3779B97F4A7C15 ^ (salt as u64);
+        for b in dst.iter_mut() {
+            x ^= x >> 12; x ^= x << 25; x ^= x >> 27;
+            *b = (x.wrapping_mul(0x2545F4914F6CDD1D) >> 33) as u8;
+        }
+    } else if let Ok(v) = u8::from_str_radix(spec.trim_start_matches("0x"), 16) {
+        // ⚠ `00` is a legal spec and is exactly what an un-poisoned emulator
+        // hands you, so a sweep that only tries 00 is not a test. Use a
+        // non-zero byte AND `random`.
+        dst.fill(v);
+    }
+}
+
 fn poison_range(w: &mut Window, base: u32, len: usize, spec: &str) {
     let start = (base - w.base) as usize;
-    if spec.eq_ignore_ascii_case("random") {
-        // xorshift64*, fixed seed: garbage that is the SAME garbage every run,
-        // so a failure it exposes can be re-run rather than merely observed.
-        let mut x: u64 = 0x9E3779B97F4A7C15 ^ (base as u64);
-        for i in 0..len {
-            x ^= x >> 12; x ^= x << 25; x ^= x >> 27;
-            w.bytes[start + i] = (x.wrapping_mul(0x2545F4914F6CDD1D) >> 33) as u8;
-        }
-    } else if let Ok(b) = u8::from_str_radix(spec.trim_start_matches("0x"), 16) {
-        for i in 0..len {
-            w.bytes[start + i] = b;
-        }
-    }
+    poison_fill(&mut w.bytes[start..start + len], spec, base);
 }
 
 impl Tom {
