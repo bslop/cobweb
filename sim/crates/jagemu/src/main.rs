@@ -2157,9 +2157,9 @@ fn state_json(jag: &Jaguar) -> String {
          \"last_illegal_op\":\"0x{:04X}\",\
          \"m68k_stray_writes\":{},\"m68k_stray_write_addr\":\"0x{:06X}\",\"m68k_stray_write_pc\":\"0x{:06X}\",\"m68k_cart_writes\":{},\
          \"m68k_unaligned\":{},\"m68k_unaligned_addr\":\"0x{:06X}\",\"m68k_unaligned_pc\":\"0x{:06X}\",\"m68k_unaligned_pcs\":[{}],\
-         \"gpu\":{{\"running\":{},\"pc_hex\":{},\"instret\":{},\"cycles\":{},\"granted\":{},\"timing\":{},\
+         \"gpu\":{{\"running\":{},\"pc_hex\":{},\"instret\":{},\"cycles\":{},\"cycles_per_field\":{:.1},\"granted\":{},\"timing\":{},\
          \"flags\":\"0x{:08X}\",\"regs0\":[{}],\"regs1\":[{}]}},\
-         \"dsp\":{{\"running\":{},\"instret\":{},\"cycles\":{},\"timing\":{},\
+         \"dsp\":{{\"running\":{},\"instret\":{},\"cycles\":{},\"cycles_per_field\":{:.1},\"timing\":{},\
          \"flags\":\"0x{:08X}\",\"regs0\":[{}],\"regs1\":[{}]}},\
          \"blitter\":{{\"bcmd_busy_reads\":{},\"bcmd_poll_in_settle\":{}}},\"risc_ram_narrow_writes\":{},\
          \"op\":{{\"scaled_misaligned_hits\":{},\"scaled_misaligned_addr\":\"0x{:06X}\",\"bitmap_misaligned_hits\":{},\"bitmap_misaligned_addr\":\"0x{:06X}\",\"bitmap_misaligned_last\":\"0x{:06X}\"}},\
@@ -2215,6 +2215,20 @@ fn state_json(jag: &Jaguar) -> String {
         jstr(&format!("0x{:06X}", jag.gpu.pc)),
         jag.gpu.instret,
         jag.gpu.cycles,
+        // ⭐ THE CONTINUOUS COST METRIC (2026-09-03, jag_resident).
+        //
+        // A game that publishes a finished buffer on the next field costs a
+        // WHOLE NUMBER of fields per frame, so its frame rate is a step
+        // function and a sub-field change is invisible in it. jag_resident
+        // measured a renderer change at -8.6% on silicon while BOTH arms
+        // reported exactly 15.00 fps here - the emulator was right, the metric
+        // could not resolve the effect, and "it is free" would have survived
+        // review. Cycles per field is the same information WITHOUT the
+        // quantisation: it moved +8.0%, which tracked silicon to 0.6 points.
+        //
+        // Emitted rather than left to be derived because the derivation is the
+        // part people skip.
+        jag.gpu.cycles as f64 / (jag.frame().max(1) as f64),
         jag.gpu.granted,
         timing_json(&jag.gpu.pipe.stats),
         jag.gpu.flags,
@@ -2223,6 +2237,7 @@ fn state_json(jag: &Jaguar) -> String {
         jag.dsp.running,
         jag.dsp.instret,
         jag.dsp.cycles,
+        jag.dsp.cycles as f64 / (jag.frame().max(1) as f64),
         timing_json(&jag.dsp.pipe.stats),
         jag.dsp.flags,
         hexregs(&jag.dsp.regs[0]),
