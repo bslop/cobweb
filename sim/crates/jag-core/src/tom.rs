@@ -283,6 +283,43 @@ pub fn op_render_line(vc: u16, cpu: &mut M68k, gpu: &mut Risc, bus: &mut Bus) {
     let vmode = bus.tom.win.r16(mem::VMODE);
     let fmt = PixFmt::from_vmode(vmode);
 
+    // ☠ PWIDTH IS NOT MODELLED, AND SILENCE ABOUT IT IS THE WHOLE PROBLEM.
+    // VM_PWIDTH_SHIFT/MASK are defined in mem.rs and read nowhere: the pixel
+    // clock does not affect scan-out here, so a ROM that renders N columns and
+    // widens the pixel clock to fill the line produces a screenshot IDENTICAL
+    // to one that does not. That makes any PWIDTH choice UNFALSIFIABLE offline
+    // -- an A/B renders the same picture whatever the hardware would do.
+    //
+    // Deliberately a warning and NOT a model, on the same reasoning as
+    // div_by_zero: the honest fix for an unmeasured behaviour is to say it is
+    // unmeasured. Guessing a stretch factor would make jsim confidently wrong
+    // instead of merely silent, and silicon is cheap to ask -- jag_quake has
+    // shipped PWIDTH 7 since 2026-08-12 and jag_openlara's 160x120 build is
+    // [HW]-confirmed to fill the active line.
+    //
+    // Field 3 is the standard 320 mode; anything else is a deliberate choice
+    // the caller is making blind here, so say so once.
+    {
+        const PWIDTH_DEFAULT: u16 = 3;
+        let pw = (vmode & mem::VM_PWIDTH_MASK) >> mem::VM_PWIDTH_SHIFT;
+        // ☠ GUARD ON "PROGRAMMED", NOT JUST "DIFFERENT". At reset VMODE is 0,
+        // so its PWIDTH field reads 0 -- which is != the default and fired this
+        // warning on EVERY rom during boot, including 320-wide ones that never
+        // touch PWIDTH. Caught by testing the negative case (a default-width
+        // ROM must stay silent), which is the only way a false positive on a
+        // warning ever shows up.
+        let programmed = vmode != 0;
+        if programmed && pw != PWIDTH_DEFAULT && !bus.tom.pwidth_warned {
+            bus.tom.pwidth_warned = true;
+            eprintln!(
+                "jagemu: WARNING - VMODE PWIDTH field is {pw} (default {PWIDTH_DEFAULT}); \
+                 jagemu does NOT model the pixel clock, so the displayed width in \
+                 this run is NOT what silicon would show. A PWIDTH A/B cannot be \
+                 falsified offline - decide it on hardware. (VMODE=${vmode:04X})"
+            );
+        }
+    }
+
     // Size/clear the canvas from the list at the first ACTIVE line, not at
     // half-line 0.
     //

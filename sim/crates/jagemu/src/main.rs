@@ -892,6 +892,33 @@ fn boot_profiled(
         } else {
             eprintln!("  all {} shapes shown (100% of transfer)", rows.len());
         }
+        // ☠ WHAT THIS TABLE DOES NOT COST, stated where the person costing a
+        // fill change will read it.
+        //
+        // A blit's OWN cost is silicon-exact here and the concurrency
+        // accounting is exact to one tick. What is NOT charged is what a blit
+        // costs EVERYONE ELSE: the bus and DRAM-page pressure it puts on the
+        // other masters while it runs. So the transfer ticks above are a fair
+        // measure of the Blitter's work and an UNDER-measure of what removing
+        // that work is worth.
+        //
+        // Measured, jag_openlara 2026-09-05, halving the pixels per span:
+        //     offline (this model)   +7.3% frames
+        //     silicon                +14.1% frames
+        // and the full implementation of the same idea read +16.3%. Nearly 2x.
+        // A pre-declared "must beat +11%" gate would have REJECTED offline a
+        // change that was worth +16% on hardware.
+        //
+        // Deliberately not modelled: one project's ratio is not a coefficient,
+        // and a guessed one makes jsim confidently wrong instead of usefully
+        // silent (the div_by_zero precedent). Treat the number as a floor.
+        eprintln!(
+            "\n  NOTE: a blit's own cost is exact here, but the bus/DRAM-page \
+             pressure it puts on OTHER masters is not charged. A fill-reduction \
+             A/B in this model is therefore a FLOOR, not a ceiling - one measured \
+             case read +7.3% offline and +14.1% on silicon. Decide fill levers on \
+             hardware."
+        );
     }
 
     if let Some(p) = jag.dbg.prof.as_ref() {

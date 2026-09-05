@@ -196,6 +196,9 @@ pub struct Tom {
     /// `bcmd_poll_in_settle` counter reports the condition either way, so the
     /// diagnostic costs nothing and the behaviour change is a deliberate act.
     pub blit_settle_faithful: bool,
+    /// One-shot latch so the PWIDTH "not modelled" warning fires once per run
+    /// rather than once per scanline.
+    pub pwidth_warned: bool,
 }
 
 /// ☠ A COPROCESSOR STARTED BEFORE ITS STATE IS WRITTEN RUNS ON POWER-UP GARBAGE.
@@ -268,6 +271,7 @@ impl Tom {
             poison_range(&mut win, 0x00F0_3000, 0x1000, &spec);   // GPU SRAM
         }
         Tom {
+            pwidth_warned: false,
             win,
             int1_enable: 0,
             int1_pending: 0,
