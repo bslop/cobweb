@@ -290,6 +290,22 @@ static BLIT_TOP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::ne
 /// is invisible to every profiling and watch command. This makes it reachable.
 static AUDIO_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+// ☠ cycles_per_field WAS DIVIDING BY THE WHOLE RUN, BOOT INCLUDED.
+// The counter exists precisely to be the honest cost metric a step-function
+// frame rate hides, so a boot-contaminated value defeats its own purpose:
+// jag_openlara measured 188,754 naive against a true 367,266 steady-state
+// figure -- a 1.9x error, in the number you reach for when fps cannot resolve
+// the effect. --start already defines an armed window for the PC histogram;
+// these snapshot the cycle counters at that same boundary so the derived
+// per-field figures describe the window the user asked for.
+// u64::MAX = "no window armed", in which case the whole-run value stands.
+static PROF_BASE_FRAME: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(u64::MAX);
+static PROF_BASE_GPU_CYC: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static PROF_BASE_DSP_CYC: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 fn apply_audio(jag: &mut Jaguar) {
     if AUDIO_ON.load(std::sync::atomic::Ordering::Relaxed) {
         jag.enable_audio_capture();
@@ -684,6 +700,14 @@ fn boot_profiled(
     // Arm the profilers and accumulate over the [start, start+frames) window.
     // Each core's profiler is independent, so `--core gpu` pays nothing for the
     // 68k's per-instruction bookkeeping and vice versa.
+    // Snapshot the cycle counters at the SAME boundary the profilers arm on, so
+    // cycles_per_field describes the armed window rather than the whole run.
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        PROF_BASE_FRAME.store(jag.frame(), Relaxed);
+        PROF_BASE_GPU_CYC.store(jag.gpu.cycles, Relaxed);
+        PROF_BASE_DSP_CYC.store(jag.dsp.cycles, Relaxed);
+    }
     if cores.m68k {
         jag.dbg.prof = Some(Box::new(jag_core::debug::Profile::new()));
     }
@@ -2145,6 +2169,19 @@ fn cmd_instances(args: &[String]) -> Result<(), String> {
 
 // ── JSON helpers ────────────────────────────────────────────────────────────
 
+/// Cycles per field over the ARMED WINDOW when `--start` set one, else over the
+/// whole run. Boot is tens of thousands of fields of a parked GPU; averaging it
+/// in halves the figure and silently understates every steady-state cost.
+fn per_field(total: u64, base: u64, frame: u64) -> f64 {
+    use std::sync::atomic::Ordering::Relaxed;
+    let bf = PROF_BASE_FRAME.load(Relaxed);
+    if bf != u64::MAX && frame > bf {
+        (total.saturating_sub(base)) as f64 / ((frame - bf) as f64)
+    } else {
+        total as f64 / (frame.max(1) as f64)
+    }
+}
+
 fn state_json(jag: &Jaguar) -> String {
     let cpu = &jag.cpu;
     let dregs: Vec<String> = cpu.d.iter().map(|v| v.to_string()).collect();
@@ -2228,7 +2265,7 @@ fn state_json(jag: &Jaguar) -> String {
         //
         // Emitted rather than left to be derived because the derivation is the
         // part people skip.
-        jag.gpu.cycles as f64 / (jag.frame().max(1) as f64),
+        per_field(jag.gpu.cycles, PROF_BASE_GPU_CYC.load(std::sync::atomic::Ordering::Relaxed), jag.frame()),
         jag.gpu.granted,
         timing_json(&jag.gpu.pipe.stats),
         jag.gpu.flags,
@@ -2237,7 +2274,7 @@ fn state_json(jag: &Jaguar) -> String {
         jag.dsp.running,
         jag.dsp.instret,
         jag.dsp.cycles,
-        jag.dsp.cycles as f64 / (jag.frame().max(1) as f64),
+        per_field(jag.dsp.cycles, PROF_BASE_DSP_CYC.load(std::sync::atomic::Ordering::Relaxed), jag.frame()),
         timing_json(&jag.dsp.pipe.stats),
         jag.dsp.flags,
         hexregs(&jag.dsp.regs[0]),
