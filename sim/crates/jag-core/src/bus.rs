@@ -157,7 +157,11 @@ pub struct Tom {
     /// because the counter being watched belonged to a different population.
     /// Here the master is the one stashed before the Blitter takes over the
     /// bus, so the label is the truth.
-    pub blit_by_master: [(u64, u64, u64); 5],
+    /// Per-master blit accounting, indexed by `Master as usize`.
+    /// ☠ MUST have one slot per `Master` VARIANT. It was sized 5 against a
+    /// 6-variant enum, so a blit issued as `Master::Host` (index 5) panicked
+    /// with an out-of-bounds index -- which is every one of the 13 blit tests.
+    pub blit_by_master: [(u64, u64, u64); Master::COUNT],
     /// Ticks until the in-flight blit completes — the Blitter is ASYNCHRONOUS.
     /// HARDWARE (calib 2026-07-19, 1/2/4/8/256-px probes + OpenLara's NOFILL
     /// delta): per-blit cost matches jsim within ~5% at every span length, yet
@@ -281,7 +285,7 @@ impl Tom {
             last_blit_ticks: 0,
             last_blit_launch: 0,
             blit_shapes: std::collections::HashMap::new(),
-            blit_by_master: [(0, 0, 0); 5],
+            blit_by_master: [(0, 0, 0); Master::COUNT],
             blit_busy: 0,
             blit_settle: 0,
             // Off unless explicitly asked for. Matches the existing
@@ -451,6 +455,10 @@ pub enum Master {
 }
 
 impl Master {
+    /// Number of variants. Anything indexed by `Master as usize` must use this
+    /// rather than a literal, so adding a master cannot silently under-size it.
+    pub const COUNT: usize = 6;
+
     pub fn name(self) -> &'static str {
         match self {
             Master::Cpu => "68k",

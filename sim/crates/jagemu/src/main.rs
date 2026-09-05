@@ -846,11 +846,14 @@ fn boot_profiled(
             if s.0 == 0 {
                 continue;
             }
+            // ☠ Index 4 is Op and index 5 is Host; this used to fold BOTH into
+            // "host", so every OP-issued blit was attributed to the debugger.
             let name = match i {
                 0 => "68000",
                 1 => "Tom",
                 2 => "Jerry",
                 3 => "Blitter",
+                4 => "OP",
                 _ => "host",
             };
             eprintln!("  {:>8} {:>10} {:>14} {:>14}", name, s.0, s.1, s.2);
