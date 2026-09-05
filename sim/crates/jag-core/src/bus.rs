@@ -441,52 +441,51 @@ pub const WATCH_LOG_CAP: usize = 256;
 /// Distinct PCs kept for [`Bus::m68k_unaligned_pcs`].
 pub const UNALIGNED_PC_CAP: usize = 32;
 
-/// A bus master, for watchpoint attribution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Master {
-    Cpu,
-    Gpu,
-    Dsp,
-    Blitter,
-    /// The Object Processor's header write-back (list self-modify).
-    Op,
-    /// Host-side pokes (ROM load, debugger) — not machine activity.
-    Host,
+/// ☠ ONE LIST DEFINES THE ENUM, ITS ORDINALS, ITS TABLE AND ITS NAMES.
+///
+/// This is not stylistic. `blit_by_master` is indexed by `Master as usize`, and
+/// inserting `Op` into the middle of a hand-written enum at `3491b52` renumbered
+/// `Host` 4 -> 5 and under-sized that array — a panic — while simultaneously
+/// handing index 4 to a `_ => "host"` catch-all, mislabelling every OP blit.
+/// Neither dependent site was wrong when written.
+///
+/// ⚠ `ALL` + `COUNT` + an exhaustive `name()` did NOT close it: adding a variant
+/// fails only the `name()` match, and satisfying that compiles clean with `ALL`
+/// still short — verified, the identical panic returns one variant later
+/// ("the len is 6 but the index is 6"). The tie has to be that there is no enum
+/// to edit separately. Add a master HERE or you do not add one at all.
+macro_rules! define_masters {
+    ($( $(#[$attr:meta])* $variant:ident => $label:literal ),+ $(,)?) => {
+        /// A bus master, for watchpoint attribution.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum Master {
+            $( $(#[$attr])* $variant ),+
+        }
+
+        impl Master {
+            /// Every variant, in ordinal order — generated, never hand-written.
+            pub const ALL: &'static [Master] = &[ $(Master::$variant),+ ];
+
+            /// Number of variants. Derived from `ALL`, which is derived from the
+            /// enum, which is the same list. Nothing to keep in sync.
+            pub const COUNT: usize = Self::ALL.len();
+
+            pub fn name(self) -> &'static str {
+                match self { $(Master::$variant => $label),+ }
+            }
+        }
+    };
 }
 
-impl Master {
-    /// Every variant, in ordinal order. `COUNT` derives from it, and anything
-    /// that labels a `Master as usize` index should iterate THIS rather than
-    /// keep a parallel positional table.
-    ///
-    /// ☠ The previous `COUNT: usize = 6` was a hand-written literal with no tie
-    /// to the enum, so it re-admitted the exact bug it was added to close: a
-    /// seventh variant would under-size the array again, silently. Adding a
-    /// variant now fails the exhaustive `name()` match below, and filling that
-    /// in leads here, where a missing entry is an array-length error rather
-    /// than a wrong number at runtime.
-    pub const ALL: [Master; 6] = [
-        Master::Cpu,
-        Master::Gpu,
-        Master::Dsp,
-        Master::Blitter,
-        Master::Op,
-        Master::Host,
-    ];
-
-    /// Number of variants — derived, never written by hand.
-    pub const COUNT: usize = Self::ALL.len();
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Master::Cpu => "68k",
-            Master::Gpu => "gpu",
-            Master::Dsp => "dsp",
-            Master::Blitter => "blitter",
-            Master::Op => "op",
-            Master::Host => "host",
-        }
-    }
+define_masters! {
+    Cpu     => "68k",
+    Gpu     => "gpu",
+    Dsp     => "dsp",
+    Blitter => "blitter",
+    /// The Object Processor's header write-back (list self-modify).
+    Op      => "op",
+    /// Host-side pokes (ROM load, debugger) — not machine activity.
+    Host    => "host",
 }
 
 /// One logged watched write.
