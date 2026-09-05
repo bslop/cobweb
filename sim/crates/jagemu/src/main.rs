@@ -846,16 +846,18 @@ fn boot_profiled(
             if s.0 == 0 {
                 continue;
             }
-            // ☠ Index 4 is Op and index 5 is Host; this used to fold BOTH into
-            // "host", so every OP-issued blit was attributed to the debugger.
-            let name = match i {
-                0 => "68000",
-                1 => "Tom",
-                2 => "Jerry",
-                3 => "Blitter",
-                4 => "OP",
-                _ => "host",
-            };
+            // ☠ NO PARALLEL POSITIONAL TABLE. This was a `match i` with a
+            // catch-all, which silently absorbed Op when it was inserted into
+            // the middle of the enum and labelled every OP blit "host". A
+            // catch-all on a usize is mandatory to compile and therefore
+            // swallows every index added later -- it turns what would have been
+            // a compile error into a wrong label. Routing through Master::name()
+            // means the enum's own exhaustive match is the single source of
+            // truth, and it is already what the watchpoint output uses.
+            let name = jag_core::bus::Master::ALL
+                .get(i)
+                .map(|m| m.name())
+                .unwrap_or("?");
             eprintln!("  {:>8} {:>10} {:>14} {:>14}", name, s.0, s.1, s.2);
         }
         eprintln!("\n=== blit shapes by transfer cost ({} distinct) ===", rows.len());

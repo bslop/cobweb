@@ -455,9 +455,27 @@ pub enum Master {
 }
 
 impl Master {
-    /// Number of variants. Anything indexed by `Master as usize` must use this
-    /// rather than a literal, so adding a master cannot silently under-size it.
-    pub const COUNT: usize = 6;
+    /// Every variant, in ordinal order. `COUNT` derives from it, and anything
+    /// that labels a `Master as usize` index should iterate THIS rather than
+    /// keep a parallel positional table.
+    ///
+    /// ☠ The previous `COUNT: usize = 6` was a hand-written literal with no tie
+    /// to the enum, so it re-admitted the exact bug it was added to close: a
+    /// seventh variant would under-size the array again, silently. Adding a
+    /// variant now fails the exhaustive `name()` match below, and filling that
+    /// in leads here, where a missing entry is an array-length error rather
+    /// than a wrong number at runtime.
+    pub const ALL: [Master; 6] = [
+        Master::Cpu,
+        Master::Gpu,
+        Master::Dsp,
+        Master::Blitter,
+        Master::Op,
+        Master::Host,
+    ];
+
+    /// Number of variants — derived, never written by hand.
+    pub const COUNT: usize = Self::ALL.len();
 
     pub fn name(self) -> &'static str {
         match self {
