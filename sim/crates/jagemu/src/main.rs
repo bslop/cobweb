@@ -918,11 +918,18 @@ fn boot_profiled(
         // and a guessed one makes jsim confidently wrong instead of usefully
         // silent (the div_by_zero precedent). Treat the number as a floor.
         eprintln!(
-            "\n  NOTE: a blit's own cost is exact here, but the bus/DRAM-page \
-             pressure it puts on OTHER masters is not charged. A fill-reduction \
-             A/B in this model is therefore a FLOOR, not a ceiling - one measured \
-             case read +7.3% offline and +14.1% on silicon. Decide fill levers on \
-             hardware."
+            "\n  NOTE: a blit's own cost is exact here, but the bus contention it \
+             imposes on OTHER masters is priced at ZERO. The sign of the error \
+             therefore depends on what your change does:\n    \
+             - REMOVES bus pressure (less fill, fewer accesses): offline is a \
+             FLOOR. Measured +7.3% here vs +14.1% on silicon.\n    \
+             - RELIES ON OVERLAP (scheduling, mode gates, more concurrency): \
+             offline is a CEILING - silicon charges contention for exactly the \
+             accesses you just made coincide. A peer measured +9.3% here vs \
+             +5.0% on silicon.\n  \
+             A cumulative ladder can look well-calibrated while its rungs err in \
+             opposite directions and cancel, so do not fit a flat correction \
+             factor to the total. Decide either kind on hardware."
         );
     }
 
