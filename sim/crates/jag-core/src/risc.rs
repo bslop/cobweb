@@ -871,6 +871,42 @@ impl Risc {
                 let optax = self.pipe.charge_op_tax(bus.tom.op.phrases_per_line);
                 cost += optax;
                 self.pipe.note_dram_stretch(optax as u64);
+
+                // ☠ THE BLITTER IS THE ONE BUS MASTER WHOSE DRAM TRAFFIC IS
+                // CHARGED TO NOBODY ELSE. The OP tax above steals cycles from
+                // both RISCs for scan-out; the 68k row-thrash tax is below;
+                // a blit in flight holds DRAM in exactly the same way and is
+                // free here. A blit's OWN cost is silicon-exact and the
+                // concurrency accounting is exact to one tick -- the gap is
+                // entirely in what it costs everyone else.
+                //
+                // MEASURED CONSEQUENCE (jag_openlara, 2026-09-05): halving the
+                // pixels transferred per span read +7.3% frames offline and
+                // +14.1% on silicon; the full implementation of the same idea
+                // read +16.3%. A fill A/B in this model is a FLOOR, and every
+                // bus-contention lever scored offline carries the same bias --
+                // which matters because that is where this project's real wins
+                // came from (M68A2 +13.9%, HUDTEXT +56%, ENTLISTS +4.1%), each
+                // found one hardware flash at a time because jsim showed ~0.
+                //
+                // ⚠ THE COUNTER IS ON, THE CHARGE IS NOT. One project's single
+                // A/B is not a calibration: it cannot separate a per-access
+                // cost from a per-busy-cycle one, and a guessed coefficient
+                // would move every project's numbers while looking authoritative
+                // (the div_by_zero precedent -- count it, warn about it, do not
+                // model it until silicon has been asked properly). What ships
+                // is the OBSERVABLE, so the effect can be MEASURED instead of
+                // argued about; set blit_tax_milli to calibrate once someone
+                // has run the sweep the OP tax got.
+                if bus.tom.blit_busy > 0 {
+                    self.pipe.stats.dram_under_blit += 1;
+                    let bt = self.pipe.blit_tax_milli;
+                    if bt > 0 {
+                        let tax = (bt / 1000) as u32;
+                        cost += tax;
+                        self.pipe.note_dram_stretch(tax as u64);
+                    }
+                }
             }
         }
 

@@ -276,6 +276,11 @@ pub struct TimingStats {
     pub bigpemu_divergence: u64,
     /// Ticks of 68k bus-contention (row-thrash) tax paid by external accesses.
     pub contention: u64,
+    /// DRAM accesses this core made while a blit held the bus. ☠ An OBSERVABLE,
+    /// not a charge: the Blitter is the only bus master whose DRAM traffic is
+    /// charged to nobody else, and this counts the exposure so it can be
+    /// measured rather than argued about. See `blit_tax_milli`.
+    pub dram_under_blit: u64,
     /// Blitter BUSY ticks (launch + transfer; asynchronous — busy time can
     /// exceed what the frame pays when the kernel overlaps compute).
     /// HARDWARE-CALIBRATED — see `tom::blit` BLIT_* constants. Split below
@@ -359,6 +364,17 @@ impl TimingStats {
 /// Per-core pipeline timing state.
 #[derive(Debug, Default)]
 pub struct Pipeline {
+    /// Milli-cycles charged to ANOTHER master's DRAM access while a blit is in
+    /// flight. **Default 0 — deliberately uncalibrated.**
+    ///
+    /// The gap is real and measured: jag_openlara halved the pixels per span
+    /// and read +7.3% frames here against +14.1% on silicon (+16.3% for the
+    /// full implementation). But one project's single A/B cannot separate a
+    /// per-access cost from a per-busy-cycle one, and a guessed coefficient
+    /// would move every project's numbers while looking authoritative. The OP
+    /// tax next to this one is HARDWARE-CALIBRATED; this should be too before
+    /// it is switched on. Until then `dram_under_blit` measures the exposure.
+    pub blit_tax_milli: u64,
     pend: Vec<Pending>,
     flags_ready: u64,
     div_busy_until: u64,

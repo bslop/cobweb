@@ -2335,7 +2335,7 @@ fn timing_json(t: &TimingStats) -> String {
         "{{\"stall_alu\":{},\"stall_load\":{},\"stall_div\":{},\"stall_flags\":{},\
          \"stall_div_busy\":{},\"jump_refill\":{},\"fetch_external\":{},\"mem_external\":{},\
          \"waw_hazards\":{},\"regpage_hazard\":{},\"indexed_store_stale\":{},\"slot_movei\":{},\"slot_jump\":{},\
-         \"bigpemu_divergence\":{},\"contention\":{},\"blit\":{},\
+         \"bigpemu_divergence\":{},\"contention\":{},\"dram_under_blit\":{},\"blit\":{},\
          \"unaligned_risc32\":{},\"blit_count\":{},\"blit_launch\":{},\"blit_transfer\":{},\"blit_wait\":{},\"div_by_zero\":{},\"div_by_zero_first_pc\":\"0x{:06X}\",\"div_by_zero_last_pc\":\"0x{:06X}\",\"store_load_roundtrips\":{},\"store_load_first_pc\":\"0x{:06X}\",\"store_load_last_pc\":\"0x{:06X}\",\"store_load_last_addr\":\"0x{:06X}\",\"store_load_min_gap\":{},\"park_spin_max\":{}}}",
         t.stall_alu,
         t.stall_load,
@@ -2352,6 +2352,7 @@ fn timing_json(t: &TimingStats) -> String {
         t.slot_jump,
         t.bigpemu_divergence,
         t.contention,
+        t.dram_under_blit,
         t.blit,
         t.unaligned_risc32,
         t.blit_count,
