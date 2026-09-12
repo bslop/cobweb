@@ -1358,8 +1358,18 @@ fn cmd_audio(args: &[String]) -> Result<(), String> {
     let frames = flag_val(args, "--frames").map(parse_u64).transpose()?.unwrap_or(180);
     let (btn, after) = press_args(args)?;
     let out = flag_val(args, "-o").or_else(|| flag_val(args, "--out")).unwrap_or("audio.wav");
+    // ☠ `--fidelity` USED TO BE SILENTLY IGNORED HERE. `jagemu audio` accepted the
+    // flag and produced a byte-identical WAV with and without it, because it
+    // never read it — so every capture came off the no-stall functional machine
+    // while the caller believed they had asked for silicon timing. That is how a
+    // "the audio pump is cheap enough" conclusion gets drawn on a machine where
+    // nothing stalls. Honour it: it is two assignments, and the DSP's cost is
+    // exactly what an audio bring-up needs to measure.
+    let fid = fidelity_arg(args)?;
     let mut jag = Jaguar::new();
     jag.load(&data).map_err(|e| e.to_string())?;
+    jag.gpu.fidelity = fid;
+    jag.dsp.fidelity = fid;
     attach_sd(&mut jag);
     let (rate, samples, wav) = jag_headless::capture_audio(&mut jag, frames, btn, after);
     std::fs::write(out, &wav).map_err(|e| format!("writing {out}: {e}"))?;
@@ -1369,8 +1379,8 @@ fn cmd_audio(args: &[String]) -> Result<(), String> {
         samples.len() / 2, rate, peak, rms
     );
     println!(
-        "{{\"ok\":true,\"path\":{},\"out\":{},\"sample_rate\":{},\"samples\":{},\"peak\":{},\"rms\":{:.1},\"silent\":{}}}",
-        jstr(&path), jstr(out), rate, samples.len() / 2, peak, rms, peak == 0
+        "{{\"ok\":true,\"path\":{},\"out\":{},\"fidelity\":{},\"sample_rate\":{},\"samples\":{},\"peak\":{},\"rms\":{:.1},\"silent\":{}}}",
+        jstr(&path), jstr(out), jstr(fidelity_name(fid)), rate, samples.len() / 2, peak, rms, peak == 0
     );
     Ok(())
 }
