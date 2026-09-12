@@ -426,7 +426,29 @@ pub fn compare(
     let spectral_mae_db =
         na.iter().zip(&nb).map(|(p, q)| (p - q).abs()).sum::<f64>() / na.len() as f64;
 
-    let matches = envelope_correlation > 0.85 && spectral_mae_db < 6.0;
+    // ☠ `matches` USED TO CALL A TONE AND DIGITAL SILENCE A MATCH. Measured: a
+    // 456 Hz square at -12 dBFS against a second of zeros gave envelope
+    // correlation 1.000 and spectral MAE 0.54 dB -> true.
+    //
+    // Both of those terms are level-BLIND by construction. Correlation is
+    // scale-invariant, so a flat envelope correlates perfectly with any other
+    // flat envelope. And `norm` above rescales each spectrum to ITS OWN peak, so
+    // silence and a tone both become "one bin at 0 dB, the rest clamped at -60";
+    // averaged over thousands of bins the handful that differ dilute to well
+    // under the 6 dB bound. Nothing in the pair of tests could see that one
+    // capture had no signal in it at all.
+    //
+    // envelope_mae_db is the absolute-level term, it was already being computed,
+    // and it separates the cases by two orders of magnitude. Measured on this
+    // exact harness:
+    //     identical captures          0.00 dB
+    //     the same tone 6 dB quieter  6.02 dB
+    //     tone vs DIGITAL SILENCE   107.75 dB
+    // 24 dB sits clear of any legitimate level difference and nowhere near
+    // silence. A gate that cannot fail is worse than no gate: this one was about
+    // to bless a silent Jerry audio pump against a working reference.
+    let matches =
+        envelope_correlation > 0.85 && spectral_mae_db < 6.0 && envelope_mae_db < 24.0;
     Ok(Comparison {
         lag_s: lag as f64 * WIN as f64 / rate as f64,
         envelope_correlation,
