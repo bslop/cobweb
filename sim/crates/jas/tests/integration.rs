@@ -484,6 +484,44 @@ fn dsp_target_encodes_dsp_only_ops() {
 }
 
 #[test]
+fn align_zero_fills_by_default_but_can_pad_with_nops() {
+    // ☠ THE TRAP THIS GUARDS. `.align` pads with ZERO bytes, and on JRISC opcode
+    // 0 is `add` — so a zero pad word decodes as `add r0,r0` and EXECUTES. That
+    // is harmless where `.align` is actually used (every site in the corpus
+    // aligns DATA: an .incbin payload, a DSP stack, a dc.l table), and it is
+    // silent corruption when the padding lands between INSTRUCTIONS, which the
+    // TOM/JERRY erratum-15 work-around (long-aligning JUMP/JR so RISC code can
+    // run from DRAM) requires.
+    //
+    // So the default stays ZERO — changing it would alter the output of every
+    // existing .align/.phrase site in the fleet — and an explicit fill is
+    // available for the instruction-stream case.
+    let zero = assemble(
+        "        .dsp\n\
+         \x20       moveq #1,r1\n\
+         \x20       .align 8\n\
+         \x20       moveq #2,r2\n",
+        &Options::default(),
+    );
+    assert_eq!(zero.errors(), 0, "{:#?}", zero.diags);
+    assert_eq!(&zero.bytes[2..8], &[0, 0, 0, 0, 0, 0], "default fill must stay zero");
+
+    let nops = assemble(
+        "        .dsp\n\
+         \x20       moveq #1,r1\n\
+         \x20       .align 8,$E400\n\
+         \x20       moveq #2,r2\n",
+        &Options::default(),
+    );
+    assert_eq!(nops.errors(), 0, "{:#?}", nops.diags);
+    assert_eq!(
+        &nops.bytes[2..8], &[0xE4, 0x00, 0xE4, 0x00, 0xE4, 0x00],
+        "explicit fill must pad with JRISC nops, not zeros"
+    );
+    assert_eq!(zero.bytes.len(), nops.bytes.len(), "fill must not change the size");
+}
+
+#[test]
 fn bare_dot_long_is_rmac_alignment() {
     // rmac's `.long` with no operands aligns to a longword boundary; jas used
     // to silently emit nothing, leaving the following table 2-misaligned (GPU

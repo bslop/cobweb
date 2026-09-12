@@ -611,8 +611,21 @@ impl<'a> Assembler<'a> {
             "dc.i" | ".dc.i" => self.emit_data(line, 4, true), // JRISC swapped-long
             ".byte" | "dc.b" | ".dc.b" => self.emit_data_checked(line, 1, false, &opl),
             ".align" => {
-                if let Some(v) = self.eval_or_err(line.args, line.n) {
-                    self.align_to(v.max(1), line);
+                // `.align N` (zero fill, unchanged) or `.align N, FILL` where
+                // FILL is the 16-bit pad word — use $E400 (JRISC nop) or $4E71
+                // (68000 nop) when the padding sits in an INSTRUCTION stream,
+                // because a zero pad decodes as `add r0,r0` on JRISC and runs.
+                let parts = split_args(line.args);
+                let n = parts.first().map(|s| s.as_str()).unwrap_or("");
+                if let Some(v) = self.eval_or_err(n, line.n) {
+                    let fill = match parts.get(1) {
+                        Some(f) => match self.eval_or_err(f, line.n) {
+                            Some(w) => Some(w as u16),
+                            None => return,
+                        },
+                        None => None,
+                    };
+                    self.align_to_fill(v.max(1), fill, line);
                 }
             }
             // GAS `.balign N` aligns the PC to an N-*byte* boundary (same as our
@@ -726,22 +739,35 @@ impl<'a> Assembler<'a> {
         }
     }
 
+    /// `.align N` / `.phrase` / `.dphrase` / `.qphrase` — pad to a boundary with
+    /// ZERO bytes. See align_to_fill for why the zero default is kept and when
+    /// you must not use it.
     fn align_to(&mut self, a: u32, line: &Line) {
-        // RELOCATABLE output: relative to the section start, and remember the
-        // request so the ELF section header carries it to the linker -- the
-        // linker is free to place the section anywhere, so an absolute
-        // alignment computed here is meaningless once linked.
-        //
-        // Everything else -- flat images AND a PINNED object (`-c` without
-        // `-r`/`--elf-obj`, which jln places at exactly its assembled `.org`)
-        // -- aligns ABSOLUTELY, because the assembled PC is the address the
-        // bytes will occupy and that is what the source is asking about.
-        // BEWARE: keying this on `object_mode` instead broke jag_soniccd: `.dphrase`
-        // before `_op_list` is there because Tom's OP fetches a BITMAP object
-        // as one 16-BYTE BURST and misreads a list at N-mod-16.  Section-
-        // relative alignment moved that list from $09AC70 (0 mod 16) to
-        // $09AC6E (14 mod 16) -- the exact fault that defeated three earlier
-        // attempts at OP compositing in that project.
+        self.align_to_fill(a, None, line)
+    }
+
+    /// `.align` with an explicit fill. `fill: None` keeps the historical ZERO
+    /// padding; `Some(w)` pads with the 16-bit value `w` (a leading zero byte
+    /// first if the PC is odd, since a 16-bit fill cannot start mid-word).
+    ///
+    /// ☠ WHY A FILL ARGUMENT EXISTS AT ALL. Zero padding is correct and harmless
+    /// where `.align` is actually used today — every use across the corpus aligns
+    /// DATA: an `.incbin` payload, a DSP stack, a `dc.l` table, a section
+    /// boundary. Padding that is never executed can be anything.
+    ///
+    /// It is NOT harmless between instructions, and that case is now reachable.
+    /// On JRISC, opcode 0 is `add`, so a zero pad word decodes as `add r0,r0` and
+    /// EXECUTES. The Atari TOM/JERRY erratum 15 work-around — long-aligning JUMP/JR
+    /// and their targets so RISC code can run from DRAM — asks for exactly that:
+    /// `.align` in the middle of an instruction stream. Padded with zeros it
+    /// assembles clean, byte-verifies clean, and silently corrupts r0 at runtime.
+    /// So: `.align 4, $E400` (JRISC nop) or `.align 4, $4E71` (68000 nop).
+    ///
+    /// The default is deliberately UNCHANGED. Making NOP the default would alter
+    /// the output bytes of every existing `.align`/`.phrase` site in the corpus
+    /// (56 of them across the fleet) and break their byte-verify, to fix a case
+    /// none of them are in.
+    fn align_to_fill(&mut self, a: u32, fill: Option<u16>, line: &Line) {
         let base = if self.opts.relocatable {
             let i = self.cur_sec.idx();
             if a > self.sec_align[i] {
@@ -751,8 +777,25 @@ impl<'a> Assembler<'a> {
         } else {
             0
         };
-        while self.pc.wrapping_sub(base) % a != 0 {
-            self.put_byte(0, line);
+        match fill {
+            None => {
+                while self.pc.wrapping_sub(base) % a != 0 {
+                    self.put_byte(0, line);
+                }
+            }
+            Some(w) => {
+                // a 16-bit fill cannot begin on an odd address
+                if self.pc.wrapping_sub(base) % a != 0 && self.pc % 2 != 0 {
+                    self.put_byte(0, line);
+                }
+                while self.pc.wrapping_sub(base) % a != 0 {
+                    if self.pc.wrapping_sub(base) % a == a - 1 {
+                        self.put_byte(0, line);   // odd byte left over
+                    } else {
+                        self.put_word(w, line);
+                    }
+                }
+            }
         }
     }
 
