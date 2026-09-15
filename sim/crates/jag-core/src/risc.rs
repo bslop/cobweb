@@ -83,6 +83,14 @@ pub struct Risc {
     pub hidata_ready: u64,
     pub modulo: u32,      // D_MOD for ADDQMOD/SUBQMOD (DSP)
     pub mac: i64,         // MAC accumulator (40-bit on DSP, modeled as i64)
+    /// IMULTN/IMACN read their operand REGISTERS one cycle after issue on
+    /// silicon (jag_resident run 241, bisected on the rig): a write to an
+    /// operand register by the very next instruction lands BEFORE the
+    /// multiplier samples it, so the product uses the new value. The product
+    /// is therefore deferred here as (op, r1, r2, age) and applied once the
+    /// following instruction has retired - or at once when that instruction
+    /// is itself a MAC op or RESMAC, which see the accumulator in order.
+    pub mac_pending: Option<(u8, usize, usize, u8)>,
     pub mtxc: u32,
     pub mtxa: u32,
     pub running: bool,
@@ -236,6 +244,7 @@ impl Risc {
             hidata_ready: 0,
             modulo: 0,
             mac: 0,
+            mac_pending: None,
             mtxc: 0,
             mtxa: 0,
             running: false,
@@ -318,6 +327,7 @@ impl Risc {
         self.hidata_ready = 0;
         self.modulo = 0;
         self.mac = 0;
+        self.mac_pending = None;
         self.mtxc = 0;
         self.mtxa = 0;
         self.running = false;

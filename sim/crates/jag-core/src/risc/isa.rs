@@ -49,6 +49,21 @@ pub(super) fn execute(core: &mut Risc, bus: &mut Bus, iw: u16) {
     let s = core.reg(b, r1);
     let d = core.reg(b, r2);
 
+    // Deferred MAC operand read (see `Risc::mac_pending`): a product issued by
+    // the PREVIOUS instruction lands after this one retires, unless this one
+    // is a MAC op or RESMAC, which must see it now and in order.
+    if let Some((pop, pr1, pr2, age)) = core.mac_pending {
+        if age >= 1 || matches!(op, 18 | 19 | 20) {
+            let ps = core.reg(b, pr1);
+            let pd = core.reg(b, pr2);
+            let prod = (pd as i16 as i64) * (ps as i16 as i64);
+            core.mac = if pop == 18 { prod } else { core.mac.wrapping_add(prod) };
+            core.mac_pending = None;
+        } else {
+            core.mac_pending = Some((pop, pr1, pr2, 1));
+        }
+    }
+
     match op {
         0 => {
             // ADD
@@ -156,18 +171,22 @@ pub(super) fn execute(core: &mut Risc, bus: &mut Bus, iw: u16) {
             core.set_zn(res);
         }
         18 => {
-            // IMULTN — start MAC (no write-back)
-            core.mac = (d as i16 as i64) * (s as i16 as i64);
-            let res = core.mac as u32;
+            // IMULTN — start MAC (no write-back). The accumulator takes the
+            // product one instruction LATE (silicon reads the operands a
+            // cycle after issue - run 241); the flags keep the issue-time
+            // product, which nothing has ever been seen to depend on.
+            let res = ((d as i16 as i64) * (s as i16 as i64)) as u32;
             core.set_zn(res);
+            core.mac_pending = Some((18, r1, r2, 0));
         }
         19 => {
-            // RESMAC — write accumulator
+            // RESMAC — write accumulator (any pending product was applied
+            // at the top of this call)
             core.set_reg(b, r2, core.mac as u32);
         }
         20 => {
-            // IMACN — accumulate (no write-back, no flags)
-            core.mac = core.mac.wrapping_add((d as i16 as i64) * (s as i16 as i64));
+            // IMACN — accumulate (no write-back, no flags), operands read late
+            core.mac_pending = Some((20, r1, r2, 0));
         }
         21 => {
             // DIV (unsigned; 16.16 if div_offset)

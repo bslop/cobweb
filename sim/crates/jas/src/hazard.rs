@@ -211,6 +211,8 @@ pub fn check(emitted: &[Emitted]) -> Vec<Diag> {
     let mut diags = Vec::new();
     // reg -> line of the pending slow producer (None = settled)
     let mut pending: HashMap<u8, Pend> = HashMap::new();
+    // the IMULTN/IMACN of the previous instruction: (line, r1, r2)
+    let mut mac_prev: Option<(usize, u8, u8)> = None;
 
     // Only instruction-bearing entries participate; keep their indices so we can
     // look at the delay slot (the next instruction).
@@ -378,6 +380,30 @@ pub fn check(emitted: &[Emitted]) -> Vec<Diag> {
         // A protected read settles the scoreboard for that register.
         for &r in &acc.reads {
             pending.remove(&r);
+        }
+
+        // MAC operand overwritten in the multiplier's read cycle: IMULTN/IMACN
+        // sample their operand REGISTERS one cycle after issue on silicon, so
+        // the instruction right after one must not write either operand.
+        // Found by jag_resident (run 241): `imultn r16,r3 / move r1,r3`
+        // rendered correctly in jagemu and drew NOTHING on the Jaguar; the
+        // same sequence with a distinct register for each operand rendered.
+        if let Some((mline, m1, m2)) = mac_prev.take() {
+            if let Some(w) = acc.write {
+                if (w == m1 || w == m2) && !matches!(acc.op, 18 | 20) {
+                    diags.push(Diag::error(
+                        e.line,
+                        format!(
+                            "write to r{w} in the cycle after the imultn/imacn at line {mline} that reads it \
+                             (silicon samples MAC operands a cycle late - the product uses the NEW value; \
+                             measured on hardware, jag_resident run 241)"
+                        ),
+                    ).with_fix(format!("give the next operand its own register, or put one instruction between the multiply and the write to r{w}")));
+                }
+            }
+        }
+        if matches!(acc.op, 18 | 20) {
+            mac_prev = Some((e.line, acc.reads[0], acc.reads[1]));
         }
 
         // Write-after-write into a shadow (bug 13): writing a register still in
