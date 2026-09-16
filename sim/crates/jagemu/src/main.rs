@@ -274,6 +274,12 @@ fn attach_sd(jag: &mut Jaguar) {
         let mut gd = jag_core::gamedrive::GameDrive::new(dir);
         gd.set_rate(SD_RATE.load(std::sync::atomic::Ordering::Relaxed));
         jag.bus.gamedrive = Some(gd);
+        // The 16 MB of cartridge SDRAM comes with the board: on hardware you
+        // cannot have the GameDrive's SD card without its SDRAM, so there is no
+        // separate flag. It changes nothing until a ROM calls
+        // GD_ROMWriteEnable(1) - the window stays read-only and reads 0, which
+        // is what an unloaded cart already did.
+        jag.bus.cart_sdram = Some(Box::new(jag_core::gamedrive::CartSdram::new()));
     }
 }
 
@@ -2258,7 +2264,7 @@ fn state_json(jag: &Jaguar) -> String {
          \"flags\":\"0x{:08X}\",\"regs0\":[{}],\"regs1\":[{}]}},\
          \"dsp\":{{\"running\":{},\"instret\":{},\"cycles\":{},\"cycles_per_field\":{:.1},\"timing\":{},\
          \"flags\":\"0x{:08X}\",\"regs0\":[{}],\"regs1\":[{}]}},\
-         \"blitter\":{{\"bcmd_busy_reads\":{},\"bcmd_poll_in_settle\":{}}},\"risc_ram_narrow_writes\":{},\
+         \"blitter\":{{\"bcmd_busy_reads\":{},\"bcmd_poll_in_settle\":{}}},\"risc_ram_narrow_writes\":{},{}\
          \"op\":{{\"scaled_misaligned_hits\":{},\"scaled_misaligned_addr\":\"0x{:06X}\",\"bitmap_misaligned_hits\":{},\"bitmap_misaligned_addr\":\"0x{:06X}\",\"bitmap_misaligned_last\":\"0x{:06X}\"}},\
          \"d\":[{}],\"a\":[{}]}}",
         jag.frame(),
@@ -2345,6 +2351,27 @@ fn state_json(jag: &Jaguar) -> String {
         jag.bus.bcmd_busy_reads.load(std::sync::atomic::Ordering::Relaxed),
         jag.bus.bcmd_poll_in_settle.load(std::sync::atomic::Ordering::Relaxed),
         jag.bus.risc_ram_narrow_writes,
+        // The GameDrive's 16 MB of cartridge SDRAM. Emitted only when a
+        // GameDrive is attached, so nothing changes for a run without --sd.
+        // `writes_byte` is the one to read: a byte store into the window fills
+        // the whole 16-bit word on silicon (run 242), so a nonzero count on a
+        // ROM that expected a memcpy to work is the bug, already measured.
+        match jag.bus.cart_sdram.as_ref() {
+            None => String::new(),
+            Some(sd) => format!(
+                "\"cart_sdram\":{{\"write_enabled\":{},\"writes\":{},\"writes_byte\":{},\
+                 \"writes_refused\":{},\"page_selects\":{},\"banks\":[{}]}},",
+                sd.write_enabled(),
+                sd.writes,
+                sd.byte_writes,
+                sd.writes_refused,
+                sd.page_sets,
+                (0..jag_core::gamedrive::CART_PAGES)
+                    .map(|p| sd.bank_of_page(p).to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+        },
         // OP object-alignment faults (jag_quake A10 lottery, 2026-08-22).
         jag.bus.tom.op.scaled_misaligned_hits,
         jag.bus.tom.op.scaled_misaligned_addr,

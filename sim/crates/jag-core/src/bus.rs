@@ -368,6 +368,24 @@ pub struct Bus {
     /// Attached GameDrive/SD (emulated SPI device at $F16002-5). None = absent,
     /// which is what `gd_install` detects via its bounded SPI waits.
     pub gamedrive: Option<crate::gamedrive::GameDrive>,
+    /// The GameDrive's 16 MB of cartridge SDRAM, when a GameDrive is attached
+    /// (`--sd <dir>`): on real hardware the two are the same board, so there is
+    /// no configuration in which you have one and not the other.
+    ///
+    /// Behaviour is UNCHANGED for every ROM that does not use it. The window is
+    /// read-only until `GD_ROMWriteEnable(1)`, so cart writes still vanish into
+    /// `m68k_stray_write`; and a never-written bank reads 0, exactly as the
+    /// empty `cart` vector did. A loaded cart IMAGE still wins where it covers
+    /// (`self.cart` is consulted first), so a `.rom` run is untouched too.
+    pub cart_sdram: Option<Box<crate::gamedrive::CartSdram>>,
+    /// Set while a DEVICE (the GameDrive's own file read) is filling memory a
+    /// byte at a time, so its bytes do NOT pick up the cart window's byte-write
+    /// quirk. MEASURED: `SDRAMTEST=12` — `gd_fread` 64 KB of the pack into the
+    /// cart and into DRAM, compared in longwords — is GREEN on silicon, i.e.
+    /// the BIOS's own copy lands intact where a 68000 byte loop does not.
+    /// (jsim read RED here until this existed, which is the divergence the
+    /// end-to-end probe caught.)
+    cart_dma: bool,
     pub jerry: Jerry,
     /// Count of bus accesses, for the debugger / profiler.
     pub access_count: u64,
@@ -521,6 +539,8 @@ impl Bus {
             m68k_bus_cycles: 0,
             dram: vec![0u8; mem::DRAM_SIZE].into_boxed_slice(),
             cart: Vec::new(),
+            cart_sdram: None,
+            cart_dma: false,
             bootrom: Vec::new(),
             tom: Tom::new(),
             gamedrive: None,
@@ -624,7 +644,16 @@ impl Bus {
             self.dram[a as usize]
         } else if (mem::CART_START..mem::CART_END).contains(&a) {
             let idx = (a - mem::CART_START) as usize;
-            self.cart.get(idx).copied().unwrap_or(0x00)
+            match self.cart.get(idx).copied() {
+                Some(b) => b,
+                // Past the end of a loaded cart image (or with none loaded at
+                // all) the window is the GameDrive's paged SDRAM, if attached.
+                None => self
+                    .cart_sdram
+                    .as_ref()
+                    .and_then(|s| s.read8(a))
+                    .unwrap_or(0x00),
+            }
         } else if (mem::BOOTROM_START..mem::BOOTROM_END).contains(&a) {
             let idx = (a - mem::BOOTROM_START) as usize;
             self.bootrom.get(idx).copied().unwrap_or(0xFF)
@@ -664,6 +693,25 @@ impl Bus {
             self.tom_write8(a, v);
         } else if mem::is_jerry(a) {
             self.jerry_write8(a, v);
+        } else if self.cart_sdram.is_some() && mem::is_cart(a) {
+            // The GameDrive's SDRAM. The window is READ-ONLY until
+            // GD_ROMWriteEnable(1), and a refused write is still a write that
+            // went nowhere — so it keeps the stray-write diagnostic it has
+            // always had, and a ROM that never opens the latch sees exactly the
+            // behaviour it saw before this model existed.
+            //
+            // ☠ `watch_suppress` is what separates a GENUINE byte store from
+            // the tail of a decomposed write16/write32 — `Bus::write16` raises
+            // it around the two `write8`s it issues. Only the genuine one gets
+            // the silicon quirk (a byte write fills the whole 16-bit word,
+            // measured run 242); without this guard EVERY longword write would
+            // also be "narrow" and the model would corrupt the very writes the
+            // hardware handles correctly.
+            let narrow = self.watch_suppress == 0 && !self.cart_dma;
+            let landed = self.cart_sdram.as_mut().unwrap().write8(a, v, narrow);
+            if !landed && self.m68k_stray_write.is_none() {
+                self.m68k_stray_write = Some((a, 1));
+            }
         } else {
             // Cart-space and unmapped writes vanish silently (no bus error) —
             // in this model. Record the first of each access so the CPU can
@@ -674,6 +722,18 @@ impl Bus {
                 self.m68k_stray_write = Some((a, if mem::is_cart(a) { 1 } else { 0 }));
             }
         }
+    }
+
+    /// A byte delivered by a DEVICE, not stored by a core: the GameDrive's
+    /// `gd_fread` filling a caller's buffer. Identical to `write8` everywhere
+    /// except the cartridge window, where a real 68000 byte store fills the
+    /// whole 16-bit word and the GameDrive's own copy does not (run 242:
+    /// `SDRAMTEST=11` RED, `SDRAMTEST=12` GREEN).
+    #[inline]
+    pub fn write8_dma(&mut self, addr: u32, v: u8) {
+        self.cart_dma = true;
+        self.write8(addr, v);
+        self.cart_dma = false;
     }
 
     // ── 16-bit access (big-endian) ──────────────────────────────────────────
@@ -927,7 +987,17 @@ impl Bus {
             *b = if mem::is_dram(a) {
                 self.dram[a as usize]
             } else if (mem::CART_START..mem::CART_END).contains(&a) {
-                self.cart.get((a - mem::CART_START) as usize).copied().unwrap_or(0)
+                // The Object Processor composites through `peek`, so this is
+                // also what lets the OP scan a plate that lives in the cart
+                // window (jag_resident run 242 mode 4, GREEN on silicon).
+                match self.cart.get((a - mem::CART_START) as usize).copied() {
+                    Some(b) => b,
+                    None => self
+                        .cart_sdram
+                        .as_ref()
+                        .and_then(|s| s.read8(a))
+                        .unwrap_or(0),
+                }
             } else if mem::is_tom(a) {
                 self.tom.win.r8(a)
             } else if mem::is_jerry(a) {

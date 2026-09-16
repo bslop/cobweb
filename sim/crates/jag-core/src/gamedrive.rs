@@ -43,7 +43,7 @@ pub fn tick_frame(bus: &mut crate::bus::Bus) {
         return;
     };
     for (i, b) in chunk.iter().enumerate() {
-        bus.write8(at.wrapping_add(i as u32), *b);
+        bus.write8_dma(at.wrapping_add(i as u32), *b);
     }
 }
 
@@ -56,7 +56,7 @@ pub fn finish_async(bus: &mut crate::bus::Bus) {
         return;
     };
     for (i, b) in chunk.iter().enumerate() {
-        bus.write8(at.wrapping_add(i as u32), *b);
+        bus.write8_dma(at.wrapping_add(i as u32), *b);
     }
 }
 
@@ -84,6 +84,11 @@ const FIRMWARE: u16 = 0x0111;
 /// Function indices, from the bindings (`JagGD/gdbios_bindings.s`).
 pub const FN_INIT: u8 = 1;
 pub const FN_INITGPUREAD: u8 = 2;
+/// Cartridge-SDRAM control (`JagGD/gdbios_bindings.s`):
+/// `GD_ROMWriteEnable .equ 4`, `GD_ROMSetPage .equ 5`, `GD_ROMSetPages .equ 6`.
+pub const FN_ROMWEN: u8 = 4;
+pub const FN_ROMPAGE: u8 = 5;
+pub const FN_ROMPAGES: u8 = 6;
 pub const FN_CARDIN: u8 = 9;
 pub const FN_FOPEN: u8 = 10;
 pub const FN_FCLOSE: u8 = 11;
@@ -111,7 +116,7 @@ const BIOS_BLOCK: usize = 512;
 /// through `fn_of_trap`. Two hand-maintained lists would silently drift, and a
 /// drifted entry means a file call quietly vectors to the wrong operation —
 /// which looks like corrupt data, not like a dispatch bug.
-pub const FN_TRAP: [(u8, u8); 12] = [
+pub const FN_TRAP: [(u8, u8); 15] = [
     (FN_INIT, 1),
     // GD_InitGPURead. A no-op here, but it MUST have a thunk: on hardware the
     // async read modes do nothing until it installs the GPU interrupt handler,
@@ -119,6 +124,11 @@ pub const FN_TRAP: [(u8, u8); 12] = [
     // zeros — i.e. the hardware-correct sequence would be the one that crashes,
     // pushing authors toward code that only works here.
     (FN_INITGPUREAD, 5),
+    // The cartridge SDRAM's three control calls. Traps 6/7/8 are the ones no
+    // file call uses; every function still owns a distinct vector (asserted).
+    (FN_ROMWEN, 6),
+    (FN_ROMPAGE, 7),
+    (FN_ROMPAGES, 8),
     (FN_CARDIN, 9),
     (FN_FOPEN, 10),
     (FN_FCLOSE, 11),
@@ -558,6 +568,218 @@ impl GameDrive {
     }
 }
 
+
+// ── THE CARTRIDGE SDRAM ──────────────────────────────────────────────────────
+//
+// The GameDrive carries **16 MB of SDRAM in sixteen 1 MB banks**, six of them
+// mapped at a time into the cartridge window `$800000..$DFFFFF` (page p at
+// `$8p0000`), and the window is READ-ONLY until `GD_ROMWriteEnable(1)`.
+//
+// ABI, read from `JagGD/gdbios_bindings.s` (not inferred):
+// ```
+// GD_ROMWriteEnable  .equ 4    void GD_ROMWriteEnable(u16 flags)   d0.w = flags
+// GD_ROMSetPage      .equ 5    void ROMSetPage(u16 page, u16 bank) d0 = page<<16|bank
+// GD_ROMSetPages     .equ 6    void ROMSetPages(u32 banks)         d0 = one nibble per page
+//   Page 0:$8xxxxx 1:$9xxxxx 2:$axxxxx 3:$bxxxxx 4:$cxxxxx 5:$dxxxxx
+//   Bank 0-15 is 1MB pages of the onboard 16MB SDRAM
+//   "Lowest significant nibble is page 0, upto nibble 5. Data above is ignored."
+// ```
+//
+// ☠ **A BYTE WRITE FILLS THE WHOLE 16-BIT WORD** — measured on silicon,
+// jag_resident run 242. `make SDRAMTEST=10` (64 KB pattern written in
+// LONGWORDS, verified in longwords then in bytes) reads GREEN on both passes;
+// `SDRAMTEST=11`, the same pattern written in BYTES and verified in longwords,
+// reads RED. Four earlier probe runs (modes 5/7/8/9) had panicked with >= 65535
+// of the hero's 186 KB differing after a byte-loop `memcpy` into the window
+// before modes 10/11 named the cause. The cart bus is 16 bits wide with no byte
+// enables reaching the SDRAM, so the odd byte of a pair takes the even byte's
+// data — a `memcpy` corrupts every other byte and `mode 4`'s byte-copied plate
+// carried the smear (mean-abs-diff 1.8 against the DRAM copy's 1.1).
+//
+// A model that omitted this would bless a ROM that dies on the cart, which is
+// the exact structural blindness this project keeps paying for. It is modelled
+// here, and `Bus::write8` only applies it to a **genuine** byte store: a
+// `write16`/`write32` decomposed into bytes raises `watch_suppress`, and that
+// is what separates the two (same discipline as `risc_ram_narrow_writes`).
+
+// ⚠ WHAT THIS MODEL DOES **NOT** CARRY, measured rather than guessed:
+//
+// * **The cart bus is SLOW and this model charges DRAM-ish cycles.** Silicon
+//   (run 242, mode 1) copies 512 KB from the window to DRAM with a 68000
+//   longword loop in **2.83 s = 181 KB/s** - every access is a 16-bit cart-bus
+//   transaction. The same ROM under jsim inverts the screen every **60 fields
+//   = 1.00 s = 512 KB/s**, i.e. **2.83x too fast**. So jsim can tell you a
+//   cart-resident design is CORRECT and cannot tell you it is fast enough;
+//   run 242's rule "nothing the 68000 touches per frame lives in the cart" is
+//   not enforceable here. Charging the real cost would also re-time every
+//   commercial cart ROM in the corpus (their code FETCHES from this window),
+//   so it wants its own calibrated pass, not a constant bolted on here.
+// * **Power-up contents.** Real SDRAM comes up arbitrary; this fills zero, so
+//   a read-before-write reads a benign 0 here and noise on the cart - the same
+//   class `JAGEMU_SRAM_POISON` exists for on Tom's and Jerry's SRAM. No poison
+//   option is implemented for the cart window.
+// * **Byte writes by a RISC or the Blitter.** The quirk is applied to every
+//   genuine 8-bit store, on the mechanism (a 16-bit bus with no byte enables
+//   reaching the SDRAM). Only the 68000's byte stores and `gd_fread`'s copy
+//   were actually measured on silicon.
+// * **The default page map.** Page p selects bank p until a ROM says
+//   otherwise. `SDRAMTEST=1` writes through page 1 before touching the page
+//   table and then requires `ROMSetPage(1,1)` to show the same data, which is
+//   GREEN on silicon - so page 1's default IS bank 1. The other five are an
+//   inference from that, not a measurement.
+
+/// 1 MB per bank, sixteen banks.
+pub const SDRAM_BANK_BYTES: u32 = 1024 * 1024;
+pub const SDRAM_BANKS: u32 = 16;
+pub const SDRAM_BYTES: u32 = SDRAM_BANKS * SDRAM_BANK_BYTES;
+/// Pages of the cartridge window: `$800000..$DFFFFF` is exactly six.
+pub const CART_PAGES: usize = 6;
+
+/// The GameDrive's 16 MB of cartridge SDRAM, its six-entry page table and the
+/// write-enable latch.
+pub struct CartSdram {
+    mem: Vec<u8>,
+    /// Which bank each page of the window selects.
+    page: [u8; CART_PAGES],
+    /// `GD_ROMWriteEnable` — the window is read-only until a ROM sets this.
+    write_enable: bool,
+    /// Fault injection (`JAGEMU_CARTSDRAM_RO=1`): hold the latch off whatever
+    /// the ROM asks for. This is the NEGATIVE CONTROL for the whole model — a
+    /// probe that passes with the latch forced off is not measuring anything.
+    force_read_only: bool,
+    /// Counters, so a run can say whether this model was used at all rather
+    /// than leaving "the probe passed" ambiguous between right and untouched.
+    pub writes: u64,
+    pub writes_refused: u64,
+    pub byte_writes: u64,
+    pub page_sets: u64,
+}
+
+impl Default for CartSdram {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CartSdram {
+    pub fn new() -> Self {
+        CartSdram {
+            // Zero fill. Real SDRAM powers up arbitrary, like Tom's and
+            // Jerry's SRAM (see JAGEMU_SRAM_POISON) — a poison option for the
+            // cart window is NOT implemented, so a read-before-write of the
+            // window still reads a benign 0 here and noise on silicon.
+            mem: vec![0u8; SDRAM_BYTES as usize],
+            // Identity: page p selects bank p. This is what the window looks
+            // like to a ROM that has not called ROMSetPage — jag_resident's
+            // SDRAMTEST=1 writes 'JAG1' through page 1 BEFORE touching the page
+            // table, switches page 1 to bank 7 and back, and requires 'JAG1' to
+            // still be there; that probe reads GREEN on silicon, so page 1 maps
+            // to a bank that ROMSetPage(1,1) also selects.
+            page: [0, 1, 2, 3, 4, 5],
+            write_enable: false,
+            force_read_only: std::env::var_os("JAGEMU_CARTSDRAM_RO").is_some(),
+            writes: 0,
+            writes_refused: 0,
+            byte_writes: 0,
+            page_sets: 0,
+        }
+    }
+
+    /// FN 4 `GD_ROMWriteEnable(flags)` — nonzero opens the window for writes.
+    pub fn set_write_enable(&mut self, flags: u16) {
+        self.write_enable = flags != 0;
+        if self.force_read_only && flags != 0 {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                eprintln!(
+                    "jsim: JAGEMU_CARTSDRAM_RO set - GD_ROMWriteEnable(1) is being \
+                     IGNORED, every cart-window write will be dropped (fault arm)."
+                );
+            });
+        }
+    }
+
+    pub fn write_enabled(&self) -> bool {
+        self.write_enable && !self.force_read_only
+    }
+
+    /// FN 5 `GD_ROMSetPage(page, bank)`. Out-of-range arguments are ignored:
+    /// the vendor documents page 0-5 and bank 0-15 and says nothing about what
+    /// the firmware does with anything else, so this model refuses rather than
+    /// inventing an aliasing rule a ROM could come to depend on.
+    pub fn set_page(&mut self, page: u32, bank: u32) {
+        if (page as usize) < CART_PAGES && bank < SDRAM_BANKS {
+            self.page[page as usize] = bank as u8;
+            self.page_sets += 1;
+        }
+    }
+
+    /// FN 6 `GD_ROMSetPages(nibbles)` — nibble 0 is page 0, up to nibble 5;
+    /// "data above is ignored".
+    pub fn set_pages(&mut self, nibbles: u32) {
+        for p in 0..CART_PAGES {
+            self.page[p] = ((nibbles >> (4 * p)) & 0xF) as u8;
+        }
+        self.page_sets += 1;
+    }
+
+    /// Which bank a page currently selects (for tests and diagnostics).
+    pub fn bank_of_page(&self, page: usize) -> u8 {
+        self.page[page.min(CART_PAGES - 1)]
+    }
+
+    /// Map a cartridge-window address to an offset in the 16 MB array.
+    /// `addr` must already be masked to 24 bits.
+    #[inline]
+    fn offset(&self, addr: u32) -> Option<usize> {
+        if !(crate::mem::CART_START..crate::mem::CART_END).contains(&addr) {
+            return None;
+        }
+        let off = addr - crate::mem::CART_START;
+        let page = (off / SDRAM_BANK_BYTES) as usize;
+        let within = off % SDRAM_BANK_BYTES;
+        Some(self.page[page] as usize * SDRAM_BANK_BYTES as usize + within as usize)
+    }
+
+    #[inline]
+    pub fn read8(&self, addr: u32) -> Option<u8> {
+        self.offset(addr).map(|i| self.mem[i])
+    }
+
+    /// A write through the window. `narrow` is true for a REAL 8-bit store —
+    /// the case that fills both halves of the 16-bit word (run 242). Returns
+    /// false if the latch is closed, in which case nothing landed.
+    #[inline]
+    pub fn write8(&mut self, addr: u32, v: u8, narrow: bool) -> bool {
+        if !self.write_enabled() {
+            self.writes_refused += 1;
+            return false;
+        }
+        let Some(i) = self.offset(addr) else {
+            return false;
+        };
+        self.writes += 1;
+        self.mem[i] = v;
+        if narrow {
+            // ☠ the silicon quirk: no byte enables, so the neighbour in the
+            // same 16-bit word takes the same data.
+            self.byte_writes += 1;
+            let pair = i ^ 1;
+            self.mem[pair] = v;
+        }
+        true
+    }
+
+    /// Host-side access for tests and tooling (bypasses the latch).
+    pub fn poke_raw(&mut self, bank: u32, off: u32, v: u8) {
+        let i = bank as usize * SDRAM_BANK_BYTES as usize + off as usize;
+        self.mem[i] = v;
+    }
+    pub fn peek_raw(&self, bank: u32, off: u32) -> u8 {
+        self.mem[bank as usize * SDRAM_BANK_BYTES as usize + off as usize]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -694,6 +916,205 @@ mod tests {
             assert_eq!(gd.fsize(h as u16), 5, "{name}");
         }
         assert_eq!(gd.fopen("/NOPE.BIN"), u32::MAX);
+    }
+
+    // ── the cartridge SDRAM (run 242) ───────────────────────────────────
+
+    /// Attach a bus with the SDRAM present and the window already open, which
+    /// is the state a ROM is in after `GD_ROMWriteEnable(1)`.
+    fn sdram_bus() -> crate::bus::Bus {
+        let mut bus = crate::bus::Bus::new();
+        let mut s = CartSdram::new();
+        s.set_write_enable(1);
+        bus.cart_sdram = Some(Box::new(s));
+        bus
+    }
+
+    /// Page p of `$800000..$DFFFFF` must address bank p by default and a
+    /// DIFFERENT 1 MB of silicon after `GD_ROMSetPage`. This is the assertion
+    /// `SDRAMTEST=1` makes on the rig (WHITE -> YELLOW -> GREEN): write through
+    /// page 1, switch page 1 to bank 7, write there, switch back, and the first
+    /// value must still be there.
+    #[test]
+    fn paging_selects_distinct_banks() {
+        let mut bus = sdram_bus();
+        let p1 = 0x90_0000; // page 1
+
+        bus.write32(p1, 0x4A41_4731); // 'JAG1'
+        assert_eq!(bus.read32(p1), 0x4A41_4731, "the window must read back");
+
+        bus.cart_sdram.as_mut().unwrap().set_page(1, 7);
+        // A different bank: it has never been written, so it cannot hold 'JAG1'.
+        assert_ne!(bus.read32(p1), 0x4A41_4731, "paging changed nothing");
+        bus.write32(p1, 0x4A41_4737); // 'JAG7'
+
+        bus.cart_sdram.as_mut().unwrap().set_page(1, 1);
+        assert_eq!(bus.read32(p1), 0x4A41_4731, "bank 1 did not survive");
+        bus.cart_sdram.as_mut().unwrap().set_page(1, 7);
+        assert_eq!(bus.read32(p1), 0x4A41_4737, "bank 7 did not survive");
+
+        // and the two banks really are two places in the 16 MB array
+        let s = bus.cart_sdram.as_ref().unwrap();
+        assert_eq!(s.peek_raw(1, 0), 0x4A);
+        assert_eq!(s.peek_raw(1, 3), 0x31);
+        assert_eq!(s.peek_raw(7, 3), 0x37);
+    }
+
+    /// All six pages, and `GD_ROMSetPages`' one-nibble-per-page packing:
+    /// "Lowest significant nibble is page 0, upto nibble 5. Data above is
+    /// ignored." Every page must reach its own bank, or a build that maps six
+    /// banks at once silently aliases two of them.
+    #[test]
+    fn all_six_pages_map_and_set_pages_packs_one_nibble_each() {
+        let mut bus = sdram_bus();
+        // banks 15,14,13,12,11,10 for pages 0..5, with junk above nibble 5
+        bus.cart_sdram.as_mut().unwrap().set_pages(0xAB_CD_EF);
+        let want = [0xF, 0xE, 0xD, 0xC, 0xB, 0xA];
+        for (p, w) in want.iter().enumerate() {
+            assert_eq!(bus.cart_sdram.as_ref().unwrap().bank_of_page(p), *w as u8);
+        }
+        // write a distinct word through each page, then read them all back
+        for p in 0..CART_PAGES as u32 {
+            bus.write32(0x80_0000 + p * SDRAM_BANK_BYTES, 0x1000_0000 + p);
+        }
+        for p in 0..CART_PAGES as u32 {
+            assert_eq!(
+                bus.read32(0x80_0000 + p * SDRAM_BANK_BYTES),
+                0x1000_0000 + p,
+                "page {p}"
+            );
+            // ... and it landed in the bank the nibble named
+            assert_eq!(
+                bus.cart_sdram.as_ref().unwrap().peek_raw(want[p as usize], 3),
+                p as u8
+            );
+        }
+        // an illegal page or bank is refused, not aliased
+        bus.cart_sdram.as_mut().unwrap().set_page(6, 3);
+        bus.cart_sdram.as_mut().unwrap().set_page(0, 16);
+        assert_eq!(bus.cart_sdram.as_ref().unwrap().bank_of_page(0), 0xF);
+    }
+
+    /// Longword and word writes must round-trip EXACTLY — this is the arm that
+    /// silicon reads GREEN (`SDRAMTEST=10`), and it is also the control for the
+    /// byte-quirk test below: without it, a model that corrupted everything
+    /// would pass the quirk test.
+    #[test]
+    fn longword_and_word_writes_round_trip() {
+        let mut bus = sdram_bus();
+        let a = 0xA0_0000; // page 2
+        // the probe's own pattern: x = x*1664525 + 1013904223
+        let mut x: u32 = 0x1234_5678;
+        for k in 0..64u32 {
+            x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+            bus.write32(a + k * 4, x);
+        }
+        let mut x: u32 = 0x1234_5678;
+        for k in 0..64u32 {
+            x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+            assert_eq!(bus.read32(a + k * 4), x, "longword {k}");
+            // byte reads of a longword-written word are exact (silicon: the
+            // second, GREEN pass of SDRAMTEST=10)
+            for b in 0..4u32 {
+                assert_eq!(bus.read8(a + k * 4 + b), (x >> (24 - 8 * b)) as u8);
+            }
+        }
+        bus.write16(a + 0x100, 0xBEEF);
+        assert_eq!(bus.read16(a + 0x100), 0xBEEF, "a word write is not narrow");
+        assert_eq!(bus.read8(a + 0x100), 0xBE);
+        assert_eq!(bus.read8(a + 0x101), 0xEF);
+    }
+
+    /// ☠ THE SILICON QUIRK (run 242): a BYTE write to the cart window fills the
+    /// whole 16-bit word. `SDRAMTEST=11` writes a 64 KB pattern in bytes and
+    /// verifies it in longwords: RED on the rig. A byte-loop `memcpy` into the
+    /// window therefore corrupts every other byte, which is what cost four
+    /// probe runs before modes 10/11 named it.
+    #[test]
+    fn a_byte_write_fills_the_whole_16_bit_word() {
+        let mut bus = sdram_bus();
+        let a = 0xB0_0000; // page 3
+        bus.write32(a, 0x0000_0000);
+
+        bus.write8(a, 0xAA); // even byte -> both halves of the word
+        assert_eq!(bus.read16(a), 0xAAAA, "even byte did not fill the word");
+
+        bus.write8(a + 3, 0x55); // odd byte -> both halves of ITS word
+        assert_eq!(bus.read16(a + 2), 0x5555, "odd byte did not fill the word");
+
+        // and the failure a ROM actually sees: a byte-loop copy of a longword
+        // pattern comes back wrong, while the same bytes written as longwords
+        // come back right.
+        let pat: [u8; 8] = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
+        for (i, b) in pat.iter().enumerate() {
+            bus.write8(a + 0x40 + i as u32, *b);
+        }
+        let got: Vec<u8> = (0..8).map(|i| bus.read8(a + 0x40 + i)).collect();
+        assert_ne!(got, pat.to_vec(), "the byte-loop copy must NOT survive");
+        assert_eq!(got, vec![0x02, 0x02, 0x04, 0x04, 0x06, 0x06, 0x08, 0x08]);
+
+        for (i, b) in pat.chunks(4).enumerate() {
+            bus.write32(a + 0x80 + 4 * i as u32, u32::from_be_bytes(b.try_into().unwrap()));
+        }
+        let got: Vec<u8> = (0..8).map(|i| bus.read8(a + 0x80 + i)).collect();
+        assert_eq!(got, pat.to_vec(), "the longword copy must survive");
+    }
+
+    /// The window is READ-ONLY until `GD_ROMWriteEnable(1)`. The control is in
+    /// the same test: the identical store must land once the latch is open, or
+    /// "nothing happened" would also pass for a model that never writes at all.
+    #[test]
+    fn writes_with_the_latch_off_do_not_land() {
+        let mut bus = crate::bus::Bus::new();
+        bus.cart_sdram = Some(Box::new(CartSdram::new())); // latch OFF, as at boot
+        let a = 0xC0_0000; // page 4
+
+        bus.write32(a, 0xDEAD_BEEF);
+        assert_eq!(bus.read32(a), 0, "a write with the latch closed landed");
+        assert_eq!(bus.cart_sdram.as_ref().unwrap().writes, 0);
+        assert!(bus.cart_sdram.as_ref().unwrap().writes_refused > 0);
+        // it is still reported as a write that went nowhere, as cart writes
+        // always were
+        assert!(bus.m68k_stray_write.is_some());
+
+        // POSITIVE CONTROL: the same store, latch open.
+        bus.cart_sdram.as_mut().unwrap().set_write_enable(1);
+        bus.write32(a, 0xDEAD_BEEF);
+        assert_eq!(bus.read32(a), 0xDEAD_BEEF, "the latch does not open");
+
+        // and closing it again stops the next one
+        bus.cart_sdram.as_mut().unwrap().set_write_enable(0);
+        bus.write32(a, 0x0BAD_0BAD);
+        assert_eq!(bus.read32(a), 0xDEAD_BEEF, "the latch does not close");
+    }
+
+    /// `JAGEMU_CARTSDRAM_RO` is the fault arm for the end-to-end probe: with it
+    /// set, `GD_ROMWriteEnable(1)` must NOT open the window. A model that
+    /// passes the probe both ways is not modelling anything.
+    #[test]
+    fn the_fault_arm_holds_the_latch_closed() {
+        let mut s = CartSdram::new();
+        s.set_write_enable(1);
+        assert!(s.write_enabled(), "control: the latch opens normally");
+
+        let mut s = CartSdram::new();
+        s.force_read_only = true;
+        s.set_write_enable(1);
+        assert!(!s.write_enabled(), "the fault arm did not hold it closed");
+        assert!(!s.write8(0x80_0000, 0xFF, false));
+    }
+
+    /// With no GameDrive attached the cart window must behave EXACTLY as it did
+    /// before this model existed: reads 0, writes vanish into the stray-write
+    /// diagnostic. Every ROM in the fleet that does not use the SDRAM depends
+    /// on this.
+    #[test]
+    fn without_a_gamedrive_the_window_is_unchanged() {
+        let mut bus = crate::bus::Bus::new();
+        assert!(bus.cart_sdram.is_none());
+        bus.write32(0x90_0000, 0xDEAD_BEEF);
+        assert_eq!(bus.read32(0x90_0000), 0);
+        assert!(bus.m68k_stray_write.is_some());
     }
 
     #[test]

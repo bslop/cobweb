@@ -775,6 +775,9 @@ impl M68k {
     /// | ASYNCPOS    | 2 | —                              | dst end (a guess) |
     /// | ASYNCWAIT   | 3 | —                              | 0 (already done) |
     /// | ASYNCACTIVE | 4 | —                              | 0 (never busy) |
+    /// | ROMWEN   | 6 | d0.w=flags                          | 0 (void) |
+    /// | ROMPAGE  | 7 | d0=(page<<16)|bank                  | 0 (void) |
+    /// | ROMPAGES | 8 | d0=nibble per page                  | 0 (void) |
     ///
     /// The trap numbers above are NOT the function indices for anything over
     /// 15 — see `gamedrive::FN_TRAP`, which owns the mapping in both
@@ -792,6 +795,27 @@ impl M68k {
             // of publishing InitGPURead is that the hardware-correct call
             // sequence must not fault here. See gamedrive::FN_TRAP.
             gd::FN_INIT | gd::FN_INITGPUREAD => 0,
+            // ── the cartridge SDRAM (run 242) ───────────────────────────────
+            // Register ABI read from JagGD/gdbios_bindings.s, NOT inferred:
+            //   GD_ROMWriteEnable(u16 flags)      d0.w = flags
+            //   GD_ROMSetPage(u16 page,u16 bank)  d0   = page<<16 | bank
+            //   GD_ROMSetPages(u32 banks)         d0   = nibble per page, 0..5
+            // All three are `void` upstream, so d0 is scratch on return.
+            // Without an attached GameDrive there is no SDRAM either, and
+            // `?` on the Option makes the trap fall through to the real 68000
+            // vector, exactly as the file calls do.
+            gd::FN_ROMWEN => {
+                bus.cart_sdram.as_mut()?.set_write_enable(d0 as u16);
+                0
+            }
+            gd::FN_ROMPAGE => {
+                bus.cart_sdram.as_mut()?.set_page(d0 >> 16, d0 & 0xFFFF);
+                0
+            }
+            gd::FN_ROMPAGES => {
+                bus.cart_sdram.as_mut()?.set_pages(d0);
+                0
+            }
             gd::FN_CARDIN => bus.gamedrive.as_ref()?.card_in(),
             gd::FN_FOPEN => {
                 let mut name = String::new();
@@ -822,7 +846,8 @@ impl M68k {
             gd::FN_FREAD => match bus.gamedrive.as_mut()?.fread(d0 as u16, d1) {
                 Some(data) => {
                     for (i, b) in data.iter().enumerate() {
-                        bus.write8(a0.wrapping_add(i as u32), *b);
+                        // a DEVICE write: see Bus::write8_dma (run 242, mode 12)
+                        bus.write8_dma(a0.wrapping_add(i as u32), *b);
                     }
                     bus.gamedrive.as_mut()?.set_async_pos(a0.wrapping_add(d1));
                     0 // upstream convention: 0 means SUCCESS, not a byte count

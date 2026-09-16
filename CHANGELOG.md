@@ -6,6 +6,53 @@ assigned at release.
 
 ## Unreleased
 
+### 2026-09-16 — jsim: the GameDrive's 16 MB cartridge SDRAM, including the byte-write quirk
+
+- The GameDrive carries **16 MB of SDRAM in sixteen 1 MB banks**, six mapped at
+  a time into the cartridge window `$800000..$DFFFFF` (page p at `$8p0000`),
+  writable after `GD_ROMWriteEnable(1)`. jsim modelled none of it, so a build
+  that put assets in the cart window could not be gated at all — the window read
+  0 and every write vanished, which is the structural blindness a simulator
+  exists to remove.
+- **ABI read from `JagGD/gdbios_bindings.s`, not inferred**: `GD_ROMWriteEnable`
+  is function 4 (`d0.w` = flags), `GD_ROMSetPage` 5 (`d0` = `page<<16 | bank`,
+  page 0-5, bank 0-15), `GD_ROMSetPages` 6 (`d0` = one bank nibble per page,
+  nibble 0 = page 0, "data above is ignored"). All three are `void`. They are
+  published as `trap #6/#7/#8` thunks in the synthetic GDBIOS block, so a ROM's
+  own unmodified bindings drive them.
+- ☠ **The silicon quirk is modelled: a BYTE write into the window fills the
+  whole 16-bit word.** Measured by jag_resident run 242 — `SDRAMTEST=10` (a
+  64 KB pattern written in longwords) is GREEN on a real GameDrive and
+  `SDRAMTEST=11` (the same pattern written in bytes) is RED, after four earlier
+  probe runs had panicked with >= 65535 of a 186 KB model differing from a
+  byte-loop `memcpy`. A model without this blesses a ROM that dies on the cart.
+  Only a GENUINE byte store gets it: `Bus::write16`/`write32` raise
+  `watch_suppress` around the bytes they decompose into, and that is the
+  discriminator (the same discipline as `risc_ram_narrow_writes`).
+- **And the GameDrive's own copy does NOT get it.** `SDRAMTEST=12` — `gd_fread`
+  64 KB straight into the cart window, compared in longwords — is GREEN on
+  silicon. jsim read RED until `Bus::write8_dma` existed: the file read was
+  filling the buffer with 68000-style byte stores. The end-to-end probe found
+  that; the unit tests could not have.
+- Writes with the latch closed do not land and are still reported through
+  `m68k_stray_write`, so a ROM that never calls `GD_ROMWriteEnable` sees exactly
+  the behaviour it saw before. A run without `--sd` has no SDRAM at all.
+- Reads honour the page table for **every** master: the 68000, the RISCs and the
+  Blitter go through `Bus::read8`, and the Object Processor composites through
+  `Bus::peek`, which is also hooked — so `jagemu peek --at 0x900000` reads the
+  paged window, and `SDRAMTEST=4` (a plate copied into the cart and scanned by
+  the OP, alternating with the DRAM copy) renders both phases identically here,
+  as it does on the rig.
+- `state_json` gains `cart_sdram` (write_enabled, writes, writes_byte,
+  writes_refused, page_selects, banks) whenever a GameDrive is attached, so
+  "did this build use the window, and did anything write it a byte at a time?"
+  is machine-readable rather than a picture.
+- `JAGEMU_CARTSDRAM_RO=1` holds the latch closed whatever the ROM asks — the
+  fault arm, so a probe that passes both ways can be shown not to be measuring
+  anything. 7 new tests in `jag-core` (84 passed / 0 failed); with the arm set,
+  6 of the 7 go red, and injecting the two obvious model faults (no byte fill /
+  byte fill on everything) reds exactly the tests that should notice.
+
 ### 2026-09-01 — jas: section-relative `.align` is for RELOCATABLE objects only
 
 - `9da2f99` made object-mode `.align` section-relative, keyed on
