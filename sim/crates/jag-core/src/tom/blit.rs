@@ -453,6 +453,19 @@ pub fn run(bus: &mut Bus, cmd: u32) {
     // ~4 billion synchronous iterations. No real blit exceeds the 2 MB DRAM as
     // pixels (~1M); cap above any legitimate blit so only pathological counts trip.
     let mut budget: u64 = 4_000_000;
+    // Env-gated PER-PIXEL trace (AI-eyes debugging, 2026-08-24): JAGEMU_BLIT_PIX=<dst y>
+    // prints every pixel of every blit whose destination row is that y (and whose
+    // dst base is inside JAGEMU_BLIT_LO/HI when set): iteration, dst x/addr, the
+    // source generator's fixed-point x/y, source addr and the byte read.
+    let pix_y: Option<i32> = std::env::var("JAGEMU_BLIT_PIX").ok().and_then(|v| v.parse().ok());
+    let pix_ok = pix_y.is_some() && {
+        let lo = std::env::var("JAGEMU_BLIT_LO").ok()
+            .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok()).unwrap_or(0);
+        let hi = std::env::var("JAGEMU_BLIT_HI").ok()
+            .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok()).unwrap_or(0xFFFF_FFFF);
+        gens[dst].base >= lo && gens[dst].base <= hi
+    };
+    let mut pix_it: u32 = 0;
     'rows: for _ in 0..outer {
         // Capture the line's starting pointers for phrase-mode realignment (6b).
         let dx0 = gens[dst].x;
@@ -470,6 +483,14 @@ pub fn run(bus: &mut Bus, cmd: u32) {
             } else {
                 lane(srcd, dbpp, lane_idx)
             };
+            if pix_ok && Some(gens[dst].y) == pix_y {
+                let (_, sa, _) = gens[src].locate();
+                eprintln!(
+                    "PIX it={} dst=({},{}) da={:06X} src=({}.{:04X},{}.{:04X}) sa={:06X} s={:02X}",
+                    pix_it, gens[dst].x, gens[dst].y, da, gens[src].x, gens[src].xfrac, gens[src].y, gens[src].yfrac, sa, s
+                );
+            }
+            pix_it += 1;
             // 2. Destination read (for LFU/compare/inhibit restore).
             let d = if need_dst { gens[dst].read_at(bus, da, dbit) } else { 0 };
             // 3. Write data select (spec §4.2).
