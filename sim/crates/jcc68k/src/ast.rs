@@ -117,6 +117,12 @@ pub struct Expr {
 #[derive(Debug, Clone)]
 pub enum ExprK {
     Num(i64),
+    /// A CONSTANT floating expression, held EXACTLY (f64). C evaluates
+    /// `(int)(0.042908 * 65536.0)` in real arithmetic; lowering each literal to
+    /// 16.16 first made `65536.0` wrap to 0 and every such constant fold to 0.
+    /// Constant float arithmetic folds on this; an integer cast truncates it
+    /// (C 6.3.1.4); anything left at runtime is 16.16, `fixed_of`.
+    FloatLit(f64),
     /// String literal: index into the program's string pool.
     StrLit(usize),
     /// A named object: (name, storage). Resolved to a stack offset or a global.
@@ -250,6 +256,13 @@ pub struct Local {
 /// a flat sequence of these, emitted in order (big-endian).
 #[derive(Clone, Debug)]
 pub enum InitByte {
+    /// Bytes 2..4 of a preceding 4-byte `Addr`/`Str`. They make an initializer
+    /// image hold exactly one item per BYTE, which the struct-member padding
+    /// relies on (`out.len()` is a byte offset). Without them every pointer
+    /// member was followed by 3 bytes of false padding, so a static table of
+    /// structs holding pointers came out with every later field misplaced.
+    /// Emits nothing: the `.dc.l` already wrote all four bytes.
+    Cont,
     /// A literal data byte.
     Byte(u8),
     /// A 32-bit big-endian address of another global symbol, plus a byte addend
@@ -278,4 +291,10 @@ pub struct Program {
     pub functions: Vec<Function>,
     pub globals: Vec<Global>,
     pub strings: Vec<Vec<u8>>,
+}
+
+/// The 16.16 image of an exact floating constant (round to nearest), which is
+/// what a `FloatLit` means wherever it survives to run time.
+pub fn fixed_of(f: f64) -> i64 {
+    (f * 65536.0).round() as i64
 }

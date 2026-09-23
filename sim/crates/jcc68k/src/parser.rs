@@ -395,6 +395,32 @@ impl Parser {
             init = Some(self.global_initializer(&ty)?);
         }
         let align = self.aligns.get(&name).copied().unwrap_or(0);
+        // C11 6.9.2: repeated file-scope declarations of one identifier name
+        // ONE object - `static T x;` twice is two tentative definitions of the
+        // same variable, and `extern T x;` then `T x = 1;` is a declaration then
+        // its definition. Pushing a second Global emitted the label twice
+        // (`duplicate label` in jas) or, worse, could have split one object in
+        // two. Merge into the first entry: the definition wins over `extern`,
+        // an initializer wins over a tentative definition, and two
+        // initializers are a real redefinition error.
+        if let Some(g) = self.globals.iter_mut().find(|g| g.name == name) {
+            if sc.is_extern {
+                return Ok(()); // a declaration adds nothing to an existing entry
+            }
+            if g.init.is_some() && init.is_some() {
+                return Err(format!("redefinition of `{name}`"));
+            }
+            if init.is_some() || g.is_extern {
+                g.ty = ty;
+            }
+            if init.is_some() {
+                g.init = init;
+            }
+            g.is_extern = false;
+            g.is_static |= sc.is_static;
+            g.align = g.align.max(align);
+            return Ok(());
+        }
         self.globals.push(Global {
             name,
             ty,
@@ -497,12 +523,14 @@ impl Parser {
                 let idx = self.strings.len();
                 self.strings.push(bytes);
                 out.push(InitByte::Str(idx));
+                out.extend([InitByte::Cont, InitByte::Cont, InitByte::Cont]);
                 return Ok(());
             }
         }
         if ty.is_ptr() {
             if let Some((sym, addend)) = self.try_global_addr()? {
                 out.push(InitByte::Addr(sym, addend));
+                out.extend([InitByte::Cont, InitByte::Cont, InitByte::Cont]);
                 return Ok(());
             }
         }
@@ -1366,7 +1394,27 @@ impl Parser {
             self.expect(")")?;
             let inner = self.cast()?;
             let ty = ty.decay();
-            return Ok(Expr { kind: ExprK::Cast(Box::new(inner)), ty, line: self.line() });
+            let line = self.line();
+            if let Some(v) = float_const(&inner) {
+                // `(double)k` and `(float)1.5` stay exact constants;
+                // `(int)(0.5 * 65536.0)` truncates toward zero (C 6.3.1.4) to
+                // the target width, exactly as a host compiler folds it.
+                if ty.is_fixed() {
+                    return Ok(Expr { kind: ExprK::FloatLit(v), ty, line });
+                }
+                if let TypeK::Int { size, signed } = &*ty {
+                    if inner.ty.is_fixed() {
+                        let t = v.trunc();
+                        let bits = size * 8;
+                        let n = if bits >= 64 { t as i64 } else {
+                            let m = (t as i128) & ((1i128 << bits) - 1);
+                            if *signed && m >> (bits - 1) != 0 { (m - (1i128 << bits)) as i64 } else { m as i64 }
+                        };
+                        return Ok(Expr { kind: ExprK::Num(n), ty, line });
+                    }
+                }
+            }
+            return Ok(Expr { kind: ExprK::Cast(Box::new(inner)), ty, line });
         }
         self.unary()
     }
@@ -1394,6 +1442,9 @@ impl Parser {
             // Integer promotion first: `-(unsigned char)13` is -13 as an int,
             // not 243 truncated back into a byte.
             let ty = promote_int(&e.ty);
+            if let ExprK::FloatLit(f) = e.kind {
+                return Ok(Expr { kind: ExprK::FloatLit(-f), ty, line });
+            }
             return Ok(Expr { kind: ExprK::Unary(UnOp::Neg, Box::new(e)), ty, line });
         }
         if self.eat_punct("~") {
@@ -1546,9 +1597,9 @@ impl Parser {
             }
             Tok::Float(f) => {
                 self.pos += 1;
-                // 16.16 fixed-point literal (round to nearest).
-                let fixed = (f * 65536.0).round() as i64;
-                Ok(Expr { kind: ExprK::Num(fixed), ty: t_fixed(), line })
+                // Held EXACT until it is either folded with other constants or
+                // reaches run time (then 16.16, see `ExprK::FloatLit`).
+                Ok(Expr { kind: ExprK::FloatLit(f), ty: t_fixed(), line })
             }
             Tok::Char(n) => {
                 self.pos += 1;
@@ -1629,6 +1680,20 @@ impl Parser {
                 | BinOp::LogAnd | BinOp::LogOr => t_int(),
                 _ => t_fixed(),
             };
+            // Both sides constant: fold in REAL arithmetic, as C does. (Folding
+            // the 16.16 images instead is what made `x * 65536.0` wrap to 0.)
+            if let (Some(a), Some(b)) = (float_const(&l), float_const(&r)) {
+                let v = match op {
+                    BinOp::Add => Some(a + b),
+                    BinOp::Sub => Some(a - b),
+                    BinOp::Mul => Some(a * b),
+                    BinOp::Div if b != 0.0 => Some(a / b),
+                    _ => None,
+                };
+                if let Some(v) = v {
+                    return Ok(Expr { kind: ExprK::FloatLit(v), ty, line });
+                }
+            }
             return Ok(Expr { kind: ExprK::Binary(op, Box::new(l), Box::new(r)), ty, line });
         }
         // comparisons and logicals yield int
@@ -1781,6 +1846,7 @@ fn substitute_leaf(shell: &Type, leaf: &Type) -> Type {
 pub fn const_eval(e: &Expr) -> Result<i64, String> {
     Ok(match &e.kind {
         ExprK::Num(n) => *n,
+        ExprK::FloatLit(f) => fixed_of(*f),
         ExprK::Unary(UnOp::Neg, a) => -const_eval(a)?,
         ExprK::Unary(UnOp::Not, a) => !const_eval(a)?,
         ExprK::Unary(UnOp::LogNot, a) => (const_eval(a)? == 0) as i64,
@@ -1834,4 +1900,16 @@ struct Storage {
     is_static: bool,
     is_extern: bool,
     is_volatile: bool,
+}
+
+/// The exact real value of a constant arithmetic expression, if it is one:
+/// a floating literal, an integer constant, or a conversion of either to a
+/// floating type. `None` for anything that has to be evaluated at run time.
+fn float_const(e: &Expr) -> Option<f64> {
+    match &e.kind {
+        ExprK::FloatLit(f) => Some(*f),
+        ExprK::Num(n) if e.ty.is_integer() => Some(*n as f64),
+        ExprK::Cast(a) if e.ty.is_fixed() => float_const(a),
+        _ => None,
+    }
 }

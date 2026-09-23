@@ -125,7 +125,28 @@ fn builtin_header(name: &str) -> Option<&'static str> {
              #define va_end(ap) ((void)0)\n\
              #define va_copy(d,s) ((d)=(s))\n"
         }
-        "stdlib.h" | "string.h" | "stdio.h" | "math.h" | "assert.h" | "ctype.h" => "",
+        // string.h/stdlib.h must DECLARE size_t (C11 7.24.1 / 7.22): code that
+        // includes only <string.h> and casts to size_t is legal C and failed to
+        // parse ("expected ')'") while these were empty. A repeated identical
+        // typedef is accepted, so combining them with <stddef.h> is safe.
+        "string.h" => {
+            "typedef unsigned int size_t;\n\
+             #define NULL ((void*)0)\n\
+             void *memcpy(void *, const void *, size_t);\n\
+             void *memmove(void *, const void *, size_t);\n\
+             void *memset(void *, int, size_t);\n\
+             int memcmp(const void *, const void *, size_t);\n\
+             size_t strlen(const char *);\n\
+             int strcmp(const char *, const char *);\n\
+             int strncmp(const char *, const char *, size_t);\n\
+             char *strcpy(char *, const char *);\n\
+             char *strncpy(char *, const char *, size_t);\n"
+        }
+        "stdlib.h" => {
+            "typedef unsigned int size_t;\n\
+             #define NULL ((void*)0)\n"
+        }
+        "stdio.h" | "math.h" | "assert.h" | "ctype.h" => "",
         _ => return None,
     })
 }
@@ -136,6 +157,14 @@ fn builtin_macros() -> HashMap<String, Macro> {
     m.insert("__STDC__".into(), obj("1"));
     m.insert("__JAGUAR__".into(), obj("1"));
     m.insert("__jcc68k__".into(), obj("1"));
+    // The TARGET macros gcc -m68000 defines. Code gates its 68000-specific
+    // paths (inline mulu.w, hand-scheduled loops) on these; without them a
+    // jcc68k build silently takes the portable C fallback instead - measured
+    // on jag_resident: its fixed-point multiply became four __mulsi3 calls,
+    // most of the 68000's boot time.
+    m.insert("__mc68000__".into(), obj("1"));
+    m.insert("__mc68000".into(), obj("1"));
+    m.insert("__m68k__".into(), obj("1"));
     m
 }
 

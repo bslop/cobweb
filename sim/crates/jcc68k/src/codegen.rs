@@ -34,6 +34,11 @@ pub struct Gen {
     /// it reaches D0 — otherwise a caller reading the full 32 bits sees the
     /// untruncated value.
     ret_ty: Type,
+    /// Result buffers for struct-returning functions defined in this unit
+    /// (label, size), emitted into `.bss`. See `Stmt::Return`.
+    sret_bufs: Vec<(String, u32)>,
+    /// The current function's result buffer, when it returns a struct.
+    sret_cur: Option<String>,
     break_labels: Vec<String>,
     cont_labels: Vec<String>,
     /// Evaluation-stack depth for data temporaries (operands of an outer op held
@@ -151,6 +156,8 @@ pub fn generate(prog: &Program) -> Result<String, String> {
         strings: prog.strings.clone(),
         ret_label: String::new(),
         ret_ty: t_int(),
+        sret_bufs: Vec::new(),
+        sret_cur: None,
         break_labels: Vec::new(),
         cont_labels: Vec::new(),
         dtemp: 0,
@@ -360,7 +367,7 @@ fn collect_stmt_refs(s: &Stmt, out: &mut std::collections::HashSet<String>) {
             ExprK::Var(n) => {
                 out.insert(n.clone());
             }
-            ExprK::Num(_) | ExprK::StrLit(_) => {}
+            ExprK::Num(_) | ExprK::FloatLit(_) | ExprK::StrLit(_) => {}
             ExprK::Unary(_, a) | ExprK::Cast(a) | ExprK::Member(a, _) | ExprK::PostIncDec(a, _) => {
                 expr(a, out)
             }
@@ -505,12 +512,19 @@ impl Gen {
         // address — into the destination. Refuse it instead, the way the
         // 64-bit types are refused: a diagnostic is recoverable, a silent
         // miscompile in a renderer is not.
+        // Returning a struct by value uses the convention the CALL side has
+        // always assumed (`gen_call` treats D0 as the result's ADDRESS and
+        // copies the object out immediately after the `jsr`): the callee copies
+        // its result into a per-function static buffer and returns that
+        // buffer's address. This is gcc's `-fpcc-struct-return`. It is NOT
+        // reentrant — an interrupt handler that calls the same function between
+        // the callee's return and the caller's copy would overwrite the result
+        // — which is the documented trade-off of that convention.
+        self.sret_cur = None;
         if matches!(&*f.ret, TypeK::Struct { .. }) {
-            return Err(format!(
-                "{}: returning a struct by value is not supported on this target — \
-                 return it through an out-pointer parameter instead",
-                f.name
-            ));
+            let lbl = format!("{}_sret_{}", self.str_prefix, f.name);
+            self.sret_bufs.push((lbl.clone(), f.ret.size()));
+            self.sret_cur = Some(lbl);
         }
         if let Some((pn, _)) = f.params.iter().find(|(_, t)| matches!(&**t, TypeK::Struct { .. })) {
             return Err(format!(
@@ -687,6 +701,25 @@ impl Gen {
         Ok(())
     }
 
+    /// Emit one inline-asm line. A `.Lnl…:` label (from `gas_local_labels`)
+    /// goes out at column 0 like every other label - indented, jas reads it
+    /// as a directive - and anything after it on the same line follows.
+    fn asm_line(&mut self, l: &str) {
+        if l.starts_with(".Lnl") {
+            if let Some(c) = l.find(':') {
+                self.lbl(&l[..c]);
+                let rest = l[c + 1..].trim();
+                if !rest.is_empty() {
+                    self.line(rest);
+                }
+                return;
+            }
+        }
+        if !l.is_empty() {
+            self.line(l);
+        }
+    }
+
     // ── statements ────────────────────────────────────────────────────────────
     fn gen_stmt(&mut self, s: &Stmt) -> Result<(), String> {
         match s {
@@ -697,12 +730,10 @@ impl Gen {
                 // Basic inline asm: emit the text verbatim, GNU `%` register
                 // prefixes normalized to the jas spelling, one line per
                 // newline-separated piece.
-                for l in text.lines() {
-                    let l = normalize_gas_asm(l);
-                    let l = l.trim();
-                    if !l.is_empty() {
-                        self.line(l);
-                    }
+                let lines: Vec<String> = text.lines().map(normalize_gas_asm).collect();
+                let uid = self.l();
+                for l in gas_local_labels(&lines, uid) {
+                    self.asm_line(l.trim());
                 }
             }
             Stmt::AsmExt { template, output, input, .. } => {
@@ -727,13 +758,13 @@ impl Gen {
                 }
                 let subst = template.replace("%0", "__R0__").replace("%1", "__R1__");
                 let (r0, r1) = if output.is_some() { ("d0", in_reg) } else { (in_reg, "") };
-                for l in subst.lines() {
-                    let l = normalize_gas_asm(l);
-                    let l = l.replace("__R0__", r0).replace("__R1__", r1);
-                    let l = l.trim();
-                    if !l.is_empty() {
-                        self.line(l);
-                    }
+                let lines: Vec<String> = subst
+                    .lines()
+                    .map(|l| normalize_gas_asm(l).replace("__R0__", r0).replace("__R1__", r1))
+                    .collect();
+                let uid = self.l();
+                for l in gas_local_labels(&lines, uid) {
+                    self.asm_line(l.trim());
                 }
                 if let Some((_, out_lv)) = output {
                     self.store_d0_to_lvalue(out_lv)?;
@@ -741,7 +772,14 @@ impl Gen {
             }
             Stmt::Null => {}
             Stmt::Return(e) => {
-                if let Some(e) = e {
+                if let (Some(e), Some(buf)) = (e, self.sret_cur.clone()) {
+                    self.gen_expr(e)?; // source address in D0
+                    self.line("move.l d0,a0");
+                    self.line(&format!("lea {buf},a1"));
+                    let sz = self.ret_ty.size();
+                    self.copy_block(sz);
+                    self.line(&format!("move.l #{buf},d0"));
+                } else if let Some(e) = e {
                     self.gen_expr(e)?;
                     // Narrow a char/short result to its declared width, so a
                     // caller reading the full 32 bits of D0 cannot see the
@@ -925,6 +963,10 @@ impl Gen {
             ExprK::Num(n) => {
                 self.load_imm(*n as i32);
             }
+            ExprK::FloatLit(f) => {
+                // a floating constant that survived to run time is 16.16
+                self.load_imm(fixed_of(*f) as i32);
+            }
             ExprK::StrLit(idx) => {
                 self.line(&format!("lea {}_{idx},a0", self.str_prefix));
                 self.line("move.l a0,d0");
@@ -1088,6 +1130,33 @@ impl Gen {
                 self.lbl(&format!(".Ltrue_{ltrue}"));
                 self.line("moveq #1,d0");
                 self.lbl(&format!(".Lend_{lend}"));
+            }
+            ExprK::Binary(BinOp::Mul, a, b)
+                if !a.ty.is_fixed() && !b.ty.is_fixed() && !is_pow2_const(b) && !is_pow2_const(a)
+                    && narrow_mul(a, b).is_some() =>
+            {
+                // Both operands PROVABLY fit 16 bits (see `value_range`): the
+                // 68000's own 16x16->32 multiply gives the exact product, so no
+                // `__mulsi3` call. Measured on a Jaguar engine's boot: 78% of
+                // the 68000's time was `__mulsi3` on products of 5/6-bit colour
+                // differences that gcc turns into `muls.w`.
+                let ins = narrow_mul(a, b).unwrap();
+                if let ExprK::Num(k) = &b.kind {
+                    self.gen_expr(a)?;
+                    self.line(&format!("{ins} #{k},d0"));
+                } else {
+                    self.gen_expr(b)?;
+                    let slot = self.push_dtemp();
+                    self.gen_expr(a)?;
+                    let rhs = if slot == "-(a7)" {
+                        self.pop_dtemp_to(&slot, "d1");
+                        "d1".to_string()
+                    } else {
+                        self.dtemp -= 1;
+                        slot
+                    };
+                    self.line(&format!("{ins} {rhs},d0"));
+                }
             }
             ExprK::Binary(op, a, b) => {
                 // Fast path: a cheap rhs (a constant or a 4-byte scalar variable)
@@ -1949,9 +2018,15 @@ impl Gen {
                 emit_init(&mut self.out, g.init.as_ref().unwrap(), &sp);
             }
         }
-        let has_bss = prog.globals.iter().any(|g| emit(g) && is_zero(g));
+        let has_bss =
+            prog.globals.iter().any(|g| emit(g) && is_zero(g)) || !self.sret_bufs.is_empty();
         if has_bss {
             self.out.push_str("\t.align 16\n\t.bss\n");
+            for (lbl, sz) in self.sret_bufs.clone() {
+                self.out.push_str("\t.even\n");
+                writeln!(self.out, "{lbl}:").unwrap();
+                writeln!(self.out, "\t.ds.b {}", ((sz.max(1) + 1) / 2) * 2).unwrap();
+            }
             for g in &prog.globals {
                 if !emit(g) || !is_zero(g) {
                     continue;
@@ -1996,6 +2071,7 @@ fn emit_init(out: &mut String, init: &[InitByte], str_prefix: &str) {
     for item in init {
         match item {
             InitByte::Byte(b) => run.push(*b),
+            InitByte::Cont => {}
             InitByte::Addr(sym, addend) => {
                 flush(out, &mut run);
                 out.push_str("\t.even\n");
@@ -2588,7 +2664,7 @@ fn assigns_to(e: &Expr, name: &str) -> bool {
         ExprK::Call(callee, args) => {
             assigns_to(callee, name) || args.iter().any(|a| assigns_to(a, name))
         }
-        ExprK::Num(_) | ExprK::StrLit(_) | ExprK::Var(_) => false,
+        ExprK::Num(_) | ExprK::FloatLit(_) | ExprK::StrLit(_) | ExprK::Var(_) => false,
     }
 }
 
@@ -2676,7 +2752,7 @@ fn is_scalar4(ty: &Type) -> bool {
 fn analyze_expr(e: &Expr, refs: &mut HashMap<String, usize>, addr: &mut std::collections::HashSet<String>) {
     match &e.kind {
         ExprK::Var(n) => *refs.entry(n.clone()).or_default() += 1,
-        ExprK::Num(_) | ExprK::StrLit(_) => {}
+        ExprK::Num(_) | ExprK::FloatLit(_) | ExprK::StrLit(_) => {}
         ExprK::Unary(UnOp::Addr, inner) => {
             if let ExprK::Var(n) = &inner.kind {
                 addr.insert(n.clone());
@@ -2767,4 +2843,172 @@ fn mangle(name: &str) -> String {
     // resolves to the asm's `gpu_kernel` label at link time. (The a.out `_`
     // prefix would leave every cross-language symbol unresolved.)
     name.to_string()
+}
+
+/// Rewrite GNU numeric local labels inside ONE inline-asm statement into
+/// unique `.L` labels, which jas understands: `N:` defines, `Nb` refers to the
+/// nearest `N:` at or before the reference, `Nf` to the nearest after it.
+/// Scoped per statement (`uid`), so the same `0:` in two inlined copies of a
+/// delay loop cannot collide. A reference with no matching definition is left
+/// untouched, so jas reports it rather than this pass inventing a target.
+fn gas_local_labels(lines: &[String], uid: usize) -> Vec<String> {
+    // (line index, number) of each definition, in order
+    let mut defs: Vec<(usize, String)> = Vec::new();
+    for (i, l) in lines.iter().enumerate() {
+        let t = l.trim_start();
+        let n: String = t.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !n.is_empty() && t[n.len()..].starts_with(':') {
+            defs.push((i, n));
+        }
+    }
+    if defs.is_empty() {
+        return lines.to_vec();
+    }
+    let name = |k: usize| format!(".Lnl{uid}_{k}");
+    let mut out = Vec::with_capacity(lines.len());
+    for (i, l) in lines.iter().enumerate() {
+        let mut l = l.clone();
+        // a definition on this line: replace the leading `N:`
+        if let Some(k) = defs.iter().position(|(di, _)| *di == i) {
+            let t = l.trim_start();
+            let rest = &t[defs[k].1.len() + 1..];
+            l = format!("{}:{}", name(k), rest);
+        }
+        // references: a digit run followed by b/f, not part of a longer word
+        let bytes: Vec<char> = l.chars().collect();
+        let mut res = String::new();
+        let mut j = 0;
+        while j < bytes.len() {
+            let c = bytes[j];
+            let prev_word = j > 0 && (bytes[j - 1].is_ascii_alphanumeric() || bytes[j - 1] == '_' || bytes[j - 1] == '.' || bytes[j - 1] == '$' || bytes[j - 1] == '#');
+            if c.is_ascii_digit() && !prev_word {
+                let mut e = j;
+                while e < bytes.len() && bytes[e].is_ascii_digit() {
+                    e += 1;
+                }
+                let dir = bytes.get(e).copied();
+                let next_word = bytes.get(e + 1).map_or(false, |c| c.is_ascii_alphanumeric() || *c == '_');
+                if matches!(dir, Some('b') | Some('f')) && !next_word {
+                    let n: String = bytes[j..e].iter().collect();
+                    let tgt = if dir == Some('b') {
+                        defs.iter().rposition(|(di, dn)| *di <= i && *dn == n)
+                    } else {
+                        defs.iter().position(|(di, dn)| *di > i && *dn == n)
+                    };
+                    if let Some(k) = tgt {
+                        res.push_str(&name(k));
+                        j = e + 1;
+                        continue;
+                    }
+                }
+                res.extend(&bytes[j..e]);
+                j = e;
+                continue;
+            }
+            res.push(c);
+            j += 1;
+        }
+        out.push(res);
+    }
+    out
+}
+
+fn is_pow2_const(e: &Expr) -> bool {
+    matches!(e.kind, ExprK::Num(n) if n > 0 && (n & (n - 1)) == 0)
+}
+
+/// `muls.w` / `mulu.w` when a product's operands provably fit 16 bits, else
+/// `None` (the caller keeps the `__mulsi3` call). `muls.w` reads the low word
+/// of each operand SIGN-extended and `mulu.w` ZERO-extended, and the 32-bit
+/// result is exact, so this is only chosen when the full 32-bit operand value
+/// equals that extension of its low word.
+fn narrow_mul(a: &Expr, b: &Expr) -> Option<&'static str> {
+    let (ra, rb) = (value_range(a, true)?, value_range(b, true)?);
+    let s16 = |r: (i64, i64)| r.0 >= -32768 && r.1 <= 32767;
+    let u16 = |r: (i64, i64)| r.0 >= 0 && r.1 <= 65535;
+    if s16(ra) && s16(rb) {
+        Some("muls.w")
+    } else if u16(ra) && u16(rb) {
+        Some("mulu.w")
+    } else {
+        None
+    }
+}
+
+/// A conservative [min, max] for the value an integer expression leaves in D0,
+/// or `None` when it cannot be bounded. Only ever used to pick a cheaper
+/// instruction whose result is identical within the bound - a `None` costs
+/// speed, a wrong `Some` would cost correctness, so every rule is exact.
+///
+/// `direct` is true when the value feeds a 16-bit multiply straight away: then
+/// a narrowing cast to `short`/`char` may be trusted by its TYPE, because
+/// `muls.w`/`mulu.w` read only the low word and so perform that narrowing
+/// themselves (this compiler's casts do not narrow D0; the store does).
+fn value_range(e: &Expr, direct: bool) -> Option<(i64, i64)> {
+    fn ty_range(t: &Type) -> Option<(i64, i64)> {
+        match &**t {
+            TypeK::Int { size: 1, signed: true } => Some((-128, 127)),
+            TypeK::Int { size: 1, signed: false } => Some((0, 255)),
+            TypeK::Int { size: 2, signed: true } => Some((-32768, 32767)),
+            TypeK::Int { size: 2, signed: false } => Some((0, 65535)),
+            _ => None,
+        }
+    }
+    let fits32 = |r: (i64, i64)| r.0 >= i32::MIN as i64 && r.1 <= i32::MAX as i64;
+    let r = match &e.kind {
+        ExprK::Num(n) => Some((*n, *n)),
+        // loads: a narrow object's value is inside its type's range
+        ExprK::Var(_) | ExprK::Member(..) | ExprK::Unary(UnOp::Deref, _) => ty_range(&e.ty),
+        ExprK::Cast(a) => match &*e.ty {
+            TypeK::Int { size, signed } if *size <= 2 => {
+                if direct {
+                    ty_range(&e.ty)
+                } else {
+                    // value-preserving only if the source already fits
+                    let t = ty_range(&e.ty)?;
+                    let ra = value_range(a, false)?;
+                    if ra.0 >= t.0 && ra.1 <= t.1 { Some(ra) } else { None }
+                }
+            }
+            TypeK::Int { size: 4, signed } if a.ty.is_integer() => {
+                let ra = value_range(a, false)?;
+                // widening, or a same-width change the value survives
+                if *signed || ra.0 >= 0 { Some(ra) } else { None }
+            }
+            _ => None,
+        },
+        ExprK::Binary(BinOp::And, x, y) => {
+            let k = match (&x.kind, &y.kind) {
+                (_, ExprK::Num(k)) | (ExprK::Num(k), _) => *k,
+                _ => return None,
+            };
+            if (0..=i32::MAX as i64).contains(&k) { Some((0, k)) } else { None }
+        }
+        ExprK::Binary(BinOp::Add, x, y) => {
+            let (a, b) = (value_range(x, false)?, value_range(y, false)?);
+            Some((a.0 + b.0, a.1 + b.1))
+        }
+        ExprK::Binary(BinOp::Sub, x, y) => {
+            let (a, b) = (value_range(x, false)?, value_range(y, false)?);
+            Some((a.0 - b.1, a.1 - b.0))
+        }
+        ExprK::Binary(BinOp::Mul, x, y) => {
+            let (a, b) = (value_range(x, false)?, value_range(y, false)?);
+            let c = [a.0 * b.0, a.0 * b.1, a.1 * b.0, a.1 * b.1];
+            Some((*c.iter().min().unwrap(), *c.iter().max().unwrap()))
+        }
+        ExprK::Binary(BinOp::Shr, x, y) => match &y.kind {
+            ExprK::Num(s) if (0..32).contains(s) => {
+                let a = value_range(x, false)?;
+                if a.0 >= 0 { Some((a.0 >> s, a.1 >> s)) } else { None }
+            }
+            _ => None,
+        },
+        ExprK::Unary(UnOp::Neg, x) => {
+            let a = value_range(x, false)?;
+            Some((-a.1, -a.0))
+        }
+        _ => None,
+    }?;
+    if fits32(r) { Some(r) } else { None }
 }

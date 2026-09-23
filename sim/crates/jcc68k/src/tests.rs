@@ -2531,19 +2531,126 @@ fn sem_mixed_width_comparison() {
 }
 
 #[test]
+fn sem_repeated_file_scope_declarations_are_one_object() {
+    // Two `static T x;` at file scope are one object (C11 6.9.2), as are
+    // `extern T y;` and its later definition. Writing through one spelling
+    // must be visible through the other, and the label is emitted once.
+    assert_eq!(run(r#"
+        static unsigned char x;
+        extern int y;
+        static void set(void) { x = 7; y = 5; }
+        static unsigned char x;
+        int y = 1;
+        int main(void) { set(); return x * 10 + y; }
+    "#), 75);
+    let e = crate::compile_program("int z = 1; int z = 2;").expect_err("two initializers");
+    assert!(e.contains("redefinition"), "unexpected: {e}");
+}
+
+#[test]
+fn sem_inline_asm_numeric_local_labels() {
+    // GNU `0:` / `0b` inside inline asm: a decrement loop run 5 times, twice,
+    // so two copies of the same label text must not collide.
+    assert_eq!(run(r#"
+        static unsigned spin(unsigned n) {
+            __asm__ __volatile__("0:\n\tsubq.l #1,%0\n\tbne.s 0b\n" : "+d"(n) : : "cc");
+            return n;
+        }
+        int main(void) { unsigned a = spin(5), b = spin(3); return (int)(a + b) + 40; }
+    "#), 40);
+}
+
+#[test]
+fn sem_float_constant_expressions_fold_exactly() {
+    // C evaluates a constant floating expression in real arithmetic. Folding
+    // the 16.16 images instead made `65536.0` wrap to 0, so the ubiquitous
+    // `(int)((double)(x) * 65536.0)` idiom compiled to 0 for EVERY x.
+    // Values checked against a host compiler, including truncation (not
+    // rounding) toward zero on both signs and a division.
+    assert_eq!(run(r#"
+        int a = ((int)((double)(0.5) * 65536.0));
+        int b = ((int)((double)(0.042908) * 65536.0));
+        int c = ((int)((double)(-1.25) * 65536.0));
+        int main(void) {
+            int d = ((int)((double)(257.0 * 2.12 / (double)91) * 65536.0));
+            int e = ((int)((double)(-0.0000305) * 65536.0));
+            return (a == 32768) + (b == 2812) * 2 + (c == -81920) * 4
+                 + (d == 392380) * 8 + (e == -1) * 16;
+        }
+    "#), 31);
+}
+
+#[test]
+fn sem_static_struct_table_with_pointer_members() {
+    // Pointer members in a static struct initializer occupy 4 bytes. The
+    // member padding counted initializer ITEMS, an address was one item, so
+    // every field after a pointer landed 3 bytes late - a table like
+    // `{ id, base, end, pals, room, room_end }` read room = 0.
+    assert_eq!(run(r#"
+        static const unsigned char a[4] = {1,2,3,4}, b[3] = {5,6,7};
+        typedef struct { unsigned short id; const unsigned char *p, *q; char tag; const char *s; } R;
+        static const R t[2] = { { 7, a, a + 4, 'x', "hi" }, { 9, b, b + 3, 'y', "yo" } };
+        int main(void) {
+            return t[1].id * 1000 + (int)(t[0].q - t[0].p) * 100 + (int)(t[1].q - t[1].p) * 10
+                 + (t[1].p[2] == 7) + (t[0].tag == 'x') * 2 + (t[1].s[1] == 'o') * 4;
+        }
+    "#), 9000 + 400 + 30 + 7);
+}
+
+#[test]
+fn sem_narrow_multiply_matches_32bit() {
+    // Products the range analysis sends to muls.w / mulu.w must equal the
+    // full 32-bit C product - including sign edges, 255*255, 65535*65535
+    // (wraps as unsigned), masked colour differences, and short locals that
+    // were ASSIGNED out-of-range values (C narrows them on assignment).
+    let cases: &[(&str, u32)] = &[
+        ("short a = -32768, b = -32768; return a * b;", 0x4000_0000),
+        ("short a = 32767, b = -2; return a * b;", (-65534i32) as u32),
+        ("unsigned char a = 255, b = 255; return a * b;", 65025),
+        ("unsigned short a = 65535, b = 65535; return (int)(a * (unsigned)b);", 0xFFFE_0001),
+        ("int c = 0x7A5F, d = 0x1234; long dr = 0; short r = ((c >> 11) & 0x1F) - ((d >> 11) & 0x1F); return r * r * 4 + dr;", 676),
+        ("short s = 40000; short t = 3; return s * t;", ((40000i32 as i16 as i32) * 3) as u32),
+        ("int x = 70000; return (short)x * (short)x;", ((70000i32 as i16 as i32) * (70000i32 as i16 as i32)) as u32),
+        ("int x = 300; return (x & 0xFF) * (x & 0x7F);", (300 & 0xFF) * (300 & 0x7F)),
+        ("signed char a = -128; return a * -128;", 16384),
+        ("short a = -5; return (a + 3) * (a - 7);", 24),
+    ];
+    for (body, want) in cases {
+        let src = format!("int main(void) {{ {body} }}");
+        assert_eq!(run(&src), *want, "{body}");
+    }
+}
+
+#[test]
+fn sem_struct_return_by_value() {
+    // A struct RESULT is returned through a per-function static buffer whose
+    // address comes back in D0 (the convention the call side already used).
+    // Three things must hold: the fields arrive, the result is a COPY (the
+    // callee's next call does not change an earlier result), and a struct
+    // with an odd tail (12 + 1 bytes) copies whole.
+    assert_eq!(run(r#"
+        struct P { int a; int b; int c; };
+        static struct P make(int x) { struct P p; p.a = x; p.b = x * 2; p.c = x + 7; return p; }
+        int main(void) {
+            struct P u = make(3);
+            struct P v = make(10);
+            return u.a + u.b * 10 + u.c * 100 + v.b * 1000;
+        }
+    "#), 3 + 60 + 1000 + 20000);
+    assert_eq!(run(r#"
+        struct Q { int a; int b; int c; unsigned char t; };
+        static struct Q mk(void) { struct Q q; q.a = 1; q.b = 2; q.c = 3; q.t = 200; return q; }
+        int main(void) { struct Q q; q = mk(); return q.t + q.c; }
+    "#), 203);
+}
+
+#[test]
 fn sem_struct_by_value_is_refused_not_miscompiled() {
     // By-value struct passing/returning is unimplemented, and what it used to
     // emit was silently WRONG: the caller pushed the struct's address, so the
     // callee mutated the caller's object, only 4 bytes were cleaned from the
     // stack, and the "returned struct" was a 4-byte address assigned over the
     // destination. A diagnostic is recoverable; that is not.
-    let ret = r#"
-        struct P { int a; int b; };
-        struct P make(void) { struct P p; p.a = 1; p.b = 2; return p; }
-    "#;
-    let e = crate::compile_program(ret).expect_err("returning a struct by value must be refused");
-    assert!(e.contains("returning a struct by value"), "unexpected: {e}");
-
     let param = r#"
         struct P { int a; int b; };
         int take(struct P p) { return p.a; }
