@@ -44,6 +44,7 @@ fn main() {
                 let def = if a.len() > 2 { a[2..].to_string() } else { it.next().cloned().unwrap_or_default() };
                 defines.push(def);
             }
+            "-Werror=incompatible-pointer-types" => jcc68k::set_strict_pointer_args(true),
             _ if a.starts_with("-U") => {
                 // Not tracked as a predefine; ignore (undefs handled in-source).
             }

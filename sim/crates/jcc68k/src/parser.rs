@@ -1526,6 +1526,9 @@ impl Parser {
                     TypeK::Func { ret, .. } => ret.clone(),
                     _ => t_int(),
                 };
+                if STRICT_POINTER_ARGS.with(|f| f.get()) {
+                    check_pointer_args(&e, &args, line)?;
+                }
                 e = Expr { kind: ExprK::Call(Box::new(e), args), ty: ret, line };
                 continue;
             }
@@ -1912,4 +1915,61 @@ fn float_const(e: &Expr) -> Option<f64> {
         ExprK::Cast(a) if e.ty.is_fixed() => float_const(a),
         _ => None,
     }
+}
+
+thread_local! {
+    /// `-Werror=incompatible-pointer-types`, gcc's spelling (off by default).
+    static STRICT_POINTER_ARGS: std::cell::Cell<bool> = std::cell::Cell::new(false);
+}
+
+/// Enable/disable the incompatible-pointer-argument error for this thread.
+pub fn set_strict_pointer_args(on: bool) {
+    STRICT_POINTER_ARGS.with(|f| f.set(on));
+}
+
+/// Pointer targets gcc calls compatible for argument passing: `void` with
+/// anything, same-size integers regardless of signedness (gcc files that under
+/// the separate -Wpointer-sign), identical structs, and pointers recursively.
+fn pointee_compatible(p: &Type, a: &Type) -> bool {
+    match (&**p, &**a) {
+        (TypeK::Void, _) | (_, TypeK::Void) => true,
+        (TypeK::Int { size: x, .. }, TypeK::Int { size: y, .. }) => x == y,
+        (TypeK::Ptr(x), TypeK::Ptr(y)) => pointee_compatible(x, y),
+        (TypeK::Func { .. }, TypeK::Func { .. }) => true,
+        (TypeK::Array(x, _), TypeK::Array(y, _)) => pointee_compatible(x, y),
+        _ => p == a,
+    }
+}
+
+/// The guard gcc's -Werror=incompatible-pointer-types provides: passing a
+/// `V3 *` where the prototype says `const uint8_t *` is a COMPILE ERROR, not a
+/// silent reinterpretation. A Jaguar engine relied on exactly this (a 4.12
+/// vertex base handed the 16.16 array read at half stride and drew a
+/// screen-filling tangle), and lost it the day it moved to this compiler.
+fn check_pointer_args(callee: &Expr, args: &[Expr], line: usize) -> PResult<()> {
+    let params = match &*callee.ty.decay() {
+        TypeK::Ptr(inner) => match &**inner {
+            TypeK::Func { params, .. } => params.clone(),
+            _ => return Ok(()),
+        },
+        TypeK::Func { params, .. } => params.clone(),
+        _ => return Ok(()),
+    };
+    for (i, (a, p)) in args.iter().zip(params.iter()).enumerate() {
+        let (pp, ap) = (p.decay(), a.ty.decay());
+        if let (TypeK::Ptr(pt), TypeK::Ptr(at)) = (&*pp, &*ap) {
+            if !pointee_compatible(pt, at) {
+                let name = match &callee.kind {
+                    ExprK::Var(n) => n.clone(),
+                    _ => "function".into(),
+                };
+                return Err(format!(
+                    "{line}: passing argument {} of `{name}` from incompatible pointer type \
+                     (-Werror=incompatible-pointer-types)",
+                    i + 1
+                ));
+            }
+        }
+    }
+    Ok(())
 }

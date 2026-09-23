@@ -2622,6 +2622,23 @@ fn sem_narrow_multiply_matches_32bit() {
 }
 
 #[test]
+fn strict_pointer_args_refuse_incompatible_pointers() {
+    let bad = "typedef struct { int x, y, z; } V3; V3 v[4];\n\
+               void set(const unsigned char *p); void f(void) { set(v); }";
+    // off by default: compiles (gcc < 14 only warns here too)
+    assert!(crate::compile(bad).is_ok());
+    crate::set_strict_pointer_args(true);
+    let e = crate::compile(bad).expect_err("V3* -> uchar* must be refused under the flag");
+    assert!(e.contains("incompatible pointer"), "unexpected: {e}");
+    // what gcc accepts under the same flag must still compile
+    let ok = "void s(void *p); void u(unsigned char *p); void t(const char **q);\n\
+              int g(void) { int x; signed char c[2]; char *pc = 0; s(&x); u(c); t(&pc); return 0; }";
+    let r = crate::compile(ok);
+    crate::set_strict_pointer_args(false);
+    assert!(r.is_ok(), "{r:?}");
+}
+
+#[test]
 fn sem_struct_return_by_value() {
     // A struct RESULT is returned through a per-function static buffer whose
     // address comes back in D0 (the convention the call side already used).

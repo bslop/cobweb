@@ -13,6 +13,7 @@ mod parser;
 mod preprocess;
 
 pub use parser::const_eval;
+pub use parser::set_strict_pointer_args;
 
 /// Compile C source to 68000 assembly (user code only — no runtime/startup).
 /// `src` is assumed already preprocessed (see [`compile_file`] for the full
