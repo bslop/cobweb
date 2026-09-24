@@ -410,6 +410,57 @@ fn aligned_attribute_is_honored() {
     assert!(bss.contains(".align 16"), "aligned(16) dropped:\n{asm}");
 }
 
+/// The `.align` directive emitted directly above `label:` (None if there is none).
+fn align_before(asm: &str, label: &str) -> Option<u32> {
+    let lines: Vec<&str> = asm.lines().collect();
+    let at = lines.iter().position(|l| l.trim() == format!("{label}:"))?;
+    let prev = lines[..at].iter().rev().find(|l| !l.trim().starts_with(".globl"))?;
+    prev.trim().strip_prefix(".align ").and_then(|n| n.trim().parse().ok())
+}
+
+// ☠ jag_resident run 267p: `#define SD_ALIGN __attribute__((aligned(32)))`
+// used as `static SD_ALIGN uint8_t sd_plates[...]` was DROPPED - the attribute
+// sits in the declaration specifiers, where the old capture found `static`
+// and no declarator. The plate buffer landed at 4 mod 8 as soon as an
+// unrelated array moved out of the file, and every Blitter phrase copy of a
+// room background came out skewed by 4 bytes.
+#[test]
+fn prefix_aligned_attribute_is_honored() {
+    let asm = crate::compile(
+        "typedef unsigned char u8;\n\
+         static __attribute__((aligned(32))) u8 plates[40];\n\
+         static char pad1;\n\
+         static __attribute__((aligned(16))) u8 a[3], b[5];\n\
+         static u8 __attribute__((aligned(8))) after_type[3];\n\
+         static __attribute__((aligned(32))) u8 inited[4] = { 1, 2, 3, 4 };\n\
+         static u8 plain[3];\n\
+         int use(void){\n\
+             static __attribute__((aligned(32))) u8 hdr[32];\n\
+             return plates[0] + pad1 + a[0] + b[0] + after_type[0] + inited[0]\n\
+                  + plain[0] + hdr[0];\n\
+         }",
+    )
+    .unwrap();
+    assert_eq!(align_before(&asm, "plates"), Some(32), "prefix aligned(32) dropped:\n{asm}");
+    assert_eq!(align_before(&asm, "a"), Some(16), "first declarator:\n{asm}");
+    assert_eq!(align_before(&asm, "b"), Some(16), "second declarator of the same declaration:\n{asm}");
+    assert_eq!(align_before(&asm, "after_type"), Some(8), "attribute between type and name:\n{asm}");
+    assert_eq!(align_before(&asm, "inited"), Some(32), "initialized (.data):\n{asm}");
+    assert_eq!(align_before(&asm, "plain"), None, "an unattributed array must not inherit it:\n{asm}");
+    assert!(asm.lines().any(|l| l.trim().starts_with("hdr__s")), "static local missing:\n{asm}");
+    let hdr = asm.lines().find(|l| l.trim().starts_with("hdr__s") && l.trim().ends_with(':')).unwrap();
+    assert_eq!(align_before(&asm, hdr.trim().trim_end_matches(':')), Some(32),
+               "prefix-aligned static local:\n{asm}");
+    // a prefix attribute on a parameter or a function body binds to nothing
+    let asm2 = crate::compile(
+        "static __attribute__((aligned(16))) int f(int x){ return x; }\n\
+         static int g;\n\
+         int h(void){ return f(g); }",
+    )
+    .unwrap();
+    assert_eq!(align_before(&asm2, "g"), None, "a function's attribute leaked to the next object:\n{asm2}");
+}
+
 // ── diagnostic line attribution ──────────────────────────────────────────────
 // The preprocessor removes/inserts lines (#include splicing, dead #if blocks,
 // gathered macro calls). Errors must still name the ORIGINAL source line —

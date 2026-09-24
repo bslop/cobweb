@@ -64,8 +64,22 @@ fn strip_gnu(toks: Vec<Token>) -> (Vec<Token>, HashMap<String, u32>) {
     // GCC asm labels: `TYPE name __asm__("linkname")` renames `name`'s linkage
     // symbol to `linkname`. Collected here, applied to every use in a second pass.
     let mut renames: HashMap<String, String> = HashMap::new();
-    // `__attribute__((aligned(N)))` per declarator name (postfix position).
+    // `__attribute__((aligned(N)))` per declarator name. POSTFIX position
+    // (`T name[n] __attribute__((aligned(N)))`) names its declarator directly.
+    // PREFIX position - in the declaration specifiers, `static
+    // __attribute__((aligned(32))) uint8_t buf[n];`, which is what a
+    // `#define SD_ALIGN __attribute__((aligned(32)))` produces - applies to
+    // EVERY declarator of the declaration (GCC), so it is held as `pending`
+    // and bound to each declarator's name as its `=`, `,` or `;` arrives.
+    // ☠ Until jag_resident run 267p the prefix form was DROPPED: the name
+    // lookup saw `static` and found no declarator, so a buffer the source
+    // declared 32-aligned was placed wherever the section put it - and a
+    // plate buffer at 4 mod 8 skews every Blitter phrase copy by 4 bytes.
     let mut aligns: HashMap<String, u32> = HashMap::new();
+    let mut pending: Option<u32> = None; // a prefix aligned(N) awaiting its declarators
+    let mut pdepth = 0i32; // ( [ { depth since the prefix attribute
+    let mut pinit = false; // inside the current declarator's initializer
+    let mut papplied = false; // the current declarator already has it
     while i < toks.len() {
         if let Tok::Ident(s) = &toks[i].tok {
             match s.as_str() {
@@ -108,8 +122,16 @@ fn strip_gnu(toks: Vec<Token>) -> (Vec<Token>, HashMap<String, u32>) {
                             }
                             i += 1;
                         }
-                        // Capture `aligned(N)` for the declarator this attribute
-                        // trails (GPU-shared buffers depend on it).
+                        // Capture `aligned(N)` for the declarator(s) this
+                        // attribute belongs to (GPU-shared buffers depend on it).
+                        // PREFIX when a declarator or more specifiers follow it
+                        // (an identifier, a keyword, `*`, `(`); POSTFIX when the
+                        // declaration goes on to `;`, `,`, `=` or a body.
+                        let prefix = match toks.get(i).map(|t| &t.tok) {
+                            Some(Tok::Ident(_)) | Some(Tok::Keyword(_)) => true,
+                            Some(Tok::Punct(p)) => p == "*" || p == "(",
+                            _ => false,
+                        };
                         let mut j = start;
                         while j < i {
                             if matches!(&toks[j].tok, Tok::Ident(a) if a == "aligned" || a == "__aligned__") {
@@ -118,7 +140,12 @@ fn strip_gnu(toks: Vec<Token>) -> (Vec<Token>, HashMap<String, u32>) {
                                     toks.get(j + 2).map(|t| &t.tok),
                                 ) {
                                     if o == "(" && *n > 0 {
-                                        if let Some(name) = declarator_name(&out) {
+                                        if prefix {
+                                            pending = Some(*n as u32);
+                                            pdepth = 0;
+                                            pinit = false;
+                                            papplied = false;
+                                        } else if let Some(name) = declarator_name(&out) {
                                             aligns.insert(name, *n as u32);
                                         }
                                     }
@@ -154,6 +181,44 @@ fn strip_gnu(toks: Vec<Token>) -> (Vec<Token>, HashMap<String, u32>) {
                     continue;
                 }
                 _ => {}
+            }
+        }
+        // A prefix aligned(N) binds to each declarator as it completes: at its
+        // `=` (then skip the initializer), at a `,` (the next declarator gets it
+        // too), at the `;` (done). A `{` that is not an initializer is a body
+        // (a function, a struct/union type) - the declaration had no object.
+        if let Some(n) = pending {
+            if let Tok::Punct(p) = &toks[i].tok {
+                match p.as_str() {
+                    "(" | "[" => pdepth += 1,
+                    "{" if pdepth == 0 && !pinit => pending = None,
+                    "{" => pdepth += 1,
+                    ")" | "]" | "}" => {
+                        pdepth -= 1;
+                        if pdepth < 0 {
+                            pending = None; // it closed something opened before it
+                        }
+                    }
+                    "=" | "," | ";" if pdepth == 0 => {
+                        if !papplied {
+                            if let Some(name) = declarator_name(&out) {
+                                aligns.insert(name, n);
+                            }
+                        }
+                        match p.as_str() {
+                            "=" => {
+                                papplied = true;
+                                pinit = true;
+                            }
+                            "," => {
+                                papplied = false;
+                                pinit = false;
+                            }
+                            _ => pending = None,
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
         out.push(toks[i].clone());
