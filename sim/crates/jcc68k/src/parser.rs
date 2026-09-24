@@ -300,6 +300,35 @@ impl Parser {
             .insert(name.to_string(), VarRef { name: uniq.clone(), ty, is_global: false });
         uniq
     }
+    /// C11 6.7.9p22: an array of unknown size (`T a[] = {...}`,
+    /// `char s[] = "..."`) is COMPLETED by its initializer. Without this the
+    /// declared type stayed `Array(el, 0)` while the right bytes were emitted,
+    /// so `sizeof a` was 0 (a `sizeof a / sizeof a[0]` loop ran zero times -
+    /// found in jag_resident, whose silent-room table then matched nothing) and
+    /// a stack local got a 0-byte frame slot its elements overwrote.
+    fn complete_array(ty: &Type, nelems: usize) -> Type {
+        if let TypeK::Array(el, 0) = &**ty {
+            return Rc::new(TypeK::Array(el.clone(), nelems as u32));
+        }
+        ty.clone()
+    }
+    /// Element count of a global image for `ty` (one item per BYTE, see InitByte).
+    fn image_elems(ty: &Type, image: &[InitByte]) -> usize {
+        match &**ty {
+            TypeK::Array(el, 0) if el.size() > 0 => image.len() / el.size() as usize,
+            _ => 0,
+        }
+    }
+    /// Element count of a local initializer for an unknown-size array.
+    fn init_elems(init: &Init) -> usize {
+        match init {
+            Init::List(v) => v.len(),
+            Init::Scalar(e) => match &*e.ty {
+                TypeK::Array(_, n) => *n as usize, // a string literal, NUL included
+                _ => 1,
+            },
+        }
+    }
     fn add_global_scope(&mut self, name: &str, ty: Type) {
         self.scopes
             .first_mut()
@@ -391,8 +420,14 @@ impl Parser {
     fn global_var(&mut self, name: String, ty: Type, sc: &Storage) -> PResult<()> {
         self.add_global_scope(&name, ty.clone());
         let mut init = None;
+        let mut ty = ty;
         if self.eat_punct("=") {
-            init = Some(self.global_initializer(&ty)?);
+            let image = self.global_initializer(&ty)?;
+            if matches!(&*ty, TypeK::Array(_, 0)) {
+                ty = Self::complete_array(&ty, Self::image_elems(&ty, &image));
+                self.add_global_scope(&name, ty.clone());
+            }
+            init = Some(image);
         }
         let align = self.aligns.get(&name).copied().unwrap_or(0);
         // C11 6.9.2: repeated file-scope declarations of one identifier name
@@ -970,8 +1005,17 @@ impl Parser {
                     VarRef { name: uniq.clone(), ty: ty.clone(), is_global: true },
                 );
                 let mut init = None;
+                let mut ty = ty;
                 if self.eat_punct("=") {
-                    init = Some(self.global_initializer(&ty)?);
+                    let image = self.global_initializer(&ty)?;
+                    if matches!(&*ty, TypeK::Array(_, 0)) {
+                        ty = Self::complete_array(&ty, Self::image_elems(&ty, &image));
+                        self.scopes.last_mut().unwrap().insert(
+                            name.clone(),
+                            VarRef { name: uniq.clone(), ty: ty.clone(), is_global: true },
+                        );
+                    }
+                    init = Some(image);
                 }
                 let align = self.aligns.get(&name).copied().unwrap_or(0);
                 self.globals.push(Global {
@@ -982,6 +1026,19 @@ impl Parser {
                     is_extern: false,
                     align,
                 });
+                if !self.eat_punct(",") {
+                    break;
+                }
+                continue;
+            }
+            // An unknown-size array takes its length from the initializer, so
+            // that is parsed FIRST and the frame slot is sized from the result.
+            if matches!(&*ty, TypeK::Array(_, 0)) && self.at_punct("=") {
+                self.expect("=")?;
+                let init = self.initializer()?;
+                let ty = Self::complete_array(&ty, Self::init_elems(&init));
+                let uniq = self.new_local(&name, ty.clone(), sc.is_volatile);
+                out.push(Stmt::Decl(uniq, ty, Some(init)));
                 if !self.eat_punct(",") {
                     break;
                 }

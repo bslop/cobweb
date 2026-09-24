@@ -2906,3 +2906,70 @@ fn rle_store_forwarding_is_correct() {
     "#;
     assert_eq!(run(src), 12 + 6);
 }
+
+// ── arrays sized by their initializer (found compiling jag_resident, run 267n) ─
+// `T a[] = {...}` declares an INCOMPLETE array type that the initializer
+// completes (C11 6.7.9p22). jcc68k emitted the right bytes but kept the type at
+// length 0, so `sizeof a` was 0 and `sizeof a / sizeof a[0]` looped zero times -
+// jag_resident's silent-room table matched nothing. For a stack local the frame
+// slot was 0 bytes as well, so the elements overwrote the neighbours.
+
+#[test]
+fn sizeof_global_array_sized_by_initializer() {
+    let src = r#"
+        static const unsigned short t[] = { 0x101, 0x102, 0x106, 0x203 };
+        int main() { return sizeof t * 100 + sizeof t / sizeof t[0]; }
+    "#;
+    assert_eq!(run(src), 8 * 100 + 4);
+}
+
+#[test]
+fn loop_over_global_array_sized_by_initializer() {
+    // the jag_resident shape, verbatim: a membership test bounded by sizeof
+    let src = r#"
+        static const unsigned short rooms[] = { 0x101, 0x102, 0x106, 0x109, 0x203 };
+        static int in_set(int id) {
+            unsigned i;
+            for (i = 0; i < sizeof rooms / sizeof rooms[0]; i++)
+                if (rooms[i] == (unsigned short)id) return 1;
+            return 0;
+        }
+        int main() { return in_set(0x106) * 10 + in_set(0x203) * 100 + in_set(0x107); }
+    "#;
+    assert_eq!(run(src), 110);
+}
+
+#[test]
+fn sizeof_static_local_array_sized_by_initializer() {
+    let src = r#"
+        int main() {
+            static const long k[] = { 7, 8, 9 };
+            return sizeof k / sizeof k[0] * 10 + k[2];
+        }
+    "#;
+    assert_eq!(run(src), 39);
+}
+
+#[test]
+fn stack_array_sized_by_initializer_owns_its_slot() {
+    // a 0-byte slot lets the elements overwrite the locals declared around it
+    let src = r#"
+        int main() {
+            int before = 11;
+            int a[] = { 1, 2, 3, 4 };
+            int after = 22;
+            return (int)(sizeof a / sizeof a[0]) * 1000 + before * 10 + after
+                   + a[0] + a[3] * 100;
+        }
+    "#;
+    assert_eq!(run(src), 4 * 1000 + 110 + 22 + 1 + 400);
+}
+
+#[test]
+fn sizeof_char_array_sized_by_string() {
+    let src = r#"
+        static const char s[] = "RESAVE";
+        int main() { return sizeof s; }
+    "#;
+    assert_eq!(run(src), 7);
+}
