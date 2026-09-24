@@ -1672,6 +1672,55 @@ impl Parser {
                 self.strings.push(bytes);
                 Ok(Expr { kind: ExprK::StrLit(idx), ty: Rc::new(TypeK::Array(t_char(), len)), line })
             }
+            Tok::Ident(s) if s == "__builtin_offsetof" => {
+                // offsetof(T, m) (C11 7.19), which <stddef.h> maps here. It has
+                // to be a BUILTIN: the portable macro `(size_t)&((T*)0)->m` is
+                // not an integer constant expression to `const_eval`, and a
+                // header WITHOUT offsetof was worse than an error - the call
+                // `offsetof(S, f)` parsed as an implicit extern function taking
+                // a typedef name as an argument, compiled clean, and emitted
+                // `jsr offsetof` (jag_resident run 267p, core/state.c).
+                // Designator: member ( '.' member | '[' const ']' )*.
+                self.pos += 1;
+                self.expect("(")?;
+                let (base, _) = self.declspec()?;
+                let (_, mut ty) = self.declarator(base)?;
+                self.expect(",")?;
+                let mut off: i64 = 0;
+                let mut name = self.ident()?;
+                loop {
+                    let (mty, moff) = match &*ty {
+                        TypeK::Struct { members, .. } => {
+                            let m = members
+                                .iter()
+                                .find(|m| m.name == name)
+                                .ok_or_else(|| format!("{line}: offsetof: no member '{name}'"))?;
+                            (m.ty.clone(), m.offset)
+                        }
+                        _ => return Err(format!("{line}: offsetof on a non-struct type")),
+                    };
+                    off += moff as i64;
+                    ty = mty;
+                    while self.eat_punct("[") {
+                        let idx = self.expr()?;
+                        self.expect("]")?;
+                        let k = const_eval(&idx)?;
+                        let elem = match &*ty {
+                            TypeK::Array(b, _) => b.clone(),
+                            _ => return Err(format!("{line}: offsetof: '[' on a non-array member")),
+                        };
+                        off += k * elem.size() as i64;
+                        ty = elem;
+                    }
+                    if self.eat_punct(".") {
+                        name = self.ident()?;
+                        continue;
+                    }
+                    break;
+                }
+                self.expect(")")?;
+                Ok(Expr { kind: ExprK::Num(off), ty: t_uint(), line })
+            }
             Tok::Ident(s) => {
                 self.pos += 1;
                 if let Some(&v) = self.enum_consts.get(&s) {

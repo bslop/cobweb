@@ -108,7 +108,8 @@ fn builtin_header(name: &str) -> Option<&'static str> {
         // turned these into stray `#` tokens the parser choked on. Use `\n`.
         "stddef.h" => {
             "typedef unsigned int size_t; typedef int ptrdiff_t;\n\
-             #define NULL ((void*)0)\n"
+             #define NULL ((void*)0)\n\
+             #define offsetof(T, m) __builtin_offsetof(T, m)\n"
         }
         "stdbool.h" => {
             "typedef int bool;\n\

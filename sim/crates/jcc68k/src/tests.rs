@@ -2973,3 +2973,51 @@ fn sizeof_char_array_sized_by_string() {
     "#;
     assert_eq!(run(src), 7);
 }
+
+// offsetof (C11 7.19). <stddef.h> had no offsetof, and that did not fail: the
+// call parsed as an implicit extern function taking a typedef name as an
+// argument and emitted `jsr offsetof` (jag_resident run 267p, core/state.c's
+// layout asserts). Each case below is checked against the portable
+// pointer-difference probe, never against a number typed from the layout.
+const OFFSETOF_DECL: &str = "typedef struct { char a[3]; int b; short c[4]; \
+     struct { char x; int y; } n; unsigned char tail[5]; } S;";
+
+#[test]
+fn offsetof_is_an_integer_constant_expression() {
+    // the array-size assert pattern: only an ICE can size an array
+    let src = format!(
+        "#include <stddef.h>\n{OFFSETOF_DECL}\n\
+         typedef char chk_b[(offsetof(S, b) == 4) ? 1 : -1];\n\
+         typedef char chk_y[(offsetof(S, n.y) == 18) ? 1 : -1];\n\
+         static const unsigned tab[3] = {{ offsetof(S, b), offsetof(S, c[2]), offsetof(S, tail) }};\n\
+         int main(void) {{ return (int)(sizeof(chk_b) + sizeof(chk_y)) * 1000 + (int)tab[0] * 100 \
+                           + (int)tab[1] * 10 + (int)(tab[2] - 20); }}\n"
+    );
+    assert_eq!(offset_probe(OFFSETOF_DECL, "S", "b"), 4);
+    assert_eq!(offset_probe(OFFSETOF_DECL, "S", "c[2]"), 12);
+    assert_eq!(offset_probe(OFFSETOF_DECL, "S", "n.y"), 18);
+    assert_eq!(offset_probe(OFFSETOF_DECL, "S", "tail"), 22);
+    assert_eq!(run_pp(&src), 2 * 1000 + 4 * 100 + 12 * 10 + 2);
+}
+
+#[test]
+fn offsetof_matches_the_pointer_probe_at_run_time() {
+    for field in ["a", "b", "c", "c[3]", "n", "n.x", "n.y", "tail", "tail[4]"] {
+        let src = format!(
+            "#include <stddef.h>\n{OFFSETOF_DECL}\n\
+             int main(void) {{ return (int)offsetof(S, {field}); }}\n"
+        );
+        assert_eq!(run_pp(&src), offset_probe(OFFSETOF_DECL, "S", field), "offsetof(S, {field})");
+    }
+}
+
+#[test]
+fn offsetof_rejects_a_member_that_does_not_exist() {
+    let src = format!("#include <stddef.h>\n{OFFSETOF_DECL}\nint main(void) {{ return (int)offsetof(S, nope); }}\n");
+    let dir = std::env::temp_dir().join(format!("jcc_off_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let main_c = dir.join("main.c");
+    std::fs::write(&main_c, &src).unwrap();
+    let inc = vec![dir.to_string_lossy().to_string()];
+    assert!(crate::compile_file(&src, &main_c, &inc).is_err(), "offsetof of a missing member compiled");
+}
