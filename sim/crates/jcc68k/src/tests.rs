@@ -330,6 +330,20 @@ fn unsupported_extended_asm_is_a_hard_error() {
 }
 
 #[test]
+fn named_label_inside_basic_asm() {
+    // Every asm line went out indented, so `skip:` reached jas as an
+    // instruction ("unknown 68000 instruction 'skip:'") and the branch to it
+    // was undefined. A label - alone or followed by an instruction - goes to
+    // column 0; the branch around it must work.
+    let src = "int f(int x){ asm(\"move.l 8(a6),d0\\n\\ttst.l d0\\n\\tbeq.s skip\\n\\tmoveq #5,d0\\nskip:\"); }\n\
+               int g(void){ asm(\"moveq #0,d0\\n\\tbra.s out\\n\\tmoveq #9,d0\\nout: addq.l #2,d0\"); }\n\
+               int main(){ return f(0) * 100 + f(3) * 10 + g(); }";
+    let asm = crate::compile_program(src).unwrap();
+    assert!(asm.lines().any(|l| l == "skip:"), "label not at column 0:\n{asm}");
+    assert_eq!(run(src), 0 * 100 + 5 * 10 + 2);
+}
+
+#[test]
 fn asm_label_still_renames() {
     // The declarator form is a symbol rename, not a statement — must keep working.
     let asm = crate::compile(

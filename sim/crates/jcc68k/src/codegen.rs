@@ -701,19 +701,24 @@ impl Gen {
         Ok(())
     }
 
-    /// Emit one inline-asm line. A `.Lnl…:` label (from `gas_local_labels`)
-    /// goes out at column 0 like every other label - indented, jas reads it
-    /// as a directive - and anything after it on the same line follows.
+    /// Emit one inline-asm line. A label - named (`skip:`) or a `.Lnl…:`
+    /// from `gas_local_labels` - goes out at column 0 like every other label
+    /// (indented, jas reads it as an instruction), and anything after it on
+    /// the same line follows.
     fn asm_line(&mut self, l: &str) {
-        if l.starts_with(".Lnl") {
-            if let Some(c) = l.find(':') {
-                self.lbl(&l[..c]);
-                let rest = l[c + 1..].trim();
-                if !rest.is_empty() {
-                    self.line(rest);
-                }
-                return;
+        let name_len = l
+            .char_indices()
+            .take_while(|&(i, c)| {
+                c == '_' || c == '.' || c.is_ascii_alphabetic() || (i > 0 && (c.is_ascii_digit() || c == '$'))
+            })
+            .count();
+        if name_len > 0 && l[name_len..].starts_with(':') {
+            self.lbl(&l[..name_len]);
+            let rest = l[name_len + 1..].trim();
+            if !rest.is_empty() {
+                self.line(rest);
             }
+            return;
         }
         if !l.is_empty() {
             self.line(l);
