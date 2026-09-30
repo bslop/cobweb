@@ -397,6 +397,9 @@ pub struct Bus {
     /// exactly how one project shipped eleven sessions of DSP work that had
     /// never executed on hardware. Counted so the run can say so out loud.
     pub risc_ram_narrow_writes: u64,
+    /// `Strict::narrow`: latch the first 68000 narrow write into RISC RAM.
+    pub strict_narrow: bool,
+    pub strict_fault: Option<crate::debug::StrictFault>,
     /// Captured stereo audio (interleaved L,R 16-bit) when `audio_capture` is on.
     pub audio: Vec<i16>,
     pub audio_capture: bool,
@@ -547,6 +550,8 @@ impl Bus {
             jerry: Jerry::new(),
             access_count: 0,
             risc_ram_narrow_writes: 0,
+            strict_narrow: false,
+            strict_fault: None,
             audio: Vec::new(),
             audio_capture: false,
             audio_rate: 44_100,
@@ -683,6 +688,14 @@ impl Bus {
                 || (0x00F1_B000..0x00F1_D000).contains(&a))
         {
             self.risc_ram_narrow_writes += 1;
+            if self.strict_narrow && self.cur_master == Master::Cpu && self.strict_fault.is_none() {
+                self.strict_fault = Some(crate::debug::StrictFault {
+                    kind: "narrow_risc_ram_write",
+                    master: "68k",
+                    pc: self.cur_master_pc,
+                    addr: a,
+                });
+            }
         }
         self.watch_note(a, 8, v as u32);
         if mem::is_dram(a) {

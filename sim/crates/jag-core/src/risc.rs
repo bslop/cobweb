@@ -185,6 +185,11 @@ pub struct Risc {
     /// have stopped by then, which resets the streak to zero and made an early
     /// version of this report "never cleared RISCGO for 0 consecutive frames".
     pub stuck_at: Option<(u32, u32)>,
+    /// Strict silicon checks armed on this core, and the first one that fired.
+    /// A fault ends the core's slice at once, and `Jaguar::run_to_frame`
+    /// stops the machine.
+    pub strict: crate::debug::Strict,
+    pub strict_fault: Option<crate::debug::StrictFault>,
 }
 
 impl Risc {
@@ -236,6 +241,9 @@ impl Risc {
                             e.2 += 1;
                             break;
                         }
+                    }
+                    if self.strict.roundtrip {
+                        self.strict_trip("store_load_roundtrip", a);
                     }
                 }
                 return;
@@ -292,6 +300,8 @@ impl Risc {
             frames_running: 0,
             stuck_after_frames: None,
             stuck_at: None,
+            strict: crate::debug::Strict::default(),
+            strict_fault: None,
         }
     }
 
@@ -334,6 +344,17 @@ impl Risc {
                 self.pipe.stats.narrow_sram_first_pc = self.pc;
             }
             self.pipe.stats.narrow_sram += 1;
+            if self.strict.narrow {
+                self.strict_trip("narrow_sram", a);
+            }
+        }
+    }
+
+    /// Latch the first strict fault (PC and address) on this core.
+    pub(crate) fn strict_trip(&mut self, kind: &'static str, addr: u32) {
+        if self.strict_fault.is_none() {
+            let master = if self.kind.is_dsp() { "dsp" } else { "gpu" };
+            self.strict_fault = Some(crate::debug::StrictFault { kind, master, pc: self.pc, addr });
         }
     }
 
@@ -547,6 +568,9 @@ impl Risc {
                     // is opt-in — a global-window substitution over-corrupts.
                     self.pipe.stats.dram_stale += 1;
                     self.pipe.stats.dram_stale_pc = self.pc;
+                    if self.strict.dram_stale {
+                        self.strict_trip("dram_stale", a);
+                    }
                     if self.dram_stale_subst {
                         return po;
                     }
@@ -667,7 +691,7 @@ impl Risc {
         let mut spent: u32 = self.budget_debt.min(budget);
         self.budget_debt -= spent;
         while spent < budget {
-            if !self.running {
+            if !self.running || self.strict_fault.is_some() {
                 break;
             }
             if !bus.watches.is_empty() {
@@ -1251,6 +1275,88 @@ mod tests {
         gpu.fidelity = fid;
         gpu.run(&mut bus, budget);
         (bus, gpu)
+    }
+
+    /// `Strict`: a GPU byte store into its own local RAM is a silicon fault
+    /// jsim executes "correctly". Strict mode latches it (PC, address) and
+    /// ends the core's slice at once, so nothing after it runs; without it
+    /// the access is only counted.
+    #[test]
+    fn strict_narrow_sram_stops_the_core() {
+        let prog = [
+            enc(35, 7, 2),                 // moveq #7,r2
+            enc(38, 0, 1), 0x3100, 0x00F0, // movei #$00F03100,r1
+            enc(45, 1, 2),                 // storeb r2,(r1)  -> the fault
+            enc(38, 0, 4), 0x0000, 0x0010, // movei #$00100000,r4
+            enc(47, 4, 2),                 // store r2,(r4)   -> must not run
+            enc(57, 0, 0),
+        ];
+        let setup = |strict: crate::debug::Strict| {
+            let mut bus = Bus::new();
+            for (i, &w) in prog.iter().enumerate() {
+                bus.write16(mem::G_RAM + (i as u32) * 2, w);
+            }
+            bus.write32(mem::G_PC, mem::G_RAM);
+            bus.write32(mem::G_CTRL, mem::RISCGO);
+            let mut gpu = Risc::new(RiscKind::Gpu);
+            gpu.strict = strict;
+            gpu.run(&mut bus, 64);
+            (bus, gpu)
+        };
+        let (mut bus, gpu) = setup(crate::debug::Strict { narrow: true, ..Default::default() });
+        let f = gpu.strict_fault.clone().expect("the narrow store must latch a fault");
+        assert_eq!((f.kind, f.master, f.addr), ("narrow_sram", "gpu", 0x00F0_3100));
+        assert!((mem::G_RAM..mem::G_RAM + 16).contains(&f.pc), "PC {:06X} is in the program", f.pc);
+        assert_eq!(bus.read32(0x0010_0000), 0, "nothing after the fault may run");
+        // not armed: counted as before, execution continues
+        let (mut bus, gpu) = setup(crate::debug::Strict::default());
+        assert!(gpu.strict_fault.is_none());
+        assert_eq!(gpu.pipe.stats.narrow_sram, 1);
+        assert_eq!(bus.read32(0x0010_0000), 7);
+    }
+
+    #[test]
+    fn strict_div_by_zero_latches() {
+        let prog = [
+            enc(35, 0, 1), // moveq #0,r1
+            enc(35, 5, 2), // moveq #5,r2
+            enc(21, 1, 2), // div r1,r2
+            enc(57, 0, 0),
+        ];
+        let mut bus = Bus::new();
+        for (i, &w) in prog.iter().enumerate() {
+            bus.write16(mem::G_RAM + (i as u32) * 2, w);
+        }
+        bus.write32(mem::G_PC, mem::G_RAM);
+        bus.write32(mem::G_CTRL, mem::RISCGO);
+        let mut gpu = Risc::new(RiscKind::Gpu);
+        gpu.strict = crate::debug::Strict { div0: true, ..Default::default() };
+        gpu.run(&mut bus, 64);
+        assert_eq!(gpu.strict_fault.as_ref().map(|f| f.kind), Some("div_by_zero"));
+    }
+
+    /// The 68000 side of `Strict::narrow`: a byte write into GPU RAM latches
+    /// on the bus with the 68k's PC, and a latched fault stops the machine.
+    #[test]
+    fn strict_68k_narrow_write_and_machine_stop() {
+        let mut bus = Bus::new();
+        bus.strict_narrow = true;
+        bus.cur_master = crate::bus::Master::Cpu;
+        bus.cur_master_pc = 0x4242;
+        bus.write32(0x00F0_3000, 0x1234_5678); // 32-bit: fine
+        assert!(bus.strict_fault.is_none());
+        bus.write8(0x00F0_3001, 1);
+        let f = bus.strict_fault.clone().expect("a 68k byte write into GPU RAM");
+        assert_eq!((f.kind, f.master, f.pc, f.addr), ("narrow_risc_ram_write", "68k", 0x4242, 0x00F0_3001));
+
+        let mut jag = crate::Jaguar::new();
+        jag.set_strict(crate::debug::Strict::ALL);
+        jag.run_frames(1);
+        assert!(jag.strict_fault().is_none(), "a blank machine trips nothing");
+        jag.bus.strict_fault = Some(f);
+        let at = jag.frame();
+        assert_eq!(jag.run_frames(5), crate::StopReason::Strict);
+        assert_eq!(jag.frame(), at, "stopped at once, not at the frame limit");
     }
 
     /// DRAM store->load round-trip staleness (jag_quake edge-table garble,

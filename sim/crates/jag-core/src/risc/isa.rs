@@ -201,6 +201,9 @@ pub(super) fn execute(core: &mut Risc, bus: &mut Bus, iw: u16) {
                 }
                 core.pipe.stats.div_by_zero_last_pc = core.pc;
                 core.pipe.stats.div_by_zero += 1;
+                if core.strict.div0 {
+                    core.strict_trip("div_by_zero", 0);
+                }
                 core.set_reg(b, r2, 0xFFFF_FFFF);
                 core.div_remainder = d;
             } else if core.div_offset {

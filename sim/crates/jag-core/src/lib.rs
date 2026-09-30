@@ -21,7 +21,7 @@ pub mod tom;
 
 pub use bus::Bus;
 pub use cart::{Cartridge, LoadError};
-pub use debug::{Debugger, StopReason};
+pub use debug::{Debugger, StopReason, Strict, StrictFault};
 pub use m68k::M68k;
 pub use risc::{Risc, RiscKind};
 pub use scheduler::Scheduler;
@@ -130,8 +130,27 @@ impl Jaguar {
                 };
             }
             illegal_seen = self.cpu.illegal_count;
+            if self.strict_fault().is_some() {
+                return StopReason::Strict;
+            }
         }
         StopReason::ReachedFrame(self.sched.frame)
+    }
+
+    /// Arm the strict silicon checks on every master (see [`Strict`]).
+    pub fn set_strict(&mut self, s: Strict) {
+        self.gpu.strict = s;
+        self.dsp.strict = s;
+        self.bus.strict_narrow = s.narrow;
+    }
+
+    /// The first strict fault latched by any master, if one has fired.
+    pub fn strict_fault(&self) -> Option<&StrictFault> {
+        self.gpu
+            .strict_fault
+            .as_ref()
+            .or(self.dsp.strict_fault.as_ref())
+            .or(self.bus.strict_fault.as_ref())
     }
 
     /// Advance `n` whole frames from the current position.

@@ -25,6 +25,57 @@ pub enum StopReason {
     Illegal { pc: u32, op: u32 },
     /// The CPU is stopped (STOP instruction) with no pending interrupt.
     Halted,
+    /// A `Strict` silicon fault: jsim would carry on and look right, silicon
+    /// would not. The latched fault says where (`Jaguar::strict_fault`).
+    Strict,
+}
+
+/// Silicon faults that stop the run instead of being counted (`jagemu
+/// --strict`). jsim executes each of these "correctly", so a pixel-exact
+/// comparison against a host reference passes while the program fails on
+/// hardware; strict mode turns that into a failed check. Off by default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Strict {
+    /// A GPU/DSP byte/word access to its own local RAM, or a 68000 byte/word
+    /// write into GPU/DSP RAM: silicon takes 32-bit accesses only there.
+    pub narrow: bool,
+    /// A load inside the `JAGEMU_DRAM_STALE` window (silicon fidelity only).
+    pub dram_stale: bool,
+    /// The always-on store->load same-DRAM-word round-trip detector.
+    pub roundtrip: bool,
+    /// A DIV by zero (silicon's result is unmeasured).
+    pub div0: bool,
+}
+
+impl Strict {
+    pub const ALL: Strict = Strict { narrow: true, dram_stale: true, roundtrip: true, div0: true };
+    pub const NAMES: &'static str = "narrow,dram-stale,roundtrip,div0";
+
+    /// Parse a comma-separated list of `NAMES` (or `all`).
+    pub fn parse(list: &str) -> Result<Strict, String> {
+        let mut s = Strict::default();
+        for k in list.split(',').map(str::trim).filter(|k| !k.is_empty()) {
+            match k {
+                "all" => s = Strict::ALL,
+                "narrow" => s.narrow = true,
+                "dram-stale" => s.dram_stale = true,
+                "roundtrip" => s.roundtrip = true,
+                "div0" => s.div0 = true,
+                other => return Err(format!("unknown strict check `{other}` (expected {})", Strict::NAMES)),
+            }
+        }
+        Ok(s)
+    }
+}
+
+/// The first strict fault: what, which master, its PC, and the address
+/// (0 where there is none, e.g. a divide by zero).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StrictFault {
+    pub kind: &'static str,
+    pub master: &'static str,
+    pub pc: u32,
+    pub addr: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

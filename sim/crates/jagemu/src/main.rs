@@ -48,6 +48,18 @@ fn main() -> ExitCode {
     if rest.iter().any(|a| a == "--audio") {
         AUDIO_ON.store(true, std::sync::atomic::Ordering::Relaxed);
     }
+    // --strict / --strict=<list>: global, like --audio, so every command
+    // that boots a ROM stops on the first silicon fault (see strict_arg).
+    match strict_arg(rest) {
+        Ok(s) => {
+            let _ = STRICT.set(s);
+        }
+        Err(e) => {
+            eprintln!("jagemu: error: {e}");
+            println!("{{\"ok\":false,\"error\":{}}}", jstr(&e));
+            return ExitCode::FAILURE;
+        }
+    }
     let result = match cmd {
         "info" => cmd_info(rest),
         "run" => cmd_run(rest),
@@ -77,6 +89,10 @@ fn main() -> ExitCode {
         other => Err(format!("unknown command: {other}")),
     };
     match result {
+        Ok(()) if STRICT_TRIPPED.load(std::sync::atomic::Ordering::Relaxed) => {
+            eprintln!("jagemu: --strict: a silicon fault stopped the run (see \"strict_fault\"); exit 3");
+            ExitCode::from(3)
+        }
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("jagemu: error: {e}");
@@ -97,6 +113,11 @@ fn usage() {
          \x20      [--gpu-map g.map] [--dsp-map d.map] [--start S] [--top K] [--bucket N]\n\
          \x20      [--prof-json p.json]      # full per-PC profile; diff two with profdiff.py\n\
          \x20 jagemu run <rom> --watchdog N   # warn if a core runs N frames without clearing GO\n\
+         \x20 --strict[=narrow,dram-stale,roundtrip,div0]   (any command that boots a ROM)\n\
+         \x20                   stop at the first silicon fault jsim would run through:\n\
+         \x20                   narrow GPU/DSP local-RAM access, JAGEMU_DRAM_STALE hit,\n\
+         \x20                   store->load DRAM round trip, DIV by zero. Bare = all.\n\
+         \x20                   The JSON's \"strict_fault\" names it (PC, address); exit 3\n\
          \x20 jagemu screenshot <rom> [--frames N] [--full-window] [-o out.png]\n\
          \x20                   --full-window: composite the WHOLE display window,\n\
          \x20                   so BGEN (the background colour, and any BG probe\n\
@@ -329,6 +350,63 @@ fn apply_audio(jag: &mut Jaguar) {
     }
 }
 
+/// `--strict[=list]`, parsed once in `main` (see `jag_core::Strict`).
+static STRICT: std::sync::OnceLock<jag_core::Strict> = std::sync::OnceLock::new();
+/// Set once a strict fault has been reported, so the process exits 3.
+static STRICT_TRIPPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `--strict` (every check) or `--strict=narrow,dram-stale,...`. Spelled with
+/// `=` because a bare word after it would be taken for the ROM path.
+fn strict_arg(args: &[String]) -> Result<jag_core::Strict, String> {
+    let mut s = jag_core::Strict::default();
+    for a in args {
+        if a == "--strict" {
+            s = jag_core::Strict::ALL;
+        } else if let Some(list) = a.strip_prefix("--strict=") {
+            s = jag_core::Strict::parse(list)?;
+        }
+    }
+    if s.dram_stale {
+        let win = std::env::var("JAGEMU_DRAM_STALE").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+        if win == 0 && s == jag_core::Strict::ALL {
+            // bare --strict: say what the dram-stale check needs
+            eprintln!(
+                "jagemu: --strict: the dram-stale check is inert without \
+                 JAGEMU_DRAM_STALE=<cycles> and --fidelity silicon"
+            );
+        } else if win == 0 {
+            return Err("--strict=dram-stale needs JAGEMU_DRAM_STALE=<cycles> (and --fidelity silicon)".into());
+        }
+    }
+    Ok(s)
+}
+
+/// Every machine jagemu builds, with the strict checks armed.
+fn new_machine() -> Jaguar {
+    let mut jag = Jaguar::new();
+    jag.set_strict(STRICT.get().copied().unwrap_or_default());
+    jag
+}
+
+/// The `strict_fault` JSON value (null when none fired). Also marks the
+/// process for exit status 3, so a strict run that tripped cannot pass.
+fn strict_json(jag: &Jaguar) -> String {
+    match jag.strict_fault() {
+        None => "null".into(),
+        Some(f) => {
+            STRICT_TRIPPED.store(true, std::sync::atomic::Ordering::Relaxed);
+            format!(
+                "{{\"kind\":{},\"master\":{},\"pc\":\"0x{:06X}\",\"addr\":\"0x{:06X}\",\"frame\":{}}}",
+                jstr(f.kind),
+                jstr(f.master),
+                f.pc,
+                f.addr,
+                jag.frame()
+            )
+        }
+    }
+}
+
 fn apply_watchdog(jag: &mut Jaguar) {
     let n = WATCHDOG_FRAMES.load(std::sync::atomic::Ordering::Relaxed);
     if n > 0 {
@@ -344,6 +422,18 @@ fn apply_watchdog(jag: &mut Jaguar) {
 /// costs a 195-second flash plus a physical power-cycle to discover the slow
 /// way — an opt-in flag would be off precisely on the run that needed it.
 fn report_hazard_diagnostics(jag: &Jaguar) {
+    if let Some(f) = jag.strict_fault() {
+        STRICT_TRIPPED.store(true, std::sync::atomic::Ordering::Relaxed);
+        eprintln!(
+            "jagemu: STRICT — stopped at the first silicon fault: {} by the {} at PC ${:06X}, \
+             address ${:06X} (frame {}). jsim would have run through it; silicon does not.",
+            f.kind,
+            f.master,
+            f.pc,
+            f.addr,
+            jag.frame()
+        );
+    }
     for (name, t) in [("Tom GPU", &jag.gpu.pipe.stats), ("Jerry DSP", &jag.dsp.pipe.stats)] {
         if t.div_by_zero > 0 {
             eprintln!(
@@ -405,7 +495,7 @@ fn boot_input(
     press_after: u64,
     fid: Fidelity,
 ) -> Result<Jaguar, String> {
-    let mut jag = Jaguar::new();
+    let mut jag = new_machine();
     jag.load(rom).map_err(|e| e.to_string())?;
     attach_sd(&mut jag);
     jag.gpu.fidelity = fid;
@@ -470,7 +560,7 @@ fn press_args(args: &[String]) -> Result<(u32, u64), String> {
 
 fn cmd_info(args: &[String]) -> Result<(), String> {
     let (path, data) = load_rom(args)?;
-    let mut jag = Jaguar::new();
+    let mut jag = new_machine();
     let cart = jag.load(&data).map_err(|e| e.to_string())?;
     attach_sd(&mut jag);
     let secs: Vec<String> = cart
@@ -623,7 +713,7 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     // byte" is the first question when silicon and emulator disagree.
     let watch = flag_val(args, "--watch").map(parse_range).transpose()?;
     if let Some((lo, hi)) = watch {
-        let mut jag = Jaguar::new();
+        let mut jag = new_machine();
         jag.load(&data).map_err(|e| e.to_string())?;
         attach_sd(&mut jag);
         let fid = fidelity_arg(args)?;
@@ -695,7 +785,7 @@ fn boot_profiled(
     prof_json: Option<&str>,
 ) -> Result<Jaguar, String> {
     let map = maps.m68k;
-    let mut jag = Jaguar::new();
+    let mut jag = new_machine();
     jag.load(rom).map_err(|e| e.to_string())?;
     attach_sd(&mut jag);
     jag.gpu.fidelity = fid;
@@ -1195,7 +1285,7 @@ fn cmd_video(args: &[String]) -> Result<(), String> {
     let out = flag_val(args, "-o").or_else(|| flag_val(args, "--out")).unwrap_or("video.png");
     let dir = flag_val(args, "--dir");
 
-    let mut jag = Jaguar::new();
+    let mut jag = new_machine();
     jag.load(&data).map_err(|e| e.to_string())?;
     attach_sd(&mut jag);
     let frames = jag_headless::capture_sequence(&mut jag, start, count, every, btn, after);
@@ -1271,7 +1361,7 @@ fn cmd_playtest(args: &[String]) -> Result<(), String> {
     }
     events.sort_by_key(|e| e.0);
 
-    let mut jag = Jaguar::new();
+    let mut jag = new_machine();
     jag.load(&data).map_err(|e| e.to_string())?;
     attach_sd(&mut jag);
 
@@ -1372,7 +1462,7 @@ fn cmd_audio(args: &[String]) -> Result<(), String> {
     // nothing stalls. Honour it: it is two assignments, and the DSP's cost is
     // exactly what an audio bring-up needs to measure.
     let fid = fidelity_arg(args)?;
-    let mut jag = Jaguar::new();
+    let mut jag = new_machine();
     jag.load(&data).map_err(|e| e.to_string())?;
     jag.gpu.fidelity = fid;
     jag.dsp.fidelity = fid;
@@ -1401,7 +1491,7 @@ fn audio_source(path: &str, args: &[String]) -> Result<(u32, u16, Vec<i16>), Str
     }
     let frames = flag_val(args, "--frames").map(parse_u64).transpose()?.unwrap_or(400);
     let (btn, after) = press_args(args)?;
-    let mut jag = Jaguar::new();
+    let mut jag = new_machine();
     jag.load(&bytes).map_err(|e| format!("{path}: {e}"))?;
     attach_sd(&mut jag);
     let (rate, samples, _) = jag_headless::capture_audio(&mut jag, frames, btn, after);
@@ -1639,7 +1729,7 @@ fn cmd_break(args: &[String]) -> Result<(), String> {
     } else {
         "68k"
     };
-    let mut jag = Jaguar::new();
+    let mut jag = new_machine();
     jag.load(&data).map_err(|e| e.to_string())?;
     attach_sd(&mut jag);
     jag.gpu.fidelity = fidelity_arg(args)?;
@@ -1948,7 +2038,7 @@ fn cmd_serve(args: &[String]) -> Result<(), String> {
     let _ = std::fs::remove_file(&sock);
     let listener = UnixListener::bind(&sock).map_err(|e| format!("bind {}: {e}", sock.display()))?;
 
-    let mut jag = Jaguar::new();
+    let mut jag = new_machine();
     let cart = jag.load(&data).map_err(|e| e.to_string())?;
     attach_sd(&mut jag);
     // serve honors --fidelity like every one-shot command (it was silently
@@ -2256,7 +2346,7 @@ fn state_json(jag: &Jaguar) -> String {
         bank.iter().map(|v| format!("\"0x{v:08X}\"")).collect::<Vec<_>>().join(",")
     };
     format!(
-        "{{\"frame\":{},\"pc\":{},\"pc_hex\":{},\"sr\":{},\"instret\":{},\"m68k_op_tax_cycles\":{},\"m68k_dram_poll_max\":{},\"m68k_dram_poll_addr\":\"0x{:06X}\",\"m68k_dram_poll_pc\":\"0x{:06X}\",\"illegal\":{},\
+        "{{\"strict_fault\":{},\"frame\":{},\"pc\":{},\"pc_hex\":{},\"sr\":{},\"instret\":{},\"m68k_op_tax_cycles\":{},\"m68k_dram_poll_max\":{},\"m68k_dram_poll_addr\":\"0x{:06X}\",\"m68k_dram_poll_pc\":\"0x{:06X}\",\"illegal\":{},\
          \"last_illegal_op\":\"0x{:04X}\",\
          \"m68k_stray_writes\":{},\"m68k_stray_write_addr\":\"0x{:06X}\",\"m68k_stray_write_pc\":\"0x{:06X}\",\"m68k_cart_writes\":{},\
          \"m68k_unaligned\":{},\"m68k_unaligned_addr\":\"0x{:06X}\",\"m68k_unaligned_pc\":\"0x{:06X}\",\"m68k_unaligned_pcs\":[{}],\
@@ -2267,6 +2357,7 @@ fn state_json(jag: &Jaguar) -> String {
          \"blitter\":{{\"bcmd_busy_reads\":{},\"bcmd_poll_in_settle\":{}}},\"risc_ram_narrow_writes\":{},{}\
          \"op\":{{\"scaled_misaligned_hits\":{},\"scaled_misaligned_addr\":\"0x{:06X}\",\"bitmap_misaligned_hits\":{},\"bitmap_misaligned_addr\":\"0x{:06X}\",\"bitmap_misaligned_last\":\"0x{:06X}\"}},\
          \"d\":[{}],\"a\":[{}]}}",
+        strict_json(jag),
         jag.frame(),
         cpu.pc,
         jstr(&format!("0x{:06X}", cpu.pc)),
