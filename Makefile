@@ -48,3 +48,9 @@ compat: sim
 clean:
 	cargo clean --manifest-path sim/Cargo.toml
 	$(MAKE) -C calib clean
+
+# ── reference editions: tools/make_edition.sh (rules come from a private file) ──
+.PHONY: edition
+edition:
+	@test -n "$(COMMIT)" || { echo "usage: make edition COMMIT=<commit> [DATE=YYYY-MM-DD] [OUT=dir] [RULES=file]"; exit 1; }
+	tools/make_edition.sh $(COMMIT) $(if $(DATE),--date $(DATE)) $(if $(OUT),--out $(OUT)) $(if $(RULES),--rules $(RULES))
