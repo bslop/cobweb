@@ -1315,6 +1315,38 @@ mod tests {
         assert_eq!(bus.read32(0x0010_0000), 7);
     }
 
+    /// A GPU that clears its own GO stops at that store on silicon: code
+    /// after the halt must not run here either, under any fidelity, and the
+    /// core must report stopped (a user report: "code after the halt store
+    /// runs only in the emulator").
+    #[test]
+    fn self_halt_stops_before_the_next_instruction() {
+        let prog = [
+            enc(38, 0, 1), 0x2114, 0x00F0, // movei #G_CTRL,r1
+            enc(35, 0, 2),                 // moveq #0,r2
+            enc(47, 1, 2),                 // store r2,(r1)   -> GO cleared
+            enc(38, 0, 4), 0x0000, 0x0010, // movei #$00100000,r4
+            enc(35, 7, 5),                 // moveq #7,r5
+            enc(47, 4, 5),                 // store r5,(r4)   -> must not run
+            enc(57, 0, 0),
+        ];
+        for fid in [Fidelity::Functional, Fidelity::Silicon, Fidelity::BigPEmu] {
+            let mut bus = Bus::new();
+            for (i, &w) in prog.iter().enumerate() {
+                bus.write16(mem::G_RAM + (i as u32) * 2, w);
+            }
+            bus.write32(mem::G_PC, mem::G_RAM);
+            bus.write32(mem::G_CTRL, mem::RISCGO);
+            let mut gpu = Risc::new(RiscKind::Gpu);
+            gpu.fidelity = fid;
+            gpu.run(&mut bus, 64);
+            assert!(!gpu.running, "{fid:?}: the core must report stopped");
+            assert_eq!(bus.read32(0x0010_0000), 0, "{fid:?}: code after the halt store ran");
+            gpu.run(&mut bus, 64); // the next slice must not restart it
+            assert_eq!(bus.read32(0x0010_0000), 0, "{fid:?}: restarted after the halt");
+        }
+    }
+
     #[test]
     fn strict_div_by_zero_latches() {
         let prog = [

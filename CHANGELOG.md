@@ -6,6 +6,40 @@ assigned at release.
 
 ## Unreleased
 
+### 2026-09-30 — jcc loads/signed/divide, jcc68k asm labels, `jagemu --strict`, DRAM staleness window
+
+- **jcc can read memory.** `load`/`loadw`/`loadb(addr)` (32/16/8-bit,
+  zero-extended) are expressions, so a kernel can read its parameter block,
+  input records and tables (`load(table + (i << 2))`). Each load is followed
+  by a read of its result register, so nothing can overwrite a register while
+  its load is in flight (writes are not scoreboarded). A byte/word load from a
+  constant GPU/DSP local-RAM address is a compile error.
+- **jcc signed comparisons and division.** `if (signed a < b)`: JRISC has no
+  overflow flag, so both operands get their sign bit flipped and the unsigned
+  compare decides. `/` is JRISC `div` (unsigned 32/32) with its result waited
+  for the same way; a program that divides clears G_DIVCTRL first. `sdiv(a,b)`
+  divides signed, truncating toward zero. Also `abs`, `neg`, unary `-`,
+  `imult` (signed 16×16; `*` is the unsigned `mult`) and `sar(x,n)`.
+- **jcc miscompile fixed:** `x = y - x` built `y` in `x`'s register and read
+  it back as `x`. Such assignments now go through a temporary. The jcc tests
+  run under silicon fidelity and require every hazard counter to be zero.
+- **jcc68k: named labels inside `asm("...")`.** Every inline-asm line was
+  indented, so `skip:` reached jas as an instruction. A `name:` at the start
+  of a line is now a label; numeric local labels (`1:`/`1f`/`1b`) keep working.
+- **`jagemu --strict[=narrow,dram-stale,roundtrip,div0]`** stops at the first
+  silicon fault jsim would otherwise run through: a GPU/DSP byte/word access
+  to its own local RAM or a 68000 byte/word write into GPU/DSP RAM; a load in
+  the `JAGEMU_DRAM_STALE` window; a store->load round trip on the same DRAM
+  word; a DIV by zero. The state JSON's `strict_fault` names the master, PC and
+  address, and the process exits 3, so a CI check fails instead of passing.
+  Detection only: runs without `--strict` are unchanged.
+- **`JAGEMU_DRAM_STALE=<cycles>`** (silicon fidelity only, off by default):
+  a same-core load of a DRAM word written within the window is counted
+  (`timing.dram_stale`, `dram_stale_pc`). `JAGEMU_DRAM_STALE_SUBST=1`
+  additionally returns the pre-write value; it is a blunt instrument (one
+  global window over-corrupts control values silicon tolerates), meant for
+  A/B experiments, not as a model of the board.
+
 ### 2026-09-16 — jsim: the GameDrive's 16 MB cartridge SDRAM, including the byte-write quirk
 
 - The GameDrive carries **16 MB of SDRAM in sixteen 1 MB banks**, six mapped at
