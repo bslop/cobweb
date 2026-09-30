@@ -3,12 +3,17 @@
 //! Static register allocation, no spills, no recursion. Variables live in
 //! r1–r13; expression evaluation uses a depth-indexed scratch pool (r24–r27);
 //! r16/r17 hold comparison operands; r20/r22 stage stores; r29/r30 are the
-//! self-stop epilogue. Every jump gets an explicit `nop` delay slot — correct
-//! by construction and left for jopt to fill. The output is fed straight back
+//! self-stop epilogue; r19 holds the sign-flip mask of a signed compare, r23
+//! an assignment whose right side reads its own target. Every jump gets an
+//! explicit `nop` delay slot — correct by construction and left for jopt to
+//! fill. Every `load` and `div` is followed by a read of its destination
+//! (`or rN,rN`), which the scoreboard holds until the result lands, so no later
+//! write can race the in-flight result (writes are not scoreboarded). The
+//! output is fed straight back
 //! through jas, which re-runs the hazard pass, so any codegen slip surfaces as
 //! a compile error rather than silent wrong silicon.
 
-use crate::parse::{Cond, Expr, Op, Rel, Stmt};
+use crate::parse::{Cond, Expr, Op, Rel, Stmt, UnOp};
 use std::collections::HashMap;
 
 /// Compilation failure.
@@ -44,12 +49,42 @@ const CMP_R: u16 = 17;
 const BR: u16 = 18; // branch-target register for movei+jump control flow
 const ST_VAL: u16 = 22;
 const ST_ADDR: u16 = 20;
+const SIGN: u16 = 19; // $80000000 for a signed compare
+const ASSIGN_TMP: u16 = 23;
+
+/// Word/byte accesses to GPU or DSP local RAM do not work on silicon (it
+/// takes 32-bit accesses only): refuse them when the address is a constant.
+fn narrow_local_ram(width: u8, addr: &Expr) -> bool {
+    use jag_core::mem::{D_RAM, G_RAM};
+    matches!(addr, Expr::Num(a) if width < 4
+        && ((G_RAM..G_RAM + 0x1000).contains(a) || (D_RAM..D_RAM + 0x2000).contains(a)))
+}
+
+/// Does `e` read `name` after `dst` has already been written? `eval` builds
+/// the leftmost operand in `dst` first, so only a later read of the target
+/// sees a clobbered value.
+fn reads_after_write(e: &Expr, name: &str) -> bool {
+    fn mentions(e: &Expr, name: &str) -> bool {
+        match e {
+            Expr::Num(_) => false,
+            Expr::Var(v) => v == name,
+            Expr::Bin(_, l, r) => mentions(l, name) || mentions(r, name),
+            Expr::Load(_, a) | Expr::Un(_, a) => mentions(a, name),
+        }
+    }
+    match e {
+        Expr::Num(_) | Expr::Var(_) => false,
+        Expr::Bin(_, l, r) => reads_after_write(l, name) || mentions(r, name),
+        Expr::Load(_, a) | Expr::Un(_, a) => reads_after_write(a, name),
+    }
+}
 
 struct Gen {
     out: String,
     vars: HashMap<String, u16>,
     next_var: u16,
     label: usize,
+    uses_div: bool,
 }
 
 impl Gen {
@@ -114,9 +149,32 @@ impl Gen {
                 }
                 Ok(())
             }
+            Expr::Load(width, addr) => {
+                if narrow_local_ram(*width, addr) {
+                    return Err(CompileError::Codegen(format!(
+                        "{}-byte load from GPU/DSP local RAM: silicon takes 32-bit accesses only there",
+                        width
+                    )));
+                }
+                self.eval(addr, dst, depth)?;
+                let mn = match width {
+                    1 => "loadb",
+                    2 => "loadw",
+                    _ => "load",
+                };
+                self.emit(&format!("{mn} (r{dst}),r{dst}"));
+                self.emit(&format!("or r{dst},r{dst}")); // wait out the load
+                Ok(())
+            }
+            Expr::Un(op, x) => {
+                self.eval(x, dst, depth)?;
+                let mn = if *op == UnOp::Neg { "neg" } else { "abs" };
+                self.emit(&format!("{mn} r{dst}"));
+                Ok(())
+            }
             Expr::Bin(op, l, r) => {
                 // shift-by-constant uses the quick opcodes (no scratch needed)
-                if matches!(op, Op::Shl | Op::Shr) {
+                if matches!(op, Op::Shl | Op::Shr | Op::Sar) {
                     if let Expr::Num(n) = **r {
                         self.eval(l, dst, depth)?;
                         if n == 0 {
@@ -125,7 +183,11 @@ impl Gen {
                         if n > 32 {
                             return Err(CompileError::Codegen("shift count > 32".into()));
                         }
-                        let mn = if *op == Op::Shl { "shlq" } else { "shrq" };
+                        let mn = match op {
+                            Op::Shl => "shlq",
+                            Op::Shr => "shrq",
+                            _ => "sharq",
+                        };
                         self.emit(&format!("{mn} #{n},r{dst}"));
                         return Ok(());
                     }
@@ -144,8 +206,35 @@ impl Gen {
                     Op::And => "and",
                     Op::Or => "or",
                     Op::Xor => "xor",
-                    Op::Mul => "mult", // 16x16 -> 32 unsigned
-                    Op::Shl | Op::Shr => unreachable!(),
+                    Op::Mul => "mult",   // 16x16 -> 32 unsigned
+                    Op::IMul => "imult", // 16x16 -> 32 signed
+                    Op::Div => {
+                        self.uses_div = true;
+                        self.emit(&format!("div r{sc},r{dst}"));
+                        self.emit(&format!("or r{dst},r{dst}")); // wait out the divide
+                        return Ok(());
+                    }
+                    Op::SDiv => {
+                        // |a| / |b| unsigned, then negate when the signs
+                        // differ: s = (a ^ b) >> 31 arithmetic (0 or -1),
+                        // q = (q ^ s) - s. abs($80000000) is $80000000,
+                        // which is the right magnitude read unsigned.
+                        let s = *SCRATCH.get(depth + 1).ok_or_else(|| {
+                            CompileError::Codegen("expression too deeply nested (v1 scratch depth 4)".into())
+                        })?;
+                        self.uses_div = true;
+                        self.emit(&format!("move r{dst},r{s}"));
+                        self.emit(&format!("xor r{sc},r{s}"));
+                        self.emit(&format!("sharq #31,r{s}"));
+                        self.emit(&format!("abs r{dst}"));
+                        self.emit(&format!("abs r{sc}"));
+                        self.emit(&format!("div r{sc},r{dst}"));
+                        self.emit(&format!("or r{dst},r{dst}")); // wait out the divide
+                        self.emit(&format!("xor r{s},r{dst}"));
+                        self.emit(&format!("sub r{s},r{dst}"));
+                        return Ok(());
+                    }
+                    Op::Shl | Op::Shr | Op::Sar => unreachable!(),
                 };
                 self.emit(&format!("{mn} r{sc},r{dst}"));
                 Ok(())
@@ -158,6 +247,13 @@ impl Gen {
     fn compare(&mut self, c: &Cond) -> Result<&'static str, CompileError> {
         self.eval(&c.lhs, CMP_L, 0)?;
         self.eval(&c.rhs, CMP_R, 0)?;
+        if c.signed {
+            // JRISC has no overflow flag, so a signed order is the unsigned
+            // order of both operands with their sign bits flipped.
+            self.emit(&format!("movei #$80000000,r{SIGN}"));
+            self.emit(&format!("xor r{SIGN},r{CMP_L}"));
+            self.emit(&format!("xor r{SIGN},r{CMP_R}"));
+        }
         // cmp rS,rD computes rD - rS. Choose operand order + skip-cc per relop.
         let skip = match c.rel {
             Rel::Eq => {
@@ -217,6 +313,12 @@ impl Gen {
             }
             Stmt::Assign(name, e) => {
                 let r = self.var_reg(name)?;
+                if reads_after_write(e, name) {
+                    // `x = y - x`: building y in x's register would destroy x
+                    self.eval(e, ASSIGN_TMP, 0)?;
+                    self.emit(&format!("move r{ASSIGN_TMP},r{r}"));
+                    return Ok(());
+                }
                 self.eval(e, r, 0)
             }
             Stmt::Store { val, addr } => {
@@ -264,12 +366,27 @@ impl Gen {
 
 /// Generate JRISC source for a program. Returns (asm, variable→register map).
 pub fn generate(prog: &[Stmt]) -> Result<(String, Vec<(String, u16)>), CompileError> {
-    let mut g = Gen { out: String::new(), vars: HashMap::new(), next_var: *VAR_REGS.start(), label: 0 };
-    g.out.push_str("; generated by jcc — auditable JRISC (re-checked by jas)\n");
-    g.out.push_str("        .gpu\n");
+    let mut g = Gen {
+        out: String::new(),
+        vars: HashMap::new(),
+        next_var: *VAR_REGS.start(),
+        label: 0,
+        uses_div: false,
+    };
     for s in prog {
         g.stmt(s)?;
     }
+    let body = std::mem::take(&mut g.out);
+    g.out.push_str("; generated by jcc — auditable JRISC (re-checked by jas)\n");
+    g.out.push_str("        .gpu\n");
+    if g.uses_div {
+        // `div` is integer division only with G_DIVCTRL = 0; don't trust the
+        // state a previous kernel left.
+        g.emit("movei #$00F0211C,r30");
+        g.emit("moveq #0,r29");
+        g.emit("store r29,(r30)");
+    }
+    g.out.push_str(&body);
     // self-stop epilogue: clear G_CTRL GO so a jsim/hardware harness sees done.
     g.emit("movei #$00F02114,r30");
     g.emit("moveq #0,r29");

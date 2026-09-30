@@ -19,8 +19,9 @@ fn main() -> ExitCode {
              USAGE: jcc <input.jc> [-o out.s]\n\
              \n\
              Emits hazard-clean JRISC assembly (assemble with jas) and reports\n\
-             the SRAM budget. Language: int vars, + - * << >> & | ^, if/else,\n\
-             while, store <val>,<addr>. See the crate docs for the grammar."
+             the SRAM budget. Language: int vars, + - * / << >> & | ^, if/else,\n\
+             while ([signed] comparisons), store <val>,<addr>, load/loadw/loadb(addr),\n\
+             abs, neg, imult, sdiv, sar(x,n). See the crate docs for the grammar."
         );
         return if args.is_empty() { ExitCode::FAILURE } else { ExitCode::SUCCESS };
     }

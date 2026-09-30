@@ -5,6 +5,16 @@ pub enum Expr {
     Num(u32),
     Var(String),
     Bin(Op, Box<Expr>, Box<Expr>),
+    /// `load`/`loadw`/`loadb`(addr): a 4-, 2- or 1-byte load (zero-extended).
+    Load(u8, Box<Expr>),
+    /// `neg(x)` / `-x`, `abs(x)`.
+    Un(UnOp, Box<Expr>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum UnOp {
+    Neg,
+    Abs,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -17,6 +27,14 @@ pub enum Op {
     Mul,
     Shl,
     Shr,
+    /// `/`: unsigned 32/32 (JRISC `div`).
+    Div,
+    /// `imult(a, b)`: signed 16x16 -> 32.
+    IMul,
+    /// `sdiv(a, b)`: signed divide, truncating toward zero.
+    SDiv,
+    /// `sar(x, n)`: arithmetic shift right by a constant.
+    Sar,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -31,6 +49,8 @@ pub enum Rel {
 
 #[derive(Debug, Clone)]
 pub struct Cond {
+    /// `signed a < b`: two's-complement order instead of unsigned.
+    pub signed: bool,
     pub lhs: Expr,
     pub rel: Rel,
     pub rhs: Expr,
@@ -125,7 +145,7 @@ fn lex(src: &str) -> Result<Vec<Tok>, String> {
             i += 2;
             continue;
         }
-        if "+-*&|^=<>(){};,".contains(c) {
+        if "+-*/&|^=<>(){};,".contains(c) {
             out.push(Tok::Sym(c.to_string()));
             i += 1;
             continue;
@@ -235,6 +255,10 @@ impl P {
     }
 
     fn cond(&mut self) -> Result<Cond, String> {
+        let signed = self.is_kw("signed");
+        if signed {
+            self.next();
+        }
         let lhs = self.expr()?;
         let rel = match self.next() {
             Some(Tok::Sym(s)) => match s.as_str() {
@@ -249,7 +273,7 @@ impl P {
             other => return Err(format!("expected comparison, found {other:?}")),
         };
         let rhs = self.expr()?;
-        Ok(Cond { lhs, rel, rhs })
+        Ok(Cond { signed, lhs, rel, rhs })
     }
 
     fn expr(&mut self) -> Result<Expr, String> {
@@ -275,6 +299,7 @@ impl P {
         while let Some(Tok::Sym(s)) = self.peek() {
             let op = match s.as_str() {
                 "*" => Op::Mul,
+                "/" => Op::Div,
                 "<<" => Op::Shl,
                 ">>" => Op::Shr,
                 _ => break,
@@ -289,7 +314,9 @@ impl P {
     fn factor(&mut self) -> Result<Expr, String> {
         match self.next() {
             Some(Tok::Num(n)) => Ok(Expr::Num(n)),
+            Some(Tok::Ident(id)) if self.is_sym("(") => self.call(&id),
             Some(Tok::Ident(id)) => Ok(Expr::Var(id)),
+            Some(Tok::Sym(s)) if s == "-" => Ok(Expr::Un(UnOp::Neg, Box::new(self.factor()?))),
             Some(Tok::Sym(s)) if s == "(" => {
                 let e = self.expr()?;
                 self.eat_sym(")")?;
@@ -297,6 +324,37 @@ impl P {
             }
             other => Err(format!("expected value, found {other:?}")),
         }
+    }
+
+    /// A builtin call `name(args)`; the `(` is next.
+    fn call(&mut self, name: &str) -> Result<Expr, String> {
+        self.eat_sym("(")?;
+        let mut args = vec![self.expr()?];
+        while self.is_sym(",") {
+            self.next();
+            args.push(self.expr()?);
+        }
+        self.eat_sym(")")?;
+        let want = match name {
+            "load" | "loadw" | "loadb" | "abs" | "neg" => 1,
+            "imult" | "sdiv" | "sar" => 2,
+            _ => return Err(format!("unknown function `{name}`")),
+        };
+        if args.len() != want {
+            return Err(format!("`{name}` takes {want} argument(s), found {}", args.len()));
+        }
+        let mut a = args.into_iter().map(Box::new);
+        let mut x = || a.next().unwrap();
+        Ok(match name {
+            "load" => Expr::Load(4, x()),
+            "loadw" => Expr::Load(2, x()),
+            "loadb" => Expr::Load(1, x()),
+            "abs" => Expr::Un(UnOp::Abs, x()),
+            "neg" => Expr::Un(UnOp::Neg, x()),
+            "imult" => Expr::Bin(Op::IMul, x(), x()),
+            "sdiv" => Expr::Bin(Op::SDiv, x(), x()),
+            _ => Expr::Bin(Op::Sar, x(), x()),
+        })
     }
 
     fn ident(&mut self) -> Result<String, String> {

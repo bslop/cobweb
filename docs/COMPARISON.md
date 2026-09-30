@@ -148,7 +148,8 @@ carries a restrictive license (provenance audit in `OSS_RELEASE.md`).
     a cycle-cost objective under the calibrated bus model.
 11. **jcc** — the compiler. **v1 shipped** (`sim/crates/jcc/`): a restricted,
     statically allocated systems language (int variables, arithmetic, if/else,
-    while, store) compiling to JRISC that is *auditable by construction* — jcc
+    while, store, loads, signed compares, divide) compiling to JRISC that is
+    *auditable by construction* — jcc
     feeds its own output back through jas, so any hazard it emits is a compile
     error, not silent wrong silicon. It reports a whole-program SRAM budget
     ledger against the 4 KB local RAM, and its output composes with jopt and
