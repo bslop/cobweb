@@ -275,7 +275,11 @@ impl Risc {
             posted_head: 0,
             dram_stale_win: std::env::var("JAGEMU_DRAM_STALE")
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(0),
-            dram_stale_subst: std::env::var("JAGEMU_DRAM_STALE_SUBST").is_ok(),
+            // Exactly "1", as JAGEMU_BLIT_SETTLE: a stray `=0` must not turn
+            // on value corruption.
+            dram_stale_subst: std::env::var("JAGEMU_DRAM_STALE_SUBST")
+                .map(|v| v == "1")
+                .unwrap_or(false),
             int_latch: 0,
             fidelity: Fidelity::default(),
             pipe: timing::Pipeline::default(),
