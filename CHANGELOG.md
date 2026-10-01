@@ -6,6 +6,42 @@ assigned at release.
 
 ## Unreleased
 
+### 2026-10-01 — measured on silicon: Blitter lanes, OP window, 68000/Blitter timing
+
+Every item below comes from the platform's silicon bench (jagq jobs 39-47); the
+measurements are transcribed in `calib/results/2026-10-01-platform-bench.md`.
+
+- **Blitter data registers are [equate+4 = high long : equate = low long].** A
+  phrase-mode span writes the lanes high long first; jsim had the longs swapped.
+- **Per-pixel Blitter writes use one fixed lane**: the low bits of the long at
+  the equate, for every pixel. jsim picked the lane by phrase position, so a
+  colour stored in one long filled every other pixel pair.
+- **A1_FINC is a full 16-bit X fraction** (high half: Y), confirmed; the "8
+  fractional bits" note was wrong. No model change.
+- **No stale-IDLE window for a GPU poll**: a GPU load of B_CMD on the
+  instruction after its launching store reads BUSY. The settle window stays
+  off by default.
+- **OP display window**: XPOS 0 is displayed at HDB1 (origin 0, PWIDTH+1 HC
+  units a pixel); nothing is shown from HDE (linear (HDE & $3FF) + HP+1) or
+  HBB on. `--full-window` captures that window (about 356 px for the standard
+  NTSC set-up), and line-buffer pixels outside it are blanked in every capture.
+- **An 8bpp object first in an unscaled list displays.** No model change.
+- **68000 timing refit**: bus waits fetch 1.3 / read 5.1 / write 10.3 cycles
+  (were 0.3 / 0.5); three instruction mixes now within 3% of silicon (were
+  16-49% fast).
+- **OP bus share**: the 68000 and the Blitter lose 2.06 thousandths of their time
+  per phrase the OP fetches a line (+16.5% for a 320x240 16bpp screen; measured
+  +16-18%). Off while video is disabled.
+- **Phrase-mode fills** cost 2.2 ticks a phrase (were 5.6).
+- **68000 beside a running blit** costs x3.0 per bus-using instruction, capped
+  at the blit's remaining time (68000 loop beside GPU spans: 128 fields vs 139
+  on silicon, was 64).
+- Fixes: a 68000-launched blit's DRAM traffic was billed to the launching
+  instruction; a word read of B_CMD returned the command word, not status.
+- 68000 reads of B_CMD are counted and noted: on silicon they are not a
+  reliable wait-for-idle.
+- Tests: 429 passed.
+
 ### 2026-10-01 — platform issues 0004/0006/0008: INT2 model, CPUINT, strict exemptions, `f().member`
 
 - **jcc68k: `f(...).member`** is accepted (C11 6.5.2.3), nested members and
