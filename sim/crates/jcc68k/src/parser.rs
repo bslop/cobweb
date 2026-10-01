@@ -286,8 +286,11 @@ pub fn parse(toks: Vec<Token>) -> PResult<Program> {
         enum_consts: HashMap::new(),
         cur_switch: Vec::new(),
     };
-    p.program()?;
-    Ok(Program { functions: p.functions, globals: p.globals, strings: p.strings })
+    let locs: Vec<(std::rc::Rc<str>, usize)> = p.toks.iter().map(|t| (t.file.clone(), t.line)).collect();
+    if let Err(e) = p.program() {
+        return Err(resolve_locs(&e, &locs));
+    }
+    Ok(Program { functions: p.functions, globals: p.globals, strings: p.strings, locs })
 }
 
 impl Parser {
@@ -295,8 +298,10 @@ impl Parser {
     fn peek(&self) -> &Tok {
         &self.toks[self.pos].tok
     }
+    /// The current token's position key (`LOC_BASE` + token index), which
+    /// `resolve_locs` maps back to `file:line` when a diagnostic leaves.
     fn line(&self) -> usize {
-        self.toks[self.pos].line
+        LOC_BASE + self.pos
     }
     /// Source position for diagnostics: `file:line` when the preprocessor's
     /// line markers named the file, bare `line` otherwise.

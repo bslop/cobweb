@@ -291,6 +291,37 @@ pub struct Program {
     pub functions: Vec<Function>,
     pub globals: Vec<Global>,
     pub strings: Vec<Vec<u8>>,
+    /// `(file, line)` of every token; an `Expr::line` is a key into it (see
+    /// [`LOC_BASE`]).
+    pub locs: Vec<(Rc<str>, usize)>,
+}
+
+/// `Expr::line` holds `LOC_BASE + token index`, not a line number: lines are
+/// per file, so in a unity build a bare line pointed into the wrong file.
+/// [`resolve_locs`] turns each key at the head of a diagnostic back into
+/// `file:line`. The offset keeps a key from passing for a real line number.
+pub const LOC_BASE: usize = 1_000_000_000;
+
+/// Rewrite every position key (`<key>:`) in a diagnostic as `file:line`
+/// (bare `line` when the source had no line markers).
+pub fn resolve_locs(msg: &str, locs: &[(Rc<str>, usize)]) -> String {
+    let mut out = String::with_capacity(msg.len());
+    let mut rest = msg;
+    while let Some(i) = rest.find(|c: char| c.is_ascii_digit()) {
+        let digits = rest[i..].find(|c: char| !c.is_ascii_digit()).map_or(rest.len() - i, |n| n);
+        let (num, tail) = rest[i..].split_at(digits);
+        let at_word_start = !rest[..i].ends_with(|c: char| c.is_alphanumeric() || c == '_');
+        let key = num.parse::<usize>().ok().filter(|_| at_word_start && tail.starts_with(':'));
+        out.push_str(&rest[..i]);
+        match key.and_then(|k| k.checked_sub(LOC_BASE)).and_then(|k| locs.get(k)) {
+            Some((file, line)) if !file.is_empty() => out.push_str(&format!("{file}:{line}")),
+            Some((_, line)) => out.push_str(&line.to_string()),
+            None => out.push_str(num),
+        }
+        rest = tail;
+    }
+    out.push_str(rest);
+    out
 }
 
 /// The 16.16 image of an exact floating constant (round to nearest), which is

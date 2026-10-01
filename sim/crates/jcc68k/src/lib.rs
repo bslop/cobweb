@@ -21,7 +21,7 @@ pub use parser::set_strict_pointer_args;
 pub fn compile(src: &str) -> Result<String, String> {
     let toks = lexer::lex(src)?;
     let prog = parser::parse(toks)?;
-    codegen::generate(&prog)
+    codegen::generate(&prog).map_err(|e| ast::resolve_locs(&e, &prog.locs))
 }
 
 /// Preprocess then compile: runs `#include`/`#define`/`#if` against `src`

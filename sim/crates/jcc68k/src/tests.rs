@@ -3114,3 +3114,106 @@ fn offsetof_rejects_a_member_that_does_not_exist() {
     let inc = vec![dir.to_string_lossy().to_string()];
     assert!(crate::compile_file(&src, &main_c, &inc).is_err(), "offsetof of a missing member compiled");
 }
+
+// ── issue 0007: a call through a function-pointer VARIABLE ──────────────────
+// A file-scope (or static local) pointer is not in the frame, so it used to be
+// called as `jsr g` — straight into the variable's bytes.
+
+const FP_DECL: &str = "typedef void (*fn)(int *, int);\n\
+                       static void add(int *p, int v) { *p += v; }\n";
+
+#[test]
+fn call_through_file_scope_fp_variable() {
+    let src = format!("{FP_DECL}static fn g; static int n;\n\
+                       int main(void) {{ g = add; g(&n, 5); return n; }}\n");
+    assert_eq!(run(&src), 5);
+}
+
+#[test]
+fn call_through_extern_style_fp_global() {
+    let src = format!("{FP_DECL}fn g = add; int n;\n\
+                       int main(void) {{ g(&n, 7); g(&n, 1); return n; }}\n");
+    assert_eq!(run(&src), 8);
+}
+
+#[test]
+fn call_through_local_fp_variable() {
+    let src = format!("{FP_DECL}static int n;\n\
+                       int main(void) {{ fn local = add; local(&n, 5); return n; }}\n");
+    assert_eq!(run(&src), 5);
+    let src = format!("{FP_DECL}static int n;\n\
+                       int main(void) {{ static fn local; local = add; local(&n, 6); return n; }}\n");
+    assert_eq!(run(&src), 6);
+}
+
+#[test]
+fn call_through_fp_array_element() {
+    let src = format!("{FP_DECL}static void sub(int *p, int v) {{ *p -= v; }}\n\
+                       static fn tab[2] = {{ add, sub }}; static int n;\n\
+                       int main(void) {{ tab[0](&n, 9); tab[1](&n, 2); return n; }}\n");
+    assert_eq!(run(&src), 7);
+}
+
+#[test]
+fn direct_calls_stay_direct() {
+    let asm = crate::compile_program(&format!(
+        "{FP_DECL}static int n; int main(void) {{ add(&n, 3); return n; }}\n"
+    ))
+    .unwrap();
+    assert!(asm.contains("jsr add") || asm.contains("jsr _add"), "{asm}");
+    assert!(!asm.contains("jsr (a0)"), "{asm}");
+}
+
+// ── issue 0006: member access on a function's struct result ────────────────
+
+const PAIR_DECL: &str = "typedef struct { int a, b; } pair;\n\
+                         static pair make(int x) { pair p; p.a = x; p.b = x + 1; return p; }\n";
+
+#[test]
+fn member_of_returned_struct() {
+    assert_eq!(run(&format!("{PAIR_DECL}int main(void) {{ return make(3).b == 4 ? 0 : 1; }}\n")), 0);
+    assert_eq!(run(&format!("{PAIR_DECL}int main(void) {{ return make(3).a + make(10).b; }}\n")), 14);
+}
+
+#[test]
+fn member_of_returned_nested_struct() {
+    let src = "typedef struct { short x; int y; } in_t;\n\
+               typedef struct { int k; in_t in; char c[4]; } out_t;\n\
+               static out_t mk(int v) { out_t o; o.k = v; o.in.x = 2; o.in.y = v * 3;\n\
+                 o.c[0] = 1; o.c[3] = 9; return o; }\n\
+               int main(void) { return mk(5).in.y + mk(1).in.x * 100 + mk(0).c[3] * 1000; }\n";
+    assert_eq!(run(src), 15 + 200 + 9000);
+}
+
+#[test]
+fn member_of_returned_struct_survives_a_second_call() {
+    // Both results must be read before the shared return buffer is reused.
+    let src = format!("{PAIR_DECL}static int f(int u, int v) {{ return u * 100 + v; }}\n\
+                       int main(void) {{ return f(make(1).a, make(7).b); }}\n");
+    assert_eq!(run(&src), 108);
+}
+
+#[test]
+fn codegen_error_inside_include_names_the_header() {
+    // Issue 0006's side note: an expression-level error used to carry only a
+    // line number, which in a unity build points into the wrong file.
+    let dir = std::env::temp_dir().join(format!("jcc_line3_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("part.h"),
+        "typedef struct { int a; } S;\nint take();\n\nint use_it(void) { S v; v.a = 1; return take(v); }\n",
+    )
+    .unwrap();
+    let src = "int pad;\n#include \"part.h\"\nint main(void) { return use_it(); }\n";
+    let main_c = dir.join("main.c");
+    std::fs::write(&main_c, src).unwrap();
+    let err = crate::compile_file(src, &main_c, &[]).unwrap_err();
+    assert!(err.contains("part.h:4:"), "error must point at part.h:4, got: {err}");
+    assert!(!err.contains("1000000"), "unresolved position key: {err}");
+}
+
+#[test]
+fn bare_compile_errors_keep_bare_line_numbers() {
+    let err = crate::compile("int f(void);\n\nint g(void) { return &f(); }\n").unwrap_err();
+    assert!(err.starts_with("3:"), "got: {err}");
+}

@@ -1275,6 +1275,18 @@ impl Gen {
             return self.a0_plus(off);
         }
         match &ptr.kind {
+            // `f(...).m`: the operand of `.` need not be an lvalue (C11
+            // 6.5.2.3). A struct-valued call leaves its result buffer's address
+            // in D0, so the member is read straight out of that buffer before
+            // anything else can call `f` again (issue 0006).
+            ExprK::Unary(UnOp::Addr, inner)
+                if matches!(&inner.kind, ExprK::Call(..))
+                    && matches!(&*inner.ty, TypeK::Struct { .. }) =>
+            {
+                self.gen_expr(inner)?;
+                self.line("move.l d0,a0");
+                return self.a0_plus(off);
+            }
             ExprK::Unary(UnOp::Addr, inner) => {
                 let base = self.addr_ea(inner)?;
                 if let Some(ea) = base.plus(off) {
