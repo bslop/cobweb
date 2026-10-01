@@ -3244,3 +3244,21 @@ fn bare_compile_errors_keep_bare_line_numbers() {
     let err = crate::compile("int f(void);\n\nint g(void) { return &f(); }\n").unwrap_err();
     assert!(err.starts_with("3:"), "got: {err}");
 }
+
+#[test]
+fn xor_assign_from_a_frame_variable_assembles() {
+    // The copy-folding peephole turned `move.l -20(a6),d2 / eor.l d2,d0` into
+    // `eor.l -20(a6),d0`; EOR has no memory-source form. This shape produced
+    // it in edition 2026-10-02.
+    let src = "int main(void){ volatile int p, q, r, s, t, u, v, k;\
+               p = 7; q = 3; r = 9; s = 12; t = 5; u = 9; v = 1;\
+               for (k = 0; k < 6; k++) { u = u + (p & q) - (r | s); u ^= t; v = v * (k + 2) / 3; }\
+               return u ^ v; }";
+    let (p, q, r, s, t) = (7i32, 3, 9, 12, 5);
+    let (mut u, mut v) = (9i32, 1i32);
+    for k in 0..6 {
+        u = (u + (p & q) - (r | s)) ^ t;
+        v = v * (k + 2) / 3;
+    }
+    assert_eq!(run(src) as i32, u ^ v);
+}

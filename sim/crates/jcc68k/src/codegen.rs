@@ -2458,6 +2458,10 @@ fn try_fold(lines: &[&str], i: usize) -> Option<String> {
     match base1 {
         // An address register is illegal as the source of these.
         "and" | "or" | "eor" if a_is_areg => return None,
+        // EOR has only the `Dn,<ea>` form: its source must be a data register.
+        // Folding a load into it made `x ^= y` on a frame `y` assemble to
+        // `eor.l -20(a6),d0`, which jas rightly rejects.
+        "eor" if !(is_machine_reg(a) && a.starts_with('d')) => return None,
         // `<ea>,Dn` forms need a data-register destination.
         "add" | "sub" | "cmp" | "and" | "or" | "eor" if a_is_mem && !dst1.starts_with('d') => {
             return None
