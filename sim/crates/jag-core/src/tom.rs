@@ -184,7 +184,21 @@ pub struct OpState {
     /// walks whatever the BIOS left in OLP before the platform owns it, so the
     /// first offender names the BIOS and the last names YOU.
     pub bitmap_misaligned_last: u32,
+    /// Most object headers the OP walked on any one line, and the `VC` of
+    /// the first line that reached it. HARDWARE (platform notes,
+    /// object-processor.md, [HW]): the OP re-walks the whole list every line
+    /// and a flat chain of unscaled objects is clean up to about 40; 48 gave
+    /// one tear, 64 heavy tearing, 80 a black screen. jsim draws any length,
+    /// so this is counted and warned about, not modelled (platform issue
+    /// 0004, item 5).
+    pub max_objects_per_line: u32,
+    pub max_objects_vc: u16,
+    /// Line walks that went past `OP_OBJECTS_PER_LINE_BUDGET`.
+    pub lines_over_object_budget: u64,
 }
+
+/// Object headers per line the OP is known to walk cleanly on silicon.
+pub const OP_OBJECTS_PER_LINE_BUDGET: u32 = 40;
 
 impl Default for OpState {
     fn default() -> Self {
@@ -202,6 +216,9 @@ impl Default for OpState {
             bitmap_misaligned_addr: 0,
             bitmap_misaligned_last: 0,
             bitmap_misaligned_hits: 0,
+            max_objects_per_line: 0,
+            max_objects_vc: 0,
+            lines_over_object_budget: 0,
         }
     }
 }
@@ -686,6 +703,15 @@ fn op_walk_line(
         if !visited.insert(addr8) || visited.len() > 4096 {
             break;
         }
+        let walked = visited.len() as u32;
+        let op = &mut bus.tom.op;
+        if walked > op.max_objects_per_line {
+            op.max_objects_per_line = walked;
+            op.max_objects_vc = vc;
+        }
+        if walked == OP_OBJECTS_PER_LINE_BUDGET + 1 {
+            op.lines_over_object_budget += 1;
+        }
         let o = decode_obj(bus, addr8);
         match o.otype {
             0 | 1 => {
@@ -970,6 +996,38 @@ mod tests {
         // VMODE = RGB16 enabled; OLP written word-swapped like the hardware path.
         bus.tom.win.w16(mem::VMODE, 0x06C7);
         bus.write32(mem::OLP, (ol >> 16) | (ol << 16));
+    }
+
+    /// A flat chain of `n` small 16bpp BITMAP objects (4 px wide, side by
+    /// side), then STOP. Every object is visible on every line of the band.
+    fn setup_chain(bus: &mut Bus, fb: u32, ol: u32, n: u32) {
+        let pw = 1u32; // one phrase = 4 px at 16bpp
+        let (h, base_y) = (32u32, 64u32);
+        for i in 0..n {
+            let at = ol + 16 * i;
+            let link = (at + 16) >> 3;
+            bus.write32(at, (fb << 8) | (link >> 8));
+            bus.write32(at + 4, (link << 24) | (h << 14) | (base_y << 4));
+            bus.write32(at + 8, pw >> 4);
+            bus.write32(at + 12, (pw << 28) | (pw << 18) | (4 << 12) | (16 + 4 * i));
+        }
+        bus.write32(ol + 16 * n, 0);
+        bus.write32(ol + 16 * n + 4, 4);
+        bus.tom.win.w16(mem::VMODE, 0x06C7);
+        bus.write32(mem::OLP, (ol >> 16) | (ol << 16));
+    }
+
+    #[test]
+    fn op_counts_objects_walked_per_line() {
+        for (n, over) in [(30u32, false), (50, true)] {
+            let mut bus = Bus::new();
+            setup_chain(&mut bus, 0x10_0000, 0x1000, n);
+            compose_frame(&mut bus);
+            let op = &bus.tom.op;
+            // n bitmaps plus the STOP header.
+            assert_eq!(op.max_objects_per_line, n + 1, "chain of {n}");
+            assert_eq!(op.lines_over_object_budget > 0, over, "chain of {n}");
+        }
     }
 
     #[test]

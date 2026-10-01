@@ -336,10 +336,14 @@ impl Risc {
     }
 
     /// Count a byte/word access that targets this core's own SRAM (see
-    /// `TimingStats::narrow_sram`).
-    pub fn note_narrow_sram(&mut self, a: u32) {
+    /// `TimingStats::narrow_sram`). Returns whether silicon fidelity takes
+    /// it as silicon does (`NARROW_POISON`): the write is dropped and the
+    /// read returns poison, so a kernel that relies on one fails here too
+    /// instead of rendering pixel-exact (platform issue 0004, item 1).
+    pub fn note_narrow_sram(&mut self, a: u32) -> bool {
         let b = self.kind.sram_base();
-        if a >= b && a < b + self.kind.sram_size() {
+        let own = a >= b && a < b + self.kind.sram_size();
+        if own {
             if self.pipe.stats.narrow_sram == 0 {
                 self.pipe.stats.narrow_sram_first_pc = self.pc;
             }
@@ -348,6 +352,7 @@ impl Risc {
                 self.strict_trip("narrow_sram", a);
             }
         }
+        own && self.fidelity == Fidelity::Silicon
     }
 
     /// Latch the first strict fault (PC and address) on this core.
@@ -765,6 +770,11 @@ impl Risc {
 
     /// Instructions of PC history a park has to recur within.
     const PARK_WINDOW: usize = 8;
+    /// What a byte/word read of a core's own local RAM returns under silicon
+    /// fidelity. Silicon takes 32-bit accesses only there and the narrow
+    /// result is undefined; a fixed, conspicuous value keeps runs
+    /// reproducible and makes a dependence on it fail.
+    pub const NARROW_POISON: u32 = 0xA5A5_A5A5;
     /// Posted-write ring depth for the Silicon DRAM staleness model.
     const POSTED_N: usize = 64;
 

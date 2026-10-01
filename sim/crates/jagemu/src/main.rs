@@ -463,8 +463,9 @@ fn report_hazard_diagnostics(jag: &Jaguar) {
             eprintln!(
                 "jagemu: WARNING — {name} made {} byte/word (LOADB/LOADW/STOREB/STOREW) access(es) \
                  to its OWN local SRAM (first at PC ${:06X}). Silicon's GPU/DSP RAM takes 32-bit \
-                 accesses ONLY: a narrow write never lands and a narrow read is undefined. jsim \
-                 models byte-addressable SRAM and executed them as if they worked — a 16-bit \
+                 accesses ONLY: a narrow write never lands and a narrow read is undefined. Under \
+                 --fidelity silicon jsim now drops those writes and reads $A5 poison; other \
+                 fidelities still execute them as if they worked — a 16-bit \
                  histogram in Jerry SRAM sorted perfectly here and killed the console in 14 s \
                  (jag_quake 2026-08-24). Use LOAD/STORE (32-bit) on local RAM.",
                 t.narrow_sram, t.narrow_sram_first_pc
@@ -488,6 +489,19 @@ fn report_hazard_diagnostics(jag: &Jaguar) {
                 eprintln!("jagemu:     round-trip site: addr ${a:06X} load PC ${pc:06X} x{n}");
             }
         }
+    }
+    let op = &jag.bus.tom.op;
+    if op.lines_over_object_budget > 0 {
+        eprintln!(
+            "jagemu: WARNING — the Object Processor walked up to {} object headers on one \
+             line (first at VC {}; {} line walk(s) over {}). On silicon the OP re-walks the \
+             list every line within a fixed time: a flat chain of unscaled objects is clean \
+             up to about 40, tears at 48-64 and goes black at 80 (platform notes, \
+             object-processor.md). jsim draws any length. Split the list with BRANCH \
+             objects by Y.",
+            op.max_objects_per_line, op.max_objects_vc, op.lines_over_object_budget,
+            jag_core::tom::OP_OBJECTS_PER_LINE_BUDGET
+        );
     }
     if jag.bus.tom.rte_without_int2 > 0 {
         eprintln!(
@@ -2378,7 +2392,7 @@ fn state_json(jag: &Jaguar) -> String {
          \"flags\":\"0x{:08X}\",\"regs0\":[{}],\"regs1\":[{}]}},\
          \"blitter\":{{\"bcmd_busy_reads\":{},\"bcmd_poll_in_settle\":{}}},\"risc_ram_narrow_writes\":{},\
          \"int2\":{{\"lowered\":{},\"rte_without_int2\":{},\"rte_without_int2_pc\":\"0x{:06X}\"}},{}\
-         \"op\":{{\"scaled_misaligned_hits\":{},\"scaled_misaligned_addr\":\"0x{:06X}\",\"bitmap_misaligned_hits\":{},\"bitmap_misaligned_addr\":\"0x{:06X}\",\"bitmap_misaligned_last\":\"0x{:06X}\"}},\
+         \"op\":{{\"scaled_misaligned_hits\":{},\"scaled_misaligned_addr\":\"0x{:06X}\",\"bitmap_misaligned_hits\":{},\"bitmap_misaligned_addr\":\"0x{:06X}\",\"bitmap_misaligned_last\":\"0x{:06X}\",\"max_objects_per_line\":{},\"max_objects_vc\":{},\"lines_over_object_budget\":{}}},\
          \"d\":[{}],\"a\":[{}]}}",
         strict_json(jag),
         jag.frame(),
@@ -2495,6 +2509,9 @@ fn state_json(jag: &Jaguar) -> String {
         jag.bus.tom.op.bitmap_misaligned_hits,
         jag.bus.tom.op.bitmap_misaligned_addr,
         jag.bus.tom.op.bitmap_misaligned_last,
+        jag.bus.tom.op.max_objects_per_line,
+        jag.bus.tom.op.max_objects_vc,
+        jag.bus.tom.op.lines_over_object_budget,
         dregs.join(","),
         aregs.join(",")
     )
