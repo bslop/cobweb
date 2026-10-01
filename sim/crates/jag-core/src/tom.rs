@@ -54,6 +54,42 @@ pub fn full_window() -> bool {
     FULL_WINDOW.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The display window in LINE-BUFFER pixels, `(first, end)`, from the video
+/// registers; `None` until both `HDB1` and `HDE` are programmed.
+///
+/// HARDWARE (platform bench, jagq jobs 42-44, NTSC, PWIDTH 4): the OP's
+/// horizontal origin is `HDB1` - line-buffer pixel 0 (XPOS 0) is displayed at
+/// HDB1 and each pixel lasts PWIDTH+1 HC units (HDB moved +40/+80 units moved
+/// every object right by exactly 10/20 pixels, and with HDB 203 XPOS 0 sat
+/// on the visible left edge). Nothing is displayed from `HDE` on: with HDE =
+/// $63F/$5BF/$53F the right edge sat at linear position (HDE & $3FF) + HP+1,
+/// within one unit (bit 10 = second half-line), and objects past it were
+/// cut. `HBB` cuts the same way ($400|600 and $400|500 measured within 3
+/// units). `HBE` is not applied: its effect was hidden by the capture chain.
+pub fn display_window(bus: &Bus) -> Option<(i32, i32)> {
+    let r = |a: u32| bus.tom.win.r16(a) as u32;
+    let (hdb, hde) = (r(mem::HDB1), r(mem::HDE));
+    if hdb == 0 || hde == 0 {
+        return None;
+    }
+    let hp = match r(mem::HP) & 0x3FF {
+        0 => 844, // NTSC default (VIDEO_TIMING.md)
+        v => v,
+    };
+    let lin = |v: u32| (v & 0x3FF) + if v & 0x400 != 0 { hp + 1 } else { 0 };
+    let base = lin(hdb);
+    let mut end = lin(hde);
+    let hbb = r(mem::HBB);
+    if hbb != 0 {
+        end = end.min(lin(hbb));
+    }
+    let pw = (((r(mem::VMODE) as u16 & mem::VM_PWIDTH_MASK) >> mem::VM_PWIDTH_SHIFT) + 1) as u32;
+    if end <= base {
+        return Some((0, 0));
+    }
+    Some((0, ((end - base) / pw).min(LINE_W as u32) as i32))
+}
+
 /// A composited frame in RGBA8888, ready for PNG.
 #[derive(Clone)]
 pub struct Framebuffer {
@@ -411,9 +447,15 @@ pub fn op_render_line(vc: u16, cpu: &mut M68k, gpu: &mut Risc, bus: &mut Bus) {
     let bgv = bus.tom.win.r16(mem::BG);
     let (br, bgc, bb) = decode_pixel(bgv, fmt);
     let w = width.min(LINE_W as u32);
+    // Line-buffer pixels outside the display window are not shown on silicon
+    // (see `display_window`); drawn black (border colours not modelled).
+    let (wfirst, wend) = display_window(bus).unwrap_or((i32::MIN, i32::MAX));
     for x in 0..w {
         let i = x as usize;
-        if written[i] {
+        let lbx = x as i32 + anchor_x;
+        if lbx < wfirst || lbx >= wend {
+            bus.tom.fb.put(x, row, 0, 0, 0);
+        } else if written[i] {
             let (r, g, b) = decode_pixel(line[i], fmt);
             bus.tom.fb.put(x, row, r, g, b);
         } else {
@@ -464,7 +506,12 @@ fn op_begin_field(bus: &mut Bus, fmt: PixFmt) {
     // field with no bitmap; the bitmaps just composite into it at their real
     // XPOS/YPOS instead of being anchored to the canvas origin.
     if full_window() {
-        width = 320;
+        // The programmed display window when there is one (its width follows
+        // HDB1..HDE, so a standard NTSC set-up is ~356 pixels, not 320).
+        width = match display_window(bus) {
+            Some((first, end)) if end > first => (end - first) as u32,
+            _ => 320,
+        };
         height = 240;
         anchor_x = 0;
         anchor_y = bus.tom.win.r16(mem::VDB);
@@ -1028,6 +1075,46 @@ mod tests {
             assert_eq!(op.max_objects_per_line, n + 1, "chain of {n}");
             assert_eq!(op.lines_over_object_budget > 0, over, "chain of {n}");
         }
+    }
+
+    /// The bench's measured edges (jagq jobs 43-44, NTSC, VMODE $06C7 =
+    /// PWIDTH 4): right edge XPOS 324.5 / 292.3 / 260.6 for HDE $63F / $5BF /
+    /// $53F at HDB 123; 330.5 / 304.9 for HBB $400|600 / $400|500.
+    #[test]
+    fn display_window_matches_the_bench() {
+        let mut bus = Bus::new();
+        bus.tom.win.w16(mem::VMODE, 0x06C7);
+        bus.tom.win.w16(mem::HDB1, 123);
+        for (hde, want) in [(0x063F, 324), (0x05BF, 292), (0x053F, 260)] {
+            bus.tom.win.w16(mem::HDE, hde);
+            assert_eq!(display_window(&bus), Some((0, want)), "HDE {hde:#X}");
+        }
+        bus.tom.win.w16(mem::HDE, 0x06BF);
+        for (hbb, want) in [(0x0400 + 600, 330), (0x0400 + 500, 305)] {
+            bus.tom.win.w16(mem::HBB, hbb);
+            assert_eq!(display_window(&bus), Some((0, want)), "HBB {hbb:#X}");
+        }
+    }
+
+    #[test]
+    fn pixels_past_hde_are_not_displayed() {
+        let mut bus = Bus::new();
+        let (fb, ol) = (0x10_0000u32, 0x1000u32);
+        for i in 0..(320 * 240) {
+            bus.write16(fb + i * 2, 0xF800);
+        }
+        setup_a3d_style(&mut bus, fb, ol, 320, 240, 16, 16);
+        bus.tom.win.w16(mem::HDB1, 123);
+        bus.tom.win.w16(mem::HDE, 0x053F); // window ends at line-buffer x 260
+        let frame = compose_frame(&mut bus);
+        let at = |x: u32| {
+            let o = ((120 * frame.width + x) * 4) as usize;
+            [frame.rgba[o], frame.rgba[o + 1], frame.rgba[o + 2]]
+        };
+        // The canvas is anchored at the bitmap's XPOS (16): column c is
+        // line-buffer x c + 16, so x 259 is column 243 and x 260 column 244.
+        assert_eq!(at(243), [255, 0, 0]);
+        assert_eq!(at(244), [0, 0, 0]);
     }
 
     #[test]

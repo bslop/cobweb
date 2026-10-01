@@ -259,6 +259,20 @@ fn lane(reg: [u32; 2], bpp: u32, idx: u32) -> u32 {
     ((phrase >> (64 - bpp - bits)) & ((1u64 << bpp) - 1)) as u32
 }
 
+/// The data-register value a PER-PIXEL write uses (any XADD mode but
+/// phrase): the low `bpp` bits of the long AT the register's equate, for every
+/// pixel whatever its x. HARDWARE (platform bench, jagq job 41, 16bpp):
+/// `B_SRCD` = $1111_2222 : $3333_4444 wrote $2222 to every pixel of 8-pixel
+/// spans starting at x = 0..3, and `B_PATD` = $5555_6666 : $7777_8888 wrote
+/// $6666. Indexing the lane by the pixel's position in its phrase (as `lane`
+/// does for phrase mode) wrote only every other pixel pair of a span whose
+/// colour was stored in one long. Other depths follow by extension, unmeasured.
+#[inline]
+fn pixel_lane(reg: [u32; 2], bpp: u32) -> u32 {
+    // reg = [high, low]; the low long is the one at the equate.
+    if bpp >= 32 { reg[1] } else { reg[1] & ((1u32 << bpp) - 1) }
+}
+
 /// Env-gated (JAGEMU_BLIT_YSTAT=1) raw source-Y extreme tracker: the address
 /// generator masks Y to 12 bits, but the RAW pointer says how far a textured
 /// span's V actually walks — the number that decides whether real silicon's
@@ -278,11 +292,16 @@ pub fn run(bus: &mut Bus, cmd: u32) {
     let outer = decode((count >> 16) & 0xFFFF);
     let inner = decode(count & 0xFFFF);
 
-    // Latch the 64-bit data registers (high long at the equate, low at +4).
+    // Latch the 64-bit data registers as [high, low]: the HIGH long is at
+    // equate + 4, the low long at the equate. HARDWARE (platform bench, jagq
+    // job 43): a phrase-mode span from B_SRCD = $1111_2222 (equate) :
+    // $3333_4444 (+4) wrote $3333 $4444 $1111 $2222, and B_PATD likewise
+    // $7777 $8888 $5555 $6666 - the leftmost pixel takes the top 16 bits of
+    // the long at +4. (This was read the other way round before.)
     let w = &bus.tom.win;
-    let srcd = [w.r32(mem::B_SRCD), w.r32(mem::B_SRCD + 4)];
-    let patd = [w.r32(mem::B_PATD), w.r32(mem::B_PATD + 4)];
-    let dstd = [w.r32(mem::B_DSTD), w.r32(mem::B_DSTD + 4)];
+    let srcd = [w.r32(mem::B_SRCD + 4), w.r32(mem::B_SRCD)];
+    let patd = [w.r32(mem::B_PATD + 4), w.r32(mem::B_PATD)];
+    let dstd = [w.r32(mem::B_DSTD + 4), w.r32(mem::B_DSTD)];
     let a1_clip = w.r32(mem::A1_CLIP);
 
     // Two address generators; DSTA2 swaps which is destination vs source.
@@ -325,6 +344,8 @@ pub fn run(bus: &mut Bus, cmd: u32) {
     let cmpdst = cmd & mem::BC_CMPDST != 0;
     let bkgwren = cmd & mem::BC_BKGWREN != 0;
     let pixel_mode = gens[dst].xadd == 1; // XADDPIX
+    // Every mode but XADDPHR writes one pixel per pass, from a fixed lane.
+    let per_pixel = gens[dst].xadd != 0;
     let clip_w = (a1_clip & 0x7FFF) as i32;
     let clip_h = ((a1_clip >> 16) & 0x7FFF) as i32;
     // Read the destination pixel only when something consumes it: an LFU that
@@ -480,6 +501,8 @@ pub fn run(bus: &mut Bus, cmd: u32) {
             let s = if srcen {
                 let (_, sa, sbit) = gens[src].locate();
                 gens[src].read_at(bus, sa, sbit)
+            } else if per_pixel {
+                pixel_lane(srcd, dbpp)
             } else {
                 lane(srcd, dbpp, lane_idx)
             };
@@ -498,7 +521,7 @@ pub fn run(bus: &mut Bus, cmd: u32) {
                 let l = (lane_idx % 4) as usize;
                 (icol[l] << 8) | ((iacc[l] >> 16) & 0xFF) as u32
             } else if patdsel || gourd {
-                lane(patd, dbpp, lane_idx)
+                if per_pixel { pixel_lane(patd, dbpp) } else { lane(patd, dbpp, lane_idx) }
             } else if adddsel {
                 sat_add16(s, d)
             } else {
@@ -515,7 +538,8 @@ pub fn run(bus: &mut Bus, cmd: u32) {
             if dcompen {
                 // Transparent copy: inhibit when the compared pixel equals B_PATD.
                 let cmpval = if cmpdst { d } else { s };
-                if cmpval == (lane(patd, dbpp, lane_idx) & dmask) {
+                let key = if per_pixel { pixel_lane(patd, dbpp) } else { lane(patd, dbpp, lane_idx) };
+                if cmpval == (key & dmask) {
                     inhibit = true;
                 }
             }
@@ -546,7 +570,13 @@ pub fn run(bus: &mut Bus, cmd: u32) {
                     // nothing to restore and the background register is written,
                     // which is the "restore inhibited pixels" role the TRM gives
                     // DSTEN in the Z recipe [TRM p.82].
-                    let bg = if dsten { d } else { lane(dstd, dbpp, lane_idx) };
+                    let bg = if dsten {
+                        d
+                    } else if per_pixel {
+                        pixel_lane(dstd, dbpp)
+                    } else {
+                        lane(dstd, dbpp, lane_idx)
+                    };
                     gens[dst].write_at(bus, da, dbit, bg & dmask);
                 }
             } else {
@@ -709,6 +739,59 @@ mod tests {
         bus.tom.win.w32(mem::B_SRCD + 4, cc);
         bus.tom.win.w32(mem::B_COUNT, (rows << 16) | n);
         let _ = upda1;
+    }
+
+    /// HARDWARE (platform bench, jagq job 41): a per-pixel (XADDPIX) span
+    /// takes every pixel from the low 16 bits of the long at the data
+    /// register's equate, whatever its x: $2222 from B_SRCD = $1111_2222 :
+    /// $3333_4444, $6666 from B_PATD = $5555_6666 : $7777_8888.
+    /// HARDWARE (platform bench, jagq jobs 43-44): a PHRASE-mode (XADDPHR)
+    /// 8-pixel span from x = 0 writes the lanes of ($equate+4 : $equate)
+    /// left to right: $3333 $4444 $1111 $2222 twice for B_SRCD, and $7777
+    /// $8888 $5555 $6666 for B_PATD.
+    #[test]
+    fn phrase_mode_lanes_run_high_long_first() {
+        for (cmd, want) in [
+            (0x0180_0000u32, [0x3333u16, 0x4444, 0x1111, 0x2222]),
+            (0x0001_0000, [0x7777, 0x8888, 0x5555, 0x6666]),
+        ] {
+            let mut bus = Bus::new();
+            let fb = 0x10_0000;
+            setup_fill_regs(&mut bus, fb, 0, 0, 8, 1, 0, false);
+            bus.tom.win.w32(mem::A1_FLAGS, 0x0000_4200 | (4 << mem::AF_PIXEL_SHIFT)); // XADDPHR
+            bus.tom.win.w32(mem::B_SRCD, 0x1111_2222);
+            bus.tom.win.w32(mem::B_SRCD + 4, 0x3333_4444);
+            bus.tom.win.w32(mem::B_PATD, 0x5555_6666);
+            bus.tom.win.w32(mem::B_PATD + 4, 0x7777_8888);
+            run(&mut bus, cmd);
+            for i in 0..8u32 {
+                assert_eq!(bus.read16(fb + 2 * i), want[(i % 4) as usize], "cmd {cmd:08X} px {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn pixel_mode_writes_one_fixed_lane() {
+        for (cmd, want) in [(0x0180_0000u32, 0x2222u16), (0x0001_0000, 0x6666)] {
+            for x0 in 0..4u32 {
+                let mut bus = Bus::new();
+                let fb = 0x10_0000;
+                for i in 0..16 {
+                    bus.write16(fb + 2 * i, 0xEEEE);
+                }
+                setup_fill_regs(&mut bus, fb, x0, 0, 8, 1, 0, false);
+                bus.tom.win.w32(mem::B_SRCD, 0x1111_2222);
+                bus.tom.win.w32(mem::B_SRCD + 4, 0x3333_4444);
+                bus.tom.win.w32(mem::B_PATD, 0x5555_6666);
+                bus.tom.win.w32(mem::B_PATD + 4, 0x7777_8888);
+                run(&mut bus, cmd);
+                for i in 0..16 {
+                    let px = bus.read16(fb + 2 * i);
+                    let inside = (x0..x0 + 8).contains(&i);
+                    assert_eq!(px, if inside { want } else { 0xEEEE }, "cmd {cmd:08X} x0 {x0} px {i}");
+                }
+            }
+        }
     }
 
     #[test]
