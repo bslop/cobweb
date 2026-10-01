@@ -352,7 +352,7 @@ impl Risc {
 
     /// Latch the first strict fault (PC and address) on this core.
     pub(crate) fn strict_trip(&mut self, kind: &'static str, addr: u32) {
-        if self.strict_fault.is_none() {
+        if self.strict_fault.is_none() && !self.strict.exempts(kind, self.pc, addr) {
             let master = if self.kind.is_dsp() { "dsp" } else { "gpu" };
             self.strict_fault = Some(crate::debug::StrictFault { kind, master, pc: self.pc, addr });
         }
@@ -714,6 +714,15 @@ impl Risc {
                 self.bp_hit = Some(self.pc);
                 break;
             }
+            if self.starved_by_int2(bus) {
+                // Held before the access, so G_PC names the stalled load, as
+                // it did on the bench. The rest of the slice is spent waiting.
+                let rest = budget - spent;
+                self.pipe.stats.int2_starved += rest as u64;
+                self.cycles += rest as u64;
+                spent = budget;
+                break;
+            }
             let c = self.step_one(bus);
             // The GPU's own execution IS wall time for the in-flight blit —
             // drain here so a bwait poll loop observes completion. (The DSP
@@ -791,6 +800,42 @@ impl Risc {
             self.park_ring.rotate_left(1);
             self.park_ring[Self::PARK_WINDOW - 1] = pc;
         }
+    }
+
+    /// Whether the next instruction needs the main bus while a 68000
+    /// interrupt holds the GPU's priority lowered (`Tom::int2_lowered`).
+    ///
+    /// Silicon, measured (platform issue 0008): a level-2 handler that
+    /// returned without writing `INT2` left every later GPU kick stalled on
+    /// its first DRAM loads for good (3,000,000 mailbox polls, ~35 s), with
+    /// the 68000 polling or in `STOP` alike; adding `INT2 = 0` fixed it. So
+    /// under silicon fidelity a lowered GPU does not get the main bus at all:
+    /// an external load/store, or a fetch from outside local RAM, waits.
+    /// Accesses inside Tom ($F00000-$F0FFFF: local RAM, registers) go on.
+    fn starved_by_int2(&self, bus: &mut Bus) -> bool {
+        if self.fidelity != Fidelity::Silicon || self.kind != RiscKind::Gpu || !bus.tom.int2_lowered {
+            return false;
+        }
+        let tom = |a: u32| (0x00F0_0000..0x00F1_0000).contains(&(a & 0x00FF_FFFF));
+        let base = self.kind.sram_base();
+        if !(base..base + self.kind.sram_size()).contains(&self.pc) {
+            return true; // fetching from DRAM/cart
+        }
+        let iw = bus.tom.win.r16(self.pc);
+        let op = (iw >> 10) & 0x3F;
+        let r1 = ((iw >> 5) & 0x1F) as usize;
+        let b = self.cur_bank();
+        let s = self.reg(b, r1);
+        let quick = |r: usize| (if r == 0 { 32 } else { r as u32 }) * 4;
+        let addr = match op {
+            39..=42 | 45..=48 => s,
+            43 | 49 => self.reg(b, 14).wrapping_add(quick(r1)),
+            44 | 50 => self.reg(b, 15).wrapping_add(quick(r1)),
+            58 | 60 => self.reg(b, 14).wrapping_add(s),
+            59 | 61 => self.reg(b, 15).wrapping_add(s),
+            _ => return false,
+        };
+        !tom(addr)
     }
 
     fn step_one(&mut self, bus: &mut Bus) -> u32 {
@@ -1372,7 +1417,7 @@ mod tests {
     #[test]
     fn strict_68k_narrow_write_and_machine_stop() {
         let mut bus = Bus::new();
-        bus.strict_narrow = true;
+        bus.strict.narrow = true;
         bus.cur_master = crate::bus::Master::Cpu;
         bus.cur_master_pc = 0x4242;
         bus.write32(0x00F0_3000, 0x1234_5678); // 32-bit: fine

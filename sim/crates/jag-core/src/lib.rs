@@ -141,7 +141,7 @@ impl Jaguar {
     pub fn set_strict(&mut self, s: Strict) {
         self.gpu.strict = s;
         self.dsp.strict = s;
-        self.bus.strict_narrow = s.narrow;
+        self.bus.strict = s;
     }
 
     /// The first strict fault latched by any master, if one has fired.

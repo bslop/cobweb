@@ -200,7 +200,10 @@ impl Scheduler {
         // finishes on wall time — drain by this window's ticks instead. Without
         // this, a 68k- or DSP-launched blit (or one outliving its kernel) never
         // completes and every B_CMD poll spins forever.
-        if !gpu.running {
+        // A lowered Blitter (68000 interrupt taken, INT2 not yet written) does
+        // not get the bus under silicon fidelity either.
+        let blit_held = bus.tom.int2_lowered && gpu.fidelity == crate::risc::timing::Fidelity::Silicon;
+        if !gpu.running && !blit_held {
             bus.tom.blit_busy = bus.tom.blit_busy.saturating_sub(risc_ticks.max(0) as u64);
             bus.tom.blit_settle = bus.tom.blit_settle.saturating_sub(risc_ticks.max(0) as u64);
         }

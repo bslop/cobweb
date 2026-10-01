@@ -118,6 +118,16 @@ pub struct Tom {
     /// INT1 pending latches (bits 0-4): which interrupts have occurred. Games
     /// poll this (e.g. vblank-wait `btst #0,INT1`) or read it in the ISR.
     pub int1_pending: u16,
+    /// GPU/Blitter bus priority is LOWERED: set when the 68000 takes an
+    /// interrupt, cleared by any write to `INT2` (Tech Ref v8 p.17). Under
+    /// silicon fidelity a lowered GPU cannot use the main bus at all: a bench
+    /// handler that never wrote `INT2` left every GPU DRAM load stalled for
+    /// good (platform issue 0008). See `Risc::starved_by_int2`.
+    pub int2_lowered: bool,
+    /// `rte`s that left an interrupt handler with `INT2` never written, and
+    /// the PC of the first one (reported on stderr; `--strict=int2` stops).
+    pub rte_without_int2: u64,
+    pub rte_without_int2_pc: u32,
     /// The Object Processor's persistent scan-out framebuffer. The OP composites
     /// into this **one display line at a time** as the scheduler crosses each
     /// active scanline (so a game that rebuilds its object list every vblank is
@@ -279,6 +289,9 @@ impl Tom {
             win,
             int1_enable: 0,
             int1_pending: 0,
+            int2_lowered: false,
+            rte_without_int2: 0,
+            rte_without_int2_pc: 0,
             fb: crate::tom::Framebuffer::solid(320, 240, 0, 0, 0),
             presented: crate::tom::Framebuffer::solid(320, 240, 0, 0, 0),
             op: crate::tom::OpState::default(),
@@ -398,7 +411,8 @@ pub struct Bus {
     /// never executed on hardware. Counted so the run can say so out loud.
     pub risc_ram_narrow_writes: u64,
     /// `Strict::narrow`: latch the first 68000 narrow write into RISC RAM.
-    pub strict_narrow: bool,
+    /// The strict checks the 68000 side latches (see `Strict`).
+    pub strict: crate::debug::Strict,
     pub strict_fault: Option<crate::debug::StrictFault>,
     /// Captured stereo audio (interleaved L,R 16-bit) when `audio_capture` is on.
     pub audio: Vec<i16>,
@@ -550,7 +564,7 @@ impl Bus {
             jerry: Jerry::new(),
             access_count: 0,
             risc_ram_narrow_writes: 0,
-            strict_narrow: false,
+            strict: crate::debug::Strict::default(),
             strict_fault: None,
             audio: Vec::new(),
             audio_capture: false,
@@ -673,6 +687,14 @@ impl Bus {
     }
 
     #[inline]
+    /// Latch the first strict fault raised on the 68000 side, unless an
+    /// `--strict-exempt` entry covers it.
+    pub fn strict_trip_68k(&mut self, kind: &'static str, pc: u32, addr: u32) {
+        if self.strict_fault.is_none() && !self.strict.exempts(kind, pc, addr) {
+            self.strict_fault = Some(crate::debug::StrictFault { kind, master: "68k", pc, addr });
+        }
+    }
+
     pub fn write8(&mut self, addr: u32, v: u8) {
         self.m68k_bus_cycles += 1;
         self.access_count += 1;
@@ -688,13 +710,8 @@ impl Bus {
                 || (0x00F1_B000..0x00F1_D000).contains(&a))
         {
             self.risc_ram_narrow_writes += 1;
-            if self.strict_narrow && self.cur_master == Master::Cpu && self.strict_fault.is_none() {
-                self.strict_fault = Some(crate::debug::StrictFault {
-                    kind: "narrow_risc_ram_write",
-                    master: "68k",
-                    pc: self.cur_master_pc,
-                    addr: a,
-                });
+            if self.strict.narrow && self.cur_master == Master::Cpu {
+                self.strict_trip_68k("narrow_risc_ram_write", self.cur_master_pc, a);
             }
         }
         self.watch_note(a, 8, v as u32);
@@ -827,6 +844,9 @@ impl Bus {
             self.tom.win.w16(a, v);
             return;
         }
+        if a == mem::INT2 {
+            self.tom.int2_lowered = false; // any value restores the priorities
+        }
         self.tom.win.w16(a, v);
     }
 
@@ -912,6 +932,13 @@ impl Bus {
     }
 
     fn tom_write32(&mut self, a: u32, v: u32) {
+        if a == mem::INT1 {
+            // `move.l #$01010000,INT1` writes INT1 and INT2 in one go: both
+            // halves need their side effects, not just the raw window.
+            self.tom_write16(mem::INT1, (v >> 16) as u16);
+            self.tom_write16(mem::INT2, v as u16);
+            return;
+        }
         self.tom.win.w32(a, v);
         if a == mem::B_CMD {
             {
@@ -945,6 +972,9 @@ impl Bus {
     }
 
     fn tom_write8(&mut self, a: u32, v: u8) {
+        if a & !1 == mem::INT2 {
+            self.tom.int2_lowered = false;
+        }
         self.tom.win.w8(a, v);
     }
 

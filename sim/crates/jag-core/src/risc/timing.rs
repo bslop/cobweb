@@ -271,6 +271,11 @@ pub struct TimingStats {
     /// Reported, never enforced — like `m68k_dram_poll_max`. A healthy kernel
     /// that clears GO reads ~0 here; one parked on `jr .idle` reads millions.
     pub park_spin_max: u64,
+    /// Ticks the GPU spent held off the main bus because a 68000 interrupt
+    /// lowered its priority and `INT2` was not yet written (silicon only;
+    /// see `Risc::starved_by_int2`). A run that never writes `INT2` reads
+    /// every tick after the first interrupt here.
+    pub int2_starved: u64,
     /// Sites where BigPEmu semantics diverge from silicon (external load
     /// consumed across a taken jump without a scoreboard stall).
     pub bigpemu_divergence: u64,

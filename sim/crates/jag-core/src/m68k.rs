@@ -376,6 +376,13 @@ impl M68k {
     /// 68000 apart from a spinning one.
     pub fn step(&mut self, bus: &mut Bus, dbg: &mut Debugger) -> u32 {
         bus.m68k_bus_cycles = 0;
+        // Cleared here like `m68k_bus_cycles`: the bus counts every master's
+        // DRAM cycles, and the GPU/DSP run between two 68000 steps. Left
+        // standing, a GPU looping on DRAM was billed to the 68000's next
+        // instruction through the OP tax, which bought the GPU a bigger slice
+        // and more DRAM cycles: under functional fidelity the cost doubled per
+        // instruction until the 68000 ran ~10 instructions a field.
+        bus.m68k_dram_cycles = 0;
         bus.m68k_dram_read_addr = None;
         bus.m68k_dram_wrote = false;
         bus.m68k_stray_write = None;
@@ -532,6 +539,9 @@ impl M68k {
         self.pc = bus.read32(vector * 4);
         self.isr_depth += 1;
         self.pending_level = 0; // acknowledged
+        // "When an interrupt is applied to the CPU the bus priorities of the
+        // GPU and Blitter are reduced" until INT2 is written (Tech Ref v8 p.17).
+        bus.tom.int2_lowered = true;
         44
     }
 

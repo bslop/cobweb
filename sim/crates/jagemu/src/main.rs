@@ -113,11 +113,15 @@ fn usage() {
          \x20      [--gpu-map g.map] [--dsp-map d.map] [--start S] [--top K] [--bucket N]\n\
          \x20      [--prof-json p.json]      # full per-PC profile; diff two with profdiff.py\n\
          \x20 jagemu run <rom> --watchdog N   # warn if a core runs N frames without clearing GO\n\
-         \x20 --strict[=narrow,dram-stale,roundtrip,div0]   (any command that boots a ROM)\n\
+         \x20 --strict[=narrow,dram-stale,roundtrip,div0,int2]   (any command that boots a ROM)\n\
          \x20                   stop at the first silicon fault jsim would run through:\n\
          \x20                   narrow GPU/DSP local-RAM access, JAGEMU_DRAM_STALE hit,\n\
-         \x20                   store->load DRAM round trip, DIV by zero. Bare = all.\n\
+         \x20                   store->load DRAM round trip, DIV by zero, a 68000 rte\n\
+         \x20                   out of an interrupt that never wrote INT2. Bare = all.\n\
          \x20                   The JSON's \"strict_fault\" names it (PC, address); exit 3\n\
+         \x20 --strict-exempt=[check:]pc=LO[-HI] | [check:]addr=LO[-HI]   (repeatable)\n\
+         \x20                   count but do not stop on a known-safe site (hex numbers),\n\
+         \x20                   e.g. --strict-exempt=roundtrip:pc=F03124\n\
          \x20 jagemu screenshot <rom> [--frames N] [--full-window] [-o out.png]\n\
          \x20                   --full-window: composite the WHOLE display window,\n\
          \x20                   so BGEN (the background colour, and any BG probe\n\
@@ -366,9 +370,16 @@ fn strict_arg(args: &[String]) -> Result<jag_core::Strict, String> {
             s = jag_core::Strict::parse(list)?;
         }
     }
+    for a in args {
+        if let Some(spec) = a.strip_prefix("--strict-exempt=") {
+            s.add_exempt(spec)?;
+        } else if a == "--strict-exempt" {
+            return Err("--strict-exempt needs `=`: --strict-exempt=[check:]pc=LO[-HI]".into());
+        }
+    }
     if s.dram_stale {
         let win = std::env::var("JAGEMU_DRAM_STALE").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
-        if win == 0 && s == jag_core::Strict::ALL {
+        if win == 0 && (jag_core::Strict { exempt: s.exempt, ..jag_core::Strict::ALL }) == s {
             // bare --strict: say what the dram-stale check needs
             eprintln!(
                 "jagemu: --strict: the dram-stale check is inert without \
@@ -477,6 +488,17 @@ fn report_hazard_diagnostics(jag: &Jaguar) {
                 eprintln!("jagemu:     round-trip site: addr ${a:06X} load PC ${pc:06X} x{n}");
             }
         }
+    }
+    if jag.bus.tom.rte_without_int2 > 0 {
+        eprintln!(
+            "jagemu: WARNING — {} 68000 interrupt handler return(s) (rte) without a write to \
+             INT2 ($F000E2) since the interrupt was taken (first rte at PC ${:06X}). Taking an \
+             interrupt lowers the GPU's and Blitter's bus priority until INT2 is written; on \
+             silicon a GPU that then loads from DRAM never finishes (platform issue 0008). \
+             Write INT2 (any value) before rte. --fidelity silicon models the stall \
+             (gpu.timing.int2_starved); --strict=int2 stops at the rte.",
+            jag.bus.tom.rte_without_int2, jag.bus.tom.rte_without_int2_pc
+        );
     }
     for (name, c) in [("Tom GPU", &jag.gpu), ("Jerry DSP", &jag.dsp)] {
         if let Some((pc, frames)) = c.stuck_at {
@@ -2354,7 +2376,8 @@ fn state_json(jag: &Jaguar) -> String {
          \"flags\":\"0x{:08X}\",\"regs0\":[{}],\"regs1\":[{}]}},\
          \"dsp\":{{\"running\":{},\"instret\":{},\"cycles\":{},\"cycles_per_field\":{:.1},\"timing\":{},\
          \"flags\":\"0x{:08X}\",\"regs0\":[{}],\"regs1\":[{}]}},\
-         \"blitter\":{{\"bcmd_busy_reads\":{},\"bcmd_poll_in_settle\":{}}},\"risc_ram_narrow_writes\":{},{}\
+         \"blitter\":{{\"bcmd_busy_reads\":{},\"bcmd_poll_in_settle\":{}}},\"risc_ram_narrow_writes\":{},\
+         \"int2\":{{\"lowered\":{},\"rte_without_int2\":{},\"rte_without_int2_pc\":\"0x{:06X}\"}},{}\
          \"op\":{{\"scaled_misaligned_hits\":{},\"scaled_misaligned_addr\":\"0x{:06X}\",\"bitmap_misaligned_hits\":{},\"bitmap_misaligned_addr\":\"0x{:06X}\",\"bitmap_misaligned_last\":\"0x{:06X}\"}},\
          \"d\":[{}],\"a\":[{}]}}",
         strict_json(jag),
@@ -2442,6 +2465,9 @@ fn state_json(jag: &Jaguar) -> String {
         jag.bus.bcmd_busy_reads.load(std::sync::atomic::Ordering::Relaxed),
         jag.bus.bcmd_poll_in_settle.load(std::sync::atomic::Ordering::Relaxed),
         jag.bus.risc_ram_narrow_writes,
+        jag.bus.tom.int2_lowered,
+        jag.bus.tom.rte_without_int2,
+        jag.bus.tom.rte_without_int2_pc,
         // The GameDrive's 16 MB of cartridge SDRAM. Emitted only when a
         // GameDrive is attached, so nothing changes for a run without --sd.
         // `writes_byte` is the one to read: a byte store into the window fills
@@ -2482,7 +2508,7 @@ fn timing_json(t: &TimingStats) -> String {
          \"stall_div_busy\":{},\"jump_refill\":{},\"fetch_external\":{},\"mem_external\":{},\
          \"waw_hazards\":{},\"regpage_hazard\":{},\"indexed_store_stale\":{},\"slot_movei\":{},\"slot_jump\":{},\
          \"bigpemu_divergence\":{},\"contention\":{},\"dram_under_blit\":{},\"blit\":{},\
-         \"unaligned_risc32\":{},\"dram_stale\":{},\"dram_stale_pc\":\"0x{:06X}\",\"blit_count\":{},\"blit_launch\":{},\"blit_transfer\":{},\"blit_wait\":{},\"div_by_zero\":{},\"div_by_zero_first_pc\":\"0x{:06X}\",\"div_by_zero_last_pc\":\"0x{:06X}\",\"store_load_roundtrips\":{},\"store_load_first_pc\":\"0x{:06X}\",\"store_load_last_pc\":\"0x{:06X}\",\"store_load_last_addr\":\"0x{:06X}\",\"store_load_min_gap\":{},\"park_spin_max\":{}}}",
+         \"unaligned_risc32\":{},\"dram_stale\":{},\"dram_stale_pc\":\"0x{:06X}\",\"blit_count\":{},\"blit_launch\":{},\"blit_transfer\":{},\"blit_wait\":{},\"div_by_zero\":{},\"div_by_zero_first_pc\":\"0x{:06X}\",\"div_by_zero_last_pc\":\"0x{:06X}\",\"store_load_roundtrips\":{},\"store_load_first_pc\":\"0x{:06X}\",\"store_load_last_pc\":\"0x{:06X}\",\"store_load_last_addr\":\"0x{:06X}\",\"store_load_min_gap\":{},\"park_spin_max\":{},\"int2_starved\":{}}}",
         t.stall_alu,
         t.stall_load,
         t.stall_div,
@@ -2516,6 +2542,7 @@ fn timing_json(t: &TimingStats) -> String {
         t.store_load_last_addr,
         t.store_load_min_gap,
         t.park_spin_max,
+        t.int2_starved,
     )
 }
 

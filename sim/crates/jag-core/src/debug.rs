@@ -45,13 +45,41 @@ pub struct Strict {
     pub roundtrip: bool,
     /// A DIV by zero (silicon's result is unmeasured).
     pub div0: bool,
+    /// A 68000 `rte` out of an interrupt handler that never wrote `INT2`:
+    /// silicon leaves the GPU and Blitter at lowered bus priority, and a GPU
+    /// that loads from DRAM then never finishes (platform issue 0008).
+    pub int2: bool,
+    /// Faults that are counted but do not stop the run (`--strict-exempt`):
+    /// a known-safe site, such as the mailbox read-back of a GPU halt.
+    pub exempt: [Option<StrictExempt>; Strict::MAX_EXEMPT],
+}
+
+/// One `--strict-exempt` entry: `[kind:]pc=LO[-HI]` or `[kind:]addr=LO[-HI]`.
+/// `kind` is a check name from [`Strict::NAMES`]; without it, every check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StrictExempt {
+    /// Fault kind (as in [`StrictFault::kind`]) this applies to, or all.
+    pub kind: Option<&'static str>,
+    /// Match the faulting PC (true) or the faulting address (false).
+    pub by_pc: bool,
+    pub lo: u32,
+    pub hi: u32,
 }
 
 impl Strict {
-    pub const ALL: Strict = Strict { narrow: true, dram_stale: true, roundtrip: true, div0: true };
-    pub const NAMES: &'static str = "narrow,dram-stale,roundtrip,div0";
+    pub const ALL: Strict = Strict {
+        narrow: true,
+        dram_stale: true,
+        roundtrip: true,
+        div0: true,
+        int2: true,
+        exempt: [None; Strict::MAX_EXEMPT],
+    };
+    pub const NAMES: &'static str = "narrow,dram-stale,roundtrip,div0,int2";
+    pub const MAX_EXEMPT: usize = 16;
 
-    /// Parse a comma-separated list of `NAMES` (or `all`).
+    /// Parse a comma-separated list of `NAMES` (or `all`). Exemptions already
+    /// in `self` are kept.
     pub fn parse(list: &str) -> Result<Strict, String> {
         let mut s = Strict::default();
         for k in list.split(',').map(str::trim).filter(|k| !k.is_empty()) {
@@ -61,10 +89,77 @@ impl Strict {
                 "dram-stale" => s.dram_stale = true,
                 "roundtrip" => s.roundtrip = true,
                 "div0" => s.div0 = true,
+                "int2" => s.int2 = true,
                 other => return Err(format!("unknown strict check `{other}` (expected {})", Strict::NAMES)),
             }
         }
         Ok(s)
+    }
+
+    /// The `StrictFault::kind` values a check name covers.
+    fn kinds_of(name: &str) -> Option<&'static [&'static str]> {
+        Some(match name {
+            "narrow" => &["narrow_sram", "narrow_risc_ram_write"],
+            "dram-stale" => &["dram_stale"],
+            "roundtrip" => &["store_load_roundtrip"],
+            "div0" => &["div_by_zero"],
+            "int2" => &["rte_without_int2"],
+            _ => return None,
+        })
+    }
+
+    /// Add one `--strict-exempt` entry: `[check:]pc=LO[-HI]` or
+    /// `[check:]addr=LO[-HI]`, numbers in hex (`0x`/`$` optional).
+    pub fn add_exempt(&mut self, spec: &str) -> Result<(), String> {
+        let bad = || format!("bad --strict-exempt `{spec}` (expected [check:]pc=LO[-HI] or [check:]addr=LO[-HI])");
+        let (kinds, rest): (Option<&'static [&'static str]>, &str) = match spec.split_once(':') {
+            Some((k, r)) => (Some(Strict::kinds_of(k.trim()).ok_or_else(|| {
+                format!("unknown strict check `{k}` in --strict-exempt (expected {})", Strict::NAMES)
+            })?), r),
+            None => (None, spec),
+        };
+        let (what, range) = rest.split_once('=').ok_or_else(bad)?;
+        let by_pc = match what.trim() {
+            "pc" => true,
+            "addr" => false,
+            _ => return Err(bad()),
+        };
+        let num = |t: &str| {
+            let t = t.trim();
+            let t = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")).or_else(|| t.strip_prefix('$')).unwrap_or(t);
+            u32::from_str_radix(t, 16).map_err(|_| bad())
+        };
+        let (lo, hi) = match range.split_once('-') {
+            Some((a, b)) => (num(a)?, num(b)?),
+            None => {
+                let v = num(range)?;
+                (v, v)
+            }
+        };
+        if hi < lo {
+            return Err(bad());
+        }
+        let kinds: Vec<Option<&'static str>> = match kinds {
+            Some(ks) => ks.iter().map(|k| Some(*k)).collect(),
+            None => vec![None],
+        };
+        for kind in kinds {
+            let slot = self.exempt.iter_mut().find(|e| e.is_none()).ok_or_else(|| {
+                format!("too many --strict-exempt entries (at most {})", Strict::MAX_EXEMPT)
+            })?;
+            *slot = Some(StrictExempt { kind, by_pc, lo, hi });
+        }
+        Ok(())
+    }
+
+    /// Whether a fault of `kind` at `pc`/`addr` is exempted from stopping.
+    pub fn exempts(&self, kind: &str, pc: u32, addr: u32) -> bool {
+        self.exempt.iter().flatten().any(|e| {
+            e.kind.map_or(true, |k| k == kind) && {
+                let v = if e.by_pc { pc } else { addr };
+                (e.lo..=e.hi).contains(&v)
+            }
+        })
     }
 }
 
@@ -461,5 +556,42 @@ impl RiscProfile {
             }
         }
         v
+    }
+}
+
+#[cfg(test)]
+mod strict_tests {
+    use super::Strict;
+
+    #[test]
+    fn exempt_by_pc_range_and_kind() {
+        let mut s = Strict::parse("roundtrip,dram-stale").unwrap();
+        s.add_exempt("roundtrip:pc=F03120-F0312C").unwrap();
+        assert!(s.exempts("store_load_roundtrip", 0xF03124, 0x1000));
+        assert!(!s.exempts("store_load_roundtrip", 0xF03130, 0x1000));
+        assert!(!s.exempts("dram_stale", 0xF03124, 0x1000), "kind filter");
+    }
+
+    #[test]
+    fn exempt_by_address_any_kind() {
+        let mut s = Strict::ALL;
+        s.add_exempt("addr=$1F0000-0x1F00FF").unwrap();
+        assert!(s.exempts("dram_stale", 0, 0x1F0040));
+        assert!(s.exempts("narrow_sram", 0, 0x1F0000));
+        assert!(!s.exempts("narrow_sram", 0, 0x1F0100));
+    }
+
+    #[test]
+    fn exempt_rejects_bad_specs() {
+        let mut s = Strict::default();
+        for bad in ["pc", "pc=", "pc=zz", "nope:pc=1", "pc=10-1", "reg=1"] {
+            assert!(s.add_exempt(bad).is_err(), "{bad} accepted");
+        }
+    }
+
+    #[test]
+    fn int2_is_a_check_name() {
+        assert!(Strict::parse("int2").unwrap().int2);
+        assert!(Strict::ALL.int2);
     }
 }

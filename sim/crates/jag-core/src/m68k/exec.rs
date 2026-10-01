@@ -395,6 +395,18 @@ impl M68k {
             }
             0x4E73 => {
                 // RTE (privileged)
+                if self.isr_depth > 0 && bus.tom.int2_lowered {
+                    // Leaving an interrupt with the GPU/Blitter priority still
+                    // lowered: on silicon a GPU DRAM load then never finishes.
+                    let pc = self.pc.wrapping_sub(2);
+                    if bus.tom.rte_without_int2 == 0 {
+                        bus.tom.rte_without_int2_pc = pc;
+                    }
+                    bus.tom.rte_without_int2 += 1;
+                    if bus.strict.int2 {
+                        bus.strict_trip_68k("rte_without_int2", pc, crate::mem::INT2);
+                    }
+                }
                 self.isr_depth = self.isr_depth.saturating_sub(1);
                 if !self.supervisor() {
                     return self.exception(bus, 8, false);
