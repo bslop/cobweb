@@ -124,6 +124,10 @@ pub struct Tom {
     /// handler that never wrote `INT2` left every GPU DRAM load stalled for
     /// good (platform issue 0008). See `Risc::starved_by_int2`.
     pub int2_lowered: bool,
+    /// The GPU stored `CPUINT` (G_CTRL bit 1): the scheduler latches INT1
+    /// source 1 (`C_GPUENA`) and interrupts the 68000 if that source is
+    /// enabled (Tech Ref: "allows the GPU to interrupt the CPU").
+    pub gpu_cpuint: bool,
     /// `rte`s that left an interrupt handler with `INT2` never written, and
     /// the PC of the first one (reported on stderr; `--strict=int2` stops).
     pub rte_without_int2: u64,
@@ -290,6 +294,7 @@ impl Tom {
             int1_enable: 0,
             int1_pending: 0,
             int2_lowered: false,
+            gpu_cpuint: false,
             rte_without_int2: 0,
             rte_without_int2_pc: 0,
             fb: crate::tom::Framebuffer::solid(320, 240, 0, 0, 0),

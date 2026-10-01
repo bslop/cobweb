@@ -601,6 +601,14 @@ impl Risc {
                 0x08 => self.mtxa = val,
                 0x10 => self.pc = val,
                 0x14 => {
+                    // CPUINT is a strobe, not state: it raises the 68000's
+                    // GPU interrupt (the STOP-sync wake-up) and reads back 0.
+                    let val = if !self.kind.is_dsp() && val & mem::CPUINT != 0 {
+                        bus.tom.gpu_cpuint = true;
+                        val & !mem::CPUINT
+                    } else {
+                        val
+                    };
                     self.ctrl = val;
                     self.win_w32(bus, addr, val);
                     if val & mem::RISCGO == 0 {

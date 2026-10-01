@@ -195,6 +195,12 @@ impl Scheduler {
         // (The scheduler advances once per 68k instruction, so the GO-low slice
         // is always observed.)
         gpu.run(bus, budget);
+        if std::mem::take(&mut bus.tom.gpu_cpuint) {
+            bus.tom.int1_pending |= mem::C_GPUENA;
+            if bus.tom.int1_enable & mem::C_GPUENA != 0 {
+                cpu.request_interrupt(2);
+            }
+        }
         // The blit drains against GPU instruction time while the GPU runs
         // (risc.rs); when the GPU is halted the Blitter still owns the bus and
         // finishes on wall time — drain by this window's ticks instead. Without

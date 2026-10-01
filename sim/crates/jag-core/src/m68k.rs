@@ -135,6 +135,20 @@ pub struct M68k {
     pub sr: u16,
     /// Highest pending interrupt level (0 = none). The Jaguar drives level 2.
     pub pending_level: u8,
+    /// Interrupt delivery delay in 68000 cycles, `(min, max)`; (0, 0) = off.
+    /// From `JAGEMU_IRQ_DELAY=N` or `=MIN-MAX`. jsim otherwise hands a request
+    /// to the 68000 at the next instruction boundary, every time, so races
+    /// that depend on WHEN the wake lands (mask-check-`STOP`, a blanket INT1
+    /// acknowledge eating a later source) never show. With a range, each
+    /// request waits a different, deterministic amount, which also makes a
+    /// handler's `VC` at entry vary between fields as it does on silicon
+    /// (platform issues 0004 item 10, 0008 item 2). Not calibrated: a test
+    /// knob to sweep, not a model of the board.
+    pub irq_delay: (u32, u32),
+    /// Cycles left before the pending request may be taken.
+    irq_wait: u32,
+    /// Requests delayed so far (drives the deterministic spread).
+    irq_seq: u32,
     /// `STOP` halted the CPU until an interrupt arrives.
     pub stopped: bool,
     pub cycles: u64,
@@ -231,6 +245,9 @@ impl M68k {
             pc: 0,
             sr: 0x2700,
             pending_level: 0,
+            irq_delay: irq_delay_from_env(),
+            irq_wait: 0,
+            irq_seq: 0,
             stopped: false,
             cycles: 0,
             fetch_ba: 0,
@@ -265,6 +282,7 @@ impl M68k {
         self.a[7] = self.ssp;
         self.pc = bus.read32(4);
         self.pending_level = 0;
+        self.irq_wait = 0;
         self.stopped = false;
     }
 
@@ -278,6 +296,14 @@ impl M68k {
     #[inline]
     pub fn request_interrupt(&mut self, level: u8) {
         if level > self.pending_level {
+            if self.pending_level == 0 && self.irq_delay.1 > 0 {
+                let (lo, hi) = self.irq_delay;
+                // Golden-ratio stride: consecutive requests spread over the
+                // whole range instead of creeping through it.
+                let spread = (self.irq_seq.wrapping_mul(0x9E37_79B1) >> 16) as u64 % (hi as u64 - lo as u64 + 1);
+                self.irq_wait = lo + spread as u32;
+                self.irq_seq = self.irq_seq.wrapping_add(1);
+            }
             self.pending_level = level;
         }
     }
@@ -484,6 +510,7 @@ impl M68k {
 
         self.cycles += (extra + op_extra) as u64;
         let c = c0 + extra + op_extra;
+        self.irq_wait = self.irq_wait.saturating_sub(c);
 
         if dbg.prof.is_some() {
             let in_isr = self.isr_depth > 0;
@@ -496,7 +523,7 @@ impl M68k {
 
     fn step_inner(&mut self, bus: &mut Bus, dbg: &mut Debugger) -> u32 {
         // Service interrupts first.
-        if self.pending_level != 0 {
+        if self.pending_level != 0 && self.irq_wait == 0 {
             let lvl = self.pending_level;
             if lvl == 7 || lvl > self.int_mask() {
                 self.stopped = false;
@@ -1153,5 +1180,27 @@ mod poll_tests {
             cpu.poll_max, 0,
             "fetches must not be mistaken for operand reads"
         );
+    }
+}
+
+/// `JAGEMU_IRQ_DELAY=N` (fixed) or `=MIN-MAX` (68000 cycles); unset = off.
+fn irq_delay_from_env() -> (u32, u32) {
+    let Ok(v) = std::env::var("JAGEMU_IRQ_DELAY") else { return (0, 0) };
+    let num = |t: &str| t.trim().parse::<u32>().ok();
+    match v.split_once('-') {
+        Some((a, b)) => match (num(a), num(b)) {
+            (Some(a), Some(b)) if a <= b => (a, b),
+            _ => {
+                eprintln!("jagemu: ignoring JAGEMU_IRQ_DELAY={v} (expected N or MIN-MAX cycles)");
+                (0, 0)
+            }
+        },
+        None => match num(&v) {
+            Some(n) => (n, n),
+            None => {
+                eprintln!("jagemu: ignoring JAGEMU_IRQ_DELAY={v} (expected N or MIN-MAX cycles)");
+                (0, 0)
+            }
+        },
     }
 }
