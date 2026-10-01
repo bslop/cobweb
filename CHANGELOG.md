@@ -6,6 +6,15 @@ assigned at release.
 
 ## Unreleased
 
+### 2026-10-01 — jcc68k: calls through function-pointer variables
+
+- ☠ **Silent miscompile fixed: a call through a function-pointer VARIABLE
+  jumped into the variable.** `static fn g; g = add; g(&n, 5);` compiled to
+  `jsr g`, so the CPU executed the pointer's bytes as code; a static local
+  did the same. A call is now direct only when the callee is a function
+  (C11 6.5.2.2); every pointer - file-scope, static local, frame or register
+  local, array element - is loaded and called through `jsr (a0)`.
+
 ### 2026-09-30 — jcc loads/signed/divide, jcc68k asm labels, `jagemu --strict`, DRAM staleness window
 
 - **jcc can read memory.** `load`/`loadw`/`loadb(addr)` (32/16/8-bit,

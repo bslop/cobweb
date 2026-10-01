@@ -330,6 +330,34 @@ fn unsupported_extended_asm_is_a_hard_error() {
 }
 
 #[test]
+fn call_through_function_pointer_variable() {
+    // A call through a pointer VARIABLE compiled to `jsr <variable>`, so the
+    // CPU executed the pointer's bytes: silent, and fatal on hardware. Every
+    // storage class must call through the value; a function name stays direct.
+    let pre = "typedef void (*fn)(int *, int);\n\
+               static void add(int *p, int v) { *p += v; }\n\
+               static int n;\n";
+    for body in [
+        "static fn g;\nint main(void) { g = add; g(&n, 5); return n; }",
+        "fn gx;\nint main(void) { gx = add; gx(&n, 5); return n; }",
+        "int main(void) { static fn s; s = add; s(&n, 5); return n; }",
+        "int main(void) { fn l = add; l(&n, 5); return n; }",
+        "static fn t[2];\nint main(void) { t[1] = add; t[1](&n, 5); return n; }",
+        "static fn g;\nint main(void) { g = add; (*g)(&n, 5); return n; }",
+    ] {
+        let src = format!("{pre}{body}");
+        assert_eq!(run(&src), 5, "{body}");
+        let asm = crate::compile_program(&src).unwrap();
+        for v in ["g", "gx", "s", "t"] {
+            assert!(!asm.lines().any(|l| l.trim().starts_with(&format!("jsr {v}"))), "direct jsr to a variable:\n{asm}");
+        }
+    }
+    // a plain call to a function is still a direct jsr
+    let asm = crate::compile_program(&format!("{pre}int main(void) {{ add(&n, 5); return n; }}")).unwrap();
+    assert!(asm.lines().any(|l| l.trim().starts_with("jsr") && l.contains("add")), "{asm}");
+}
+
+#[test]
 fn named_label_inside_basic_asm() {
     // Every asm line went out indented, so `skip:` reached jas as an
     // instruction ("unknown 68000 instruction 'skip:'") and the branch to it

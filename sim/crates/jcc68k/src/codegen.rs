@@ -1364,10 +1364,13 @@ impl Gen {
             self.gen_expr(a)?;
             self.line("move.l d0,-(a7)");
         }
-        // Direct call to a named function, else indirect through D0. A register
-        // (or frame) local named here holds a function *pointer* — call indirect.
+        // Direct call only when the callee IS a function (C11 6.5.2.2: it is
+        // any expression of pointer-to-function type). A variable of pointer
+        // type - file-scope, static local, frame or register local - holds the
+        // address to call: `jsr g` on one ran the pointer's own bytes as code.
         if let ExprK::Var(name) = &callee.kind {
-            if !self.frame.contains_key(name) && !self.reg_of.contains_key(name) {
+            let is_function = matches!(&*callee.ty, TypeK::Func { .. });
+            if is_function && !self.frame.contains_key(name) && !self.reg_of.contains_key(name) {
                 self.line(&format!("jsr {}", mangle(name)));
                 if nbytes > 0 {
                     self.line(&format!("adda.l #{nbytes},a7"));
