@@ -3245,6 +3245,125 @@ fn bare_compile_errors_keep_bare_line_numbers() {
     assert!(err.starts_with("3:"), "got: {err}");
 }
 
+// ── issue 0009: branches on comparisons, loop-weighted register locals ───────
+
+#[test]
+fn conditions_branch_without_materializing_a_boolean() {
+    // `if (a < 0 || a >= 240)` should be two compare-and-branch pairs, with
+    // no 0/1 built in D0 first.
+    let asm = crate::compile_program(
+        "int g; void f(int a){ if (a < 0 || a >= 240) g = 1; }\
+         void h(unsigned a, int b){ while (!(a > 7u && b != 3)) { a++; b--; } g = a; }",
+    )
+    .expect("compile");
+    for scc in ["slt", "sge", "shi", "sne", "seq", "sgt", "scs", "scc", "sls", "sle"] {
+        assert!(!asm.contains(&format!("\t{scc} ")), "condition still materialized ({scc}):\n{asm}");
+    }
+}
+
+/// Run `body` once as written and once with every condition evaluated as a
+/// value first (`int t = (C); if (t)`), which takes the old code path. Both
+/// must agree, including the order and count of side effects.
+#[test]
+fn branching_conditions_match_their_values() {
+    let conds = [
+        "f(i) < 0 || f(i + 10) >= 12",
+        "!(f(i) > 1 && f(i) != 2)",
+        "(f(i) & 1) && (f(-i) < 2 || f(i * 3) == 6)",
+        "!(f(i) == 0) || !f(i + 1)",
+        "(unsigned)f(i) > 2u && (unsigned)f(i) <= 0x80000000u",
+        "u >= (unsigned)f(i) || u < 5u",
+        "f(i) <= -2 && !(f(i) >= -2)",
+    ];
+    for c in conds {
+        let prog = |test: &str| {
+            format!(
+                "int k; int f(int v){{ k = k * 3 + v; return v; }}\
+                 int main(){{ int r = 0, i, n = 0; unsigned u = 0xFFFFFFF0u;\
+                   for (i = -4; i <= 4; i++) {{ u += 3u;\
+                     {test}\
+                     n = 0; while ({c2}) {{ if (++n > 2) break; }} r = r * 5 + n; }}\
+                   return r ^ k; }}",
+                c2 = c
+            )
+            .replace("{test}", test)
+        };
+        let direct = prog(&format!("if ({c}) r = r * 2 + 1; else r = r * 2;"));
+        let valued = prog(&format!("{{ int t = ({c}); if (t != 0) r = r * 2 + 1; else r = r * 2; }}"));
+        assert_eq!(run(&direct), run(&valued), "condition `{c}` branches differently than it evaluates");
+    }
+}
+
+/// The same function with its locals in registers and with every local
+/// `volatile` (kept in the frame) must compute the same thing.
+fn same_with_volatile_locals(decls: &str, body: &str, args: &str) {
+    let src = |d: &str| format!("int out[4]; int fn(int x, int y, int z){{ {d} {body} }} int main(){{ return fn({args}); }}");
+    let regs = run(&src(decls));
+    let frame = run(&src(&format!("volatile {decls}")));
+    assert_eq!(regs, frame, "register and frame versions disagree");
+}
+
+#[test]
+fn many_hot_locals_compute_the_same_in_registers() {
+    // Twelve live ints in a two-deep loop nest: more than the data registers,
+    // so the extra ones go to d3/d2 and to address registers.
+    same_with_volatile_locals(
+        "int a, b, c, d, e, h, i, j, m, n, s, t;",
+        "a = x; b = y; c = z; d = 0; e = 1; h = 7; m = 0x55; n = 0; s = 0; t = -3;\
+         for (i = 0; i < 9; i++) {\
+           for (j = 0; j < 7; j++) {\
+             if (a + j < c || b - i >= h) { e = e << 1 | 1; continue; }\
+             s += (a & m) | (b ^ j); s -= t * j; d = (s / (j + 1)) % 1000;\
+             n++; t = -t; m = (m >> 1) ^ (e & 0xFF); h = h * 3 + d;\
+           }\
+           a = a + d - i; b = b - (n & 3);\
+         }\
+         return s ^ d ^ e ^ h ^ m ^ n ^ a ^ b ^ c;",
+        "5, 40, 9",
+    );
+}
+
+#[test]
+fn int_locals_in_address_registers_handle_every_operator() {
+    // Seven loop-hot ints: four take d7..d4, then d3/d2 and a2..a4 as the eval
+    // stacks allow. Every operator must still work on whichever kind of
+    // register its operands landed in (AND/OR cannot read an address register).
+    same_with_volatile_locals(
+        "int p, q, r, s, t, u, v, w, k;",
+        "p = x; q = y; r = z; s = 3; t = -5; u = 0; v = 1; w = 0;\
+         for (k = 0; k < 6; k++) {\
+           u = u + (p & q) - (r | s);  u ^= t;   v = v * (k + 2) / 3;\
+           w += (p << 2) + (q >> 1) - (r % 7) + (s * t);\
+           if (p > q || r <= s) p--; else q++;\
+           if (!(u < 0) && w != 0) s = s - t; t = -t;\
+           out[k & 3] = p + q; r = out[(k + 1) & 3] | r;\
+         }\
+         return u ^ v ^ w ^ p ^ q ^ r ^ s ^ t;",
+        "11, 6, -20",
+    );
+}
+
+#[test]
+fn loop_locals_win_registers_over_straight_line_ones() {
+    // `a`..`f` are mentioned often outside the loop; `i`, `acc`, `lim`, `step`,
+    // `bias` once or twice inside it. The loop's must be the ones in registers.
+    let asm = crate::compile_program(
+        "int g[8];\
+         int f(int a, int b, int c, int d, int e, int f){\
+           int i, acc, lim, step, bias;\
+           g[0]=a; g[1]=b; g[2]=c; g[3]=d; g[4]=e; g[5]=f;\
+           g[0]+=a; g[1]+=b; g[2]+=c; g[3]+=d; g[4]+=e; g[5]+=f;\
+           g[0]+=a; g[1]+=b; g[2]+=c; g[3]+=d; g[4]+=e; g[5]+=f;\
+           lim = a + b; step = c; bias = d; acc = 0;\
+           for (i = 0; i < lim; i += step) acc += i + bias;\
+           return acc; }",
+    )
+    .expect("compile");
+    let body = &asm[asm.find("f:").unwrap()..];
+    let loop_ = &body[body.find(".Ltop_").unwrap()..body.find(".Lend_").unwrap()];
+    assert!(!loop_.contains("(a6)") && !loop_.contains("(a7)"), "loop still reads the frame:\n{loop_}");
+}
+
 #[test]
 fn xor_assign_from_a_frame_variable_assembles() {
     // The copy-folding peephole turned `move.l -20(a6),d2 / eor.l d2,d0` into

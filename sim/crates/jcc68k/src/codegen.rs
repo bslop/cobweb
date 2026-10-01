@@ -45,8 +45,12 @@ pub struct Gen {
     /// while an inner one is evaluated). Values live in callee-saved d2–d7 (which
     /// survive calls and runtime helpers), spilling to the stack past depth 6.
     dtemp: usize,
+    /// The deepest [`dtemp`] reached in the current function body.
+    dtemp_max: usize,
     /// Same, for address temporaries — callee-saved a2–a5, spilling past depth 4.
     atemp: usize,
+    /// The deepest [`atemp`] reached in the current function body.
+    atemp_max: usize,
     /// Scalar locals promoted to a callee-saved data register for this function
     /// (name → register). Read/written directly; never spilled to a frame slot.
     reg_of: HashMap<String, String>,
@@ -161,7 +165,9 @@ pub fn generate(prog: &Program) -> Result<String, String> {
         break_labels: Vec::new(),
         cont_labels: Vec::new(),
         dtemp: 0,
+        dtemp_max: 0,
         atemp: 0,
+        atemp_max: 0,
         reg_of: HashMap::new(),
         dpool: Vec::new(),
         apool: Vec::new(),
@@ -469,6 +475,7 @@ impl Gen {
         let slot = self.dpool.get(self.dtemp).map(|r| r.to_string()).unwrap_or_else(|| "-(a7)".into());
         self.line(&format!("move.l d0,{slot}"));
         self.dtemp += 1;
+        self.dtemp_max = self.dtemp_max.max(self.dtemp);
         slot
     }
     /// Restore a value saved by [`push_dtemp`] into `dst` (usually `d1`).
@@ -485,6 +492,7 @@ impl Gen {
         let slot = self.apool.get(self.atemp).map(|r| r.to_string()).unwrap_or_else(|| "-(a7)".into());
         self.line(&format!("move.l a0,{slot}"));
         self.atemp += 1;
+        self.atemp_max = self.atemp_max.max(self.atemp);
         slot
     }
     /// Restore an address saved by [`push_atemp`] into `dst` (usually `a0`).
@@ -545,7 +553,7 @@ impl Gen {
         let mut refs = HashMap::new();
         let mut addr = std::collections::HashSet::new();
         for s in &f.body {
-            analyze_stmt(s, &mut refs, &mut addr);
+            analyze_stmt(s, 1, &mut refs, &mut addr);
         }
         // Volatile locals are excluded: every access must be a real memory
         // access (a volatile delay-loop counter promoted to a register would
@@ -573,9 +581,23 @@ impl Gen {
         // `move.l d6,d0 / move.l d0,a0 / move.l 8(a0),d0` — a pointer parked in
         // a data register has to be ferried into A0 before every single
         // dereference, which is most of what struct-walking code does.
-        const LOCAL_DREGS: &[&str] = &["d7", "d6", "d5", "d4"];
+        //
+        // d7..d4 always go to locals. d3 and d2 belong to the eval stack unless
+        // the body, once generated, shows it never needed them: then the next
+        // hottest locals take them and the body is generated again. A function
+        // with many live locals and simple expressions (a blitter's loop
+        // counters, offsets and clip bounds) kept six of them in the frame while
+        // d2/d3 sat idle (issue 0009).
+        const LOCAL_DREGS: &[&str] = &["d7", "d6", "d5", "d4", "d3", "d2"];
+        const BASE_DREGS: usize = 4;
+        // An extra register costs a save and a restore, so a local only takes
+        // one when it is referenced at least this often (loop-weighted).
+        const EXTRA_MIN_REFS: usize = 3;
         // A5 is deliberately left out: the eval stack needs at least one address
         // register for held lvalue addresses before it starts spilling to A7.
+        // Address registers the pointers leave free, and the address eval stack
+        // didn't need, take integer locals that missed a data register: they
+        // are read, compared and added there as cheaply (`cmp.l a3,d0`).
         const LOCAL_AREGS: &[&str] = &["a2", "a3", "a4"];
         // Registers an inline asm says it destroys are off the table entirely —
         // for locals and for the evaluation stack alike.
@@ -584,60 +606,10 @@ impl Gen {
             set.iter().copied().filter(|r| !banned.contains(*r)).collect()
         };
         let (local_aregs, local_dregs) = (usable(LOCAL_AREGS), usable(LOCAL_DREGS));
-        let mut claimed: Vec<&str> = Vec::new();
+        let mut n_dregs = usable(&LOCAL_DREGS[..BASE_DREGS]).len();
+        let mut n_aints = 0usize;
         let (ptrs, others): (Vec<_>, Vec<_>) =
             cand.iter().partition(|(_, t)| matches!(&***t, TypeK::Ptr(_)));
-        for ((n, _), r) in ptrs.iter().zip(&local_aregs) {
-            self.reg_of.insert(n.to_string(), r.to_string());
-            claimed.push(r);
-        }
-        for ((n, _), r) in others.iter().zip(&local_dregs) {
-            self.reg_of.insert(n.to_string(), r.to_string());
-            claimed.push(r);
-        }
-        self.dpool = usable(DTEMP_REGS).into_iter().filter(|r| !claimed.contains(r)).collect();
-        self.apool = usable(ATEMP_REGS).into_iter().filter(|r| !claimed.contains(r)).collect();
-
-        let param_names: std::collections::HashSet<&str> =
-            f.params.iter().map(|(n, _)| n.as_str()).collect();
-        let mut poff = 8i32;
-        for (pn, pt) in &f.params {
-            // A register param still receives its arg in the stack slot; we copy
-            // it to the register in the prologue below.
-            //
-            // Every argument occupies a full 32-bit slot, so a `char`/`short`
-            // parameter's value sits in the LOW end of its slot on this
-            // big-endian chip: at +3 for a byte, +2 for a word. Addressing the
-            // slot from its base and reading a word there returns the zero (or
-            // sign) padding instead of the argument. That was the joypad strobe
-            // bug — `strobe(0x81FE)` read sel == 0, so all four scan columns
-            // wrote the same value and the pad reported nothing pressed.
-            //
-            // Aggregates are exempt: `gen_call` pushes an aggregate argument's
-            // *address*, so those slots really are 4-byte pointers. Registered
-            // params are exempt by construction — `is_scalar4` only promotes
-            // 4-byte types, so the prologue's `move.l off(a6)` never sees an
-            // adjusted offset.
-            let sz = pt.size().max(1) as i32;
-            let scalar = !matches!(&**pt, TypeK::Array(..) | TypeK::Struct { .. } | TypeK::Func { .. });
-            let lo = if scalar && sz < 4 { 4 - sz } else { 0 };
-            self.frame.insert(pn.clone(), poff + lo);
-            self.types.insert(pn.clone(), pt.clone());
-            poff += 4; // args are pushed as longs
-        }
-        let mut noff = 0i32;
-        for loc in &f.locals {
-            self.types.insert(loc.name.clone(), loc.ty.clone());
-            if param_names.contains(loc.name.as_str()) || self.reg_of.contains_key(&loc.name) {
-                continue; // register locals need no frame slot
-            }
-            let sz = loc.ty.size().max(1) as i32;
-            let al = loc.ty.align().max(1) as i32;
-            noff += sz;
-            noff = (noff + al - 1) / al * al;
-            self.frame.insert(loc.name.clone(), -noff);
-        }
-        let frame_size = ((noff + 1) / 2) * 2; // word-align the frame
 
         let name = mangle(&f.name);
         self.ret_label = format!(".Lret_{}", self.l());
@@ -648,11 +620,93 @@ impl Gen {
         // actually used, and save/restore only the callee-saved registers the
         // body touches. A leaf like `blit_wait()` (a 3-instruction spin) gets
         // no prologue at all instead of a full link + movem of ten registers.
-        let outer = std::mem::take(&mut self.out);
-        for s in live_prefix(&f.body) {
-            self.gen_stmt(s)?;
-        }
-        let body = std::mem::replace(&mut self.out, outer);
+        let (frame_size, body) = loop {
+            self.frame.clear();
+            self.types.clear();
+            self.reg_of.clear();
+            let mut claimed: Vec<&str> = Vec::new();
+            for ((n, _), r) in ptrs.iter().zip(&local_aregs) {
+                self.reg_of.insert(n.to_string(), r.to_string());
+                claimed.push(r);
+            }
+            let free_aregs = &local_aregs[ptrs.len().min(local_aregs.len())..];
+            let regs = local_dregs[..n_dregs].iter().chain(&free_aregs[..n_aints]);
+            for ((n, _), r) in others.iter().zip(regs) {
+                self.reg_of.insert(n.to_string(), r.to_string());
+                claimed.push(r);
+            }
+            self.dpool = usable(DTEMP_REGS).into_iter().filter(|r| !claimed.contains(r)).collect();
+            self.apool = usable(ATEMP_REGS).into_iter().filter(|r| !claimed.contains(r)).collect();
+
+            let param_names: std::collections::HashSet<&str> =
+                f.params.iter().map(|(n, _)| n.as_str()).collect();
+            let mut poff = 8i32;
+            for (pn, pt) in &f.params {
+                // A register param still receives its arg in the stack slot; we copy
+                // it to the register in the prologue below.
+                //
+                // Every argument occupies a full 32-bit slot, so a `char`/`short`
+                // parameter's value sits in the LOW end of its slot on this
+                // big-endian chip: at +3 for a byte, +2 for a word. Addressing the
+                // slot from its base and reading a word there returns the zero (or
+                // sign) padding instead of the argument. That was the joypad strobe
+                // bug — `strobe(0x81FE)` read sel == 0, so all four scan columns
+                // wrote the same value and the pad reported nothing pressed.
+                //
+                // Aggregates are exempt: `gen_call` pushes an aggregate argument's
+                // *address*, so those slots really are 4-byte pointers. Registered
+                // params are exempt by construction — `is_scalar4` only promotes
+                // 4-byte types, so the prologue's `move.l off(a6)` never sees an
+                // adjusted offset.
+                let sz = pt.size().max(1) as i32;
+                let scalar = !matches!(&**pt, TypeK::Array(..) | TypeK::Struct { .. } | TypeK::Func { .. });
+                let lo = if scalar && sz < 4 { 4 - sz } else { 0 };
+                self.frame.insert(pn.clone(), poff + lo);
+                self.types.insert(pn.clone(), pt.clone());
+                poff += 4; // args are pushed as longs
+            }
+            let mut noff = 0i32;
+            for loc in &f.locals {
+                self.types.insert(loc.name.clone(), loc.ty.clone());
+                if param_names.contains(loc.name.as_str()) || self.reg_of.contains_key(&loc.name) {
+                    continue; // register locals need no frame slot
+                }
+                let sz = loc.ty.size().max(1) as i32;
+                let al = loc.ty.align().max(1) as i32;
+                noff += sz;
+                noff = (noff + al - 1) / al * al;
+                self.frame.insert(loc.name.clone(), -noff);
+            }
+            let frame_size = ((noff + 1) / 2) * 2; // word-align the frame
+
+            self.dtemp_max = 0;
+            self.atemp_max = 0;
+            let outer = std::mem::take(&mut self.out);
+            for s in live_prefix(&f.body) {
+                self.gen_stmt(s)?;
+            }
+            let body = std::mem::replace(&mut self.out, outer);
+
+            // Eval-stack registers the body never reached, and hot locals still
+            // in the frame: hand the first to the second and generate again.
+            // Promoting a local never deepens the eval stack (a register is as
+            // foldable an operand as a frame slot), so this only moves forward.
+            // Data registers first: the hotter locals get them.
+            let waiting = others
+                .iter()
+                .skip(n_dregs + n_aints)
+                .take_while(|(n, _)| refs[*n] >= EXTRA_MIN_REFS)
+                .count();
+            let spare_d = self.dpool.len().saturating_sub(self.dtemp_max).min(local_dregs.len() - n_dregs);
+            let spare_a = self.apool.len().saturating_sub(self.atemp_max).min(free_aregs.len() - n_aints);
+            let grow_d = spare_d.min(waiting);
+            let grow_a = spare_a.min(waiting - grow_d);
+            if grow_d + grow_a == 0 {
+                break (frame_size, body);
+            }
+            n_dregs += grow_d;
+            n_aints += grow_a;
+        };
 
         let used = used_callee_saved(&body);
         let need_frame = frame_size > 0 || body.contains("(a6)");
@@ -950,7 +1004,41 @@ impl Gen {
 
     /// Branch to `target` when the condition is false (jump_if_true=false) or
     /// true (jump_if_true=true).
+    ///
+    /// `&&`, `||` and `!` become control flow, and a comparison branches on the
+    /// flags its `cmp` set. Evaluating them as values first cost a 0/1 in D0, a
+    /// join, and a `tst` per condition: `if (a < 0 || a >= 240)` was eleven
+    /// instructions where four do (issue 0009).
     fn gen_cond_branch(&mut self, c: &Expr, target: &str, jump_if_true: bool) -> Result<(), String> {
+        match &c.kind {
+            ExprK::Unary(UnOp::LogNot, a) => return self.gen_cond_branch(a, target, !jump_if_true),
+            ExprK::Binary(op @ (BinOp::LogAnd | BinOp::LogOr), a, b) => {
+                // `a && b` jumps on false as soon as either is false, and on
+                // true only when both are; `||` is the mirror image.
+                let short = matches!(op, BinOp::LogOr);
+                if jump_if_true == short {
+                    self.gen_cond_branch(a, target, jump_if_true)?;
+                    self.gen_cond_branch(b, target, jump_if_true)?;
+                } else {
+                    let lskip = format!(".Lskip_{}", self.l());
+                    self.gen_cond_branch(a, &lskip, short)?;
+                    self.gen_cond_branch(b, target, jump_if_true)?;
+                    self.lbl(&lskip);
+                }
+                return Ok(());
+            }
+            ExprK::Binary(op, a, b) if cmp_scc(*op, false).is_some() => {
+                let unsigned = forces_unsigned(&a.ty) || forces_unsigned(&b.ty);
+                let (rhs, _) = self.gen_binary_operands(*op, a, b)?;
+                self.line(&format!("cmp.l {rhs},d0"));
+                let scc = cmp_scc(*op, unsigned).unwrap();
+                let &(_, on_true, on_false) = SCC_TO_BRANCH.iter().find(|(s, _, _)| *s == scc).unwrap();
+                let b = if jump_if_true { on_true } else { on_false };
+                self.line(&format!("{b}.w {target}"));
+                return Ok(());
+            }
+            _ => {}
+        }
         self.gen_expr(c)?; // D0 = condition value
         self.line("tst.l d0");
         if jump_if_true {
@@ -1178,25 +1266,9 @@ impl Gen {
                 // Fast path: a cheap rhs (a constant or a 4-byte scalar variable)
                 // folds straight into the instruction, sparing the temp register
                 // and the operand's load — `x + 5` → `add.l #5,d0`, not a push/pop.
-                if let Some((src, is_imm)) = self.foldable_rhs(*op, b) {
-                    self.gen_expr(a)?;
-                    self.fold_binop(*op, &a.ty, &b.ty, &src, is_imm);
-                } else {
-                    // General path: rhs held on the register eval stack.
-                    self.gen_expr(b)?;
-                    let slot = self.push_dtemp();
-                    self.gen_expr(a)?;
-                    // When the rhs is parked in a register it is already a legal
-                    // instruction source, so the binop reads it where it sits;
-                    // only a stack-spilled operand has to come back through D1.
-                    let rhs = if slot == "-(a7)" {
-                        self.pop_dtemp_to(&slot, "d1");
-                        "d1".to_string()
-                    } else {
-                        self.dtemp -= 1; // release the slot without a copy
-                        slot
-                    };
-                    self.gen_binop(*op, &a.ty, &b.ty, &rhs);
+                match self.gen_binary_operands(*op, a, b)? {
+                    (src, Some(is_imm)) => self.fold_binop(*op, &a.ty, &b.ty, &src, is_imm),
+                    (rhs, None) => self.gen_binop(*op, &a.ty, &b.ty, &rhs),
                 }
             }
             ExprK::Call(callee, args) => {
@@ -1204,6 +1276,40 @@ impl Gen {
             }
         }
         Ok(())
+    }
+
+    /// Evaluate `a` into D0 and return a source operand holding `b`, with
+    /// `Some(is_immediate)` when `b` folded straight into the instruction (a
+    /// constant or a variable), or `None` when it was evaluated onto the
+    /// register eval stack (the slot it was parked in, D1 if it spilled).
+    fn gen_binary_operands(&mut self, op: BinOp, a: &Expr, b: &Expr) -> Result<(String, Option<bool>), String> {
+        if let Some((src, is_imm)) = self.foldable_rhs(op, b) {
+            self.gen_expr(a)?;
+            // The 68000 rejects an address register as the source of AND/OR
+            // (an integer local can live in one): go through D1, which is
+            // free once `a` is in D0.
+            if is_areg(&src) && matches!(op, BinOp::And | BinOp::Or) {
+                self.line(&format!("move.l {src},d1"));
+                return Ok(("d1".into(), Some(false)));
+            }
+            return Ok((src, Some(is_imm)));
+        }
+        self.gen_expr(b)?;
+        let slot = self.push_dtemp();
+        self.gen_expr(a)?;
+        // When the rhs is parked in a register it is already a legal
+        // instruction source, so the binop reads it where it sits;
+        // only a stack-spilled operand has to come back through D1.
+        Ok((
+            if slot == "-(a7)" {
+                self.pop_dtemp_to(&slot, "d1");
+                "d1".to_string()
+            } else {
+                self.dtemp -= 1; // release the slot without a copy
+                slot
+            },
+            None,
+        ))
     }
 
     /// Store D0 into an lvalue (used by extended-asm output write-back).
@@ -1604,19 +1710,7 @@ impl Gen {
             }
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
                 self.line(&format!("cmp.l {rhs},d0")); // sets flags for D0 - D1
-                let cc = match (op, unsigned) {
-                    (BinOp::Eq, _) => "seq",
-                    (BinOp::Ne, _) => "sne",
-                    (BinOp::Lt, false) => "slt",
-                    (BinOp::Le, false) => "sle",
-                    (BinOp::Gt, false) => "sgt",
-                    (BinOp::Ge, false) => "sge",
-                    (BinOp::Lt, true) => "scs",
-                    (BinOp::Le, true) => "sls",
-                    (BinOp::Gt, true) => "shi",
-                    (BinOp::Ge, true) => "scc",
-                    _ => unreachable!(),
-                };
+                let cc = cmp_scc(op, unsigned).unwrap();
                 self.line(&format!("{cc} d0"));
                 self.line("and.l #1,d0");
             }
@@ -1632,11 +1726,9 @@ impl Gen {
             ExprK::Num(n) => Some((format!("#{}", *n as i32), true)),
             ExprK::Var(name) if self.reg_of.contains_key(name) => {
                 // A register-allocated local is itself a valid instruction
-                // source — except an address register, which the 68000 rejects
-                // as the source of AND/OR/EOR. Not worth encoding per-op: let
-                // those fall back to the generic path.
-                let r = self.reg_of[name].clone();
-                (!is_areg(&r)).then_some((r, false))
+                // source; for AND/OR an address register isn't, and
+                // `gen_binary_operands` copies it to D1 first.
+                Some((self.reg_of[name].clone(), false))
             }
             ExprK::Var(name) if is_scalar4(&e.ty) => {
                 let src = match self.frame.get(name).copied() {
@@ -1711,19 +1803,7 @@ impl Gen {
             BinOp::Shr => self.emit_shift(if unsigned { "lsr.l" } else { "asr.l" }, src),
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
                 self.line(&format!("cmp.l {src},d0"));
-                let cc = match (op, unsigned) {
-                    (BinOp::Eq, _) => "seq",
-                    (BinOp::Ne, _) => "sne",
-                    (BinOp::Lt, false) => "slt",
-                    (BinOp::Le, false) => "sle",
-                    (BinOp::Gt, false) => "sgt",
-                    (BinOp::Ge, false) => "sge",
-                    (BinOp::Lt, true) => "scs",
-                    (BinOp::Le, true) => "sls",
-                    (BinOp::Gt, true) => "shi",
-                    (BinOp::Ge, true) => "scc",
-                    _ => unreachable!(),
-                };
+                let cc = cmp_scc(op, unsigned).unwrap();
                 self.line(&format!("{cc} d0"));
                 self.line("and.l #1,d0");
             }
@@ -2483,6 +2563,24 @@ fn try_fold(lines: &[&str], i: usize) -> Option<String> {
 }
 
 /// `(scc, branch-if-condition-true, branch-if-condition-false)`.
+/// The `s<cc>` that sets a byte when comparison `op` holds after `cmp.l rhs,d0`,
+/// or `None` when `op` isn't a comparison.
+fn cmp_scc(op: BinOp, unsigned: bool) -> Option<&'static str> {
+    Some(match (op, unsigned) {
+        (BinOp::Eq, _) => "seq",
+        (BinOp::Ne, _) => "sne",
+        (BinOp::Lt, false) => "slt",
+        (BinOp::Le, false) => "sle",
+        (BinOp::Gt, false) => "sgt",
+        (BinOp::Ge, false) => "sge",
+        (BinOp::Lt, true) => "scs",
+        (BinOp::Le, true) => "sls",
+        (BinOp::Gt, true) => "shi",
+        (BinOp::Ge, true) => "scc",
+        _ => return None,
+    })
+}
+
 const SCC_TO_BRANCH: &[(&str, &str, &str)] = &[
     ("seq", "beq", "bne"),
     ("sne", "bne", "beq"),
@@ -2783,90 +2881,98 @@ fn is_scalar4(ty: &Type) -> bool {
 
 /// Walk an expression, counting variable references and recording which
 /// variables have their address taken (`&x`) — the latter can't live in a
-/// register.
-fn analyze_expr(e: &Expr, refs: &mut HashMap<String, usize>, addr: &mut std::collections::HashSet<String>) {
+/// register. Each reference counts `w`: [`LOOP_WEIGHT`] per enclosing loop.
+fn analyze_expr(e: &Expr, w: usize, refs: &mut HashMap<String, usize>, addr: &mut std::collections::HashSet<String>) {
     match &e.kind {
-        ExprK::Var(n) => *refs.entry(n.clone()).or_default() += 1,
+        ExprK::Var(n) => *refs.entry(n.clone()).or_default() += w,
         ExprK::Num(_) | ExprK::FloatLit(_) | ExprK::StrLit(_) => {}
         ExprK::Unary(UnOp::Addr, inner) => {
             if let ExprK::Var(n) = &inner.kind {
                 addr.insert(n.clone());
             }
-            analyze_expr(inner, refs, addr);
+            analyze_expr(inner, w, refs, addr);
         }
         ExprK::Unary(_, a) | ExprK::Cast(a) | ExprK::Member(a, _) | ExprK::PostIncDec(a, _) => {
-            analyze_expr(a, refs, addr)
+            analyze_expr(a, w, refs, addr)
         }
         ExprK::Binary(_, a, b) | ExprK::Assign(a, b) | ExprK::Comma(a, b) => {
-            analyze_expr(a, refs, addr);
-            analyze_expr(b, refs, addr);
+            analyze_expr(a, w, refs, addr);
+            analyze_expr(b, w, refs, addr);
         }
         ExprK::Cond(c, t, f) => {
-            analyze_expr(c, refs, addr);
-            analyze_expr(t, refs, addr);
-            analyze_expr(f, refs, addr);
+            analyze_expr(c, w, refs, addr);
+            analyze_expr(t, w, refs, addr);
+            analyze_expr(f, w, refs, addr);
         }
         ExprK::Call(callee, args) => {
-            analyze_expr(callee, refs, addr);
+            analyze_expr(callee, w, refs, addr);
             for a in args {
-                analyze_expr(a, refs, addr);
+                analyze_expr(a, w, refs, addr);
             }
         }
     }
 }
 
+/// How much more a reference inside a loop counts than one just outside it,
+/// when ranking locals for registers. A loop runs its body many times, so the
+/// innermost loop's counters and offsets win the registers, not whichever
+/// local is mentioned most often in straight-line code (issue 0009).
+const LOOP_WEIGHT: usize = 8;
+
 /// Walk a statement (and any nested statements/initializers) for the analysis.
-fn analyze_stmt(s: &Stmt, refs: &mut HashMap<String, usize>, addr: &mut std::collections::HashSet<String>) {
+fn analyze_stmt(s: &Stmt, w: usize, refs: &mut HashMap<String, usize>, addr: &mut std::collections::HashSet<String>) {
     let mut init = |i: &Init, refs: &mut _, addr: &mut _| {
-        fn walk(i: &Init, refs: &mut HashMap<String, usize>, addr: &mut std::collections::HashSet<String>) {
+        fn walk(i: &Init, w: usize, refs: &mut HashMap<String, usize>, addr: &mut std::collections::HashSet<String>) {
             match i {
-                Init::Scalar(e) => analyze_expr(e, refs, addr),
-                Init::List(items) => items.iter().for_each(|it| walk(it, refs, addr)),
+                Init::Scalar(e) => analyze_expr(e, w, refs, addr),
+                Init::List(items) => items.iter().for_each(|it| walk(it, w, refs, addr)),
             }
         }
-        walk(i, refs, addr);
+        walk(i, w, refs, addr);
     };
+    // Capped so deep nests can't overflow; four levels already decide it.
+    let inner = (w * LOOP_WEIGHT).min(LOOP_WEIGHT.pow(4));
     match s {
-        Stmt::Expr(e) | Stmt::Return(Some(e)) => analyze_expr(e, refs, addr),
+        Stmt::Expr(e) | Stmt::Return(Some(e)) => analyze_expr(e, w, refs, addr),
         Stmt::Return(None) | Stmt::Break | Stmt::Continue | Stmt::Goto(_)
         | Stmt::Case(_) | Stmt::Default(_) | Stmt::Null | Stmt::Asm(_) => {}
         Stmt::AsmExt { output, input, .. } => {
             if let Some((_, e)) = output {
-                analyze_expr(e, refs, addr);
+                analyze_expr(e, w, refs, addr);
             }
             if let Some(e) = input {
-                analyze_expr(e, refs, addr);
+                analyze_expr(e, w, refs, addr);
             }
         }
         Stmt::If(c, t, e) => {
-            analyze_expr(c, refs, addr);
-            analyze_stmt(t, refs, addr);
+            analyze_expr(c, w, refs, addr);
+            analyze_stmt(t, w, refs, addr);
             if let Some(e) = e {
-                analyze_stmt(e, refs, addr);
+                analyze_stmt(e, w, refs, addr);
             }
         }
         Stmt::While(c, b) | Stmt::DoWhile(b, c) => {
-            analyze_expr(c, refs, addr);
-            analyze_stmt(b, refs, addr);
+            analyze_expr(c, inner, refs, addr);
+            analyze_stmt(b, inner, refs, addr);
         }
         Stmt::For(i, c, st, b) => {
             if let Some(i) = i {
-                analyze_stmt(i, refs, addr);
+                analyze_stmt(i, w, refs, addr);
             }
             if let Some(c) = c {
-                analyze_expr(c, refs, addr);
+                analyze_expr(c, inner, refs, addr);
             }
             if let Some(st) = st {
-                analyze_expr(st, refs, addr);
+                analyze_expr(st, inner, refs, addr);
             }
-            analyze_stmt(b, refs, addr);
+            analyze_stmt(b, inner, refs, addr);
         }
-        Stmt::Block(ss) => ss.iter().for_each(|s| analyze_stmt(s, refs, addr)),
+        Stmt::Block(ss) => ss.iter().for_each(|s| analyze_stmt(s, w, refs, addr)),
         Stmt::Switch(e, b, _, _) => {
-            analyze_expr(e, refs, addr);
-            analyze_stmt(b, refs, addr);
+            analyze_expr(e, w, refs, addr);
+            analyze_stmt(b, w, refs, addr);
         }
-        Stmt::Label(_, b) => analyze_stmt(b, refs, addr),
+        Stmt::Label(_, b) => analyze_stmt(b, w, refs, addr),
         Stmt::Decl(_, _, Some(i)) => init(i, refs, addr),
         Stmt::Decl(_, _, None) => {}
     }
