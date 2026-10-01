@@ -348,6 +348,13 @@ restores it (and may stall the 68k as just described). *(Exact stall/timing of
 "no further instructions until GPU/Blitter completes" — model conservatively
 and validate; §10.)*
 
+*jsim (2026-09-30):* interrupt entry sets `Tom::int2_lowered`, any `INT2`
+write clears it. Under `--fidelity silicon` a lowered GPU gets no main-bus
+access at all and the Blitter does not drain, which matches the bench (a
+handler that never wrote `INT2` left GPU DRAM loads stalled indefinitely;
+platform issue 0008). The 68000-side stall after the `INT2` write is still
+not modelled.
+
 ### 4.6 The VI line and PIT (for completeness; detail in Tom/Jerry specs)
 
 - `VI` (`$F0004E`, WO, 11-bit): half-line on which the video interrupt fires.

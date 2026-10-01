@@ -6,6 +6,44 @@ assigned at release.
 
 ## Unreleased
 
+### 2026-10-01 — platform issues 0004/0006/0008: INT2 model, CPUINT, strict exemptions, `f().member`
+
+- **jcc68k: `f(...).member`** is accepted (C11 6.5.2.3), nested members and
+  arrays included; the member is read out of the returned struct's buffer
+  (issue 0006). Expression-level errors inside an included file now name
+  that file (`part.h:3:`), not just a line of the unit.
+- **INT2 bus-priority drop, modelled.** Taking a 68000 interrupt lowers the
+  GPU's and Blitter's bus priority until `INT2` is written (Tech Ref v8 p.17).
+  Under `--fidelity silicon` a lowered GPU waits before any main-bus access
+  and the Blitter stops draining, as on the bench, where a handler without the
+  `INT2` write left every GPU DRAM load stalled for good (issue 0008).
+  `gpu.timing.int2_starved` counts the ticks. Always on: an `rte` out of an
+  interrupt with `INT2` unwritten is counted (`int2` in the state JSON) and
+  reported; `--strict=int2` stops at it. A long write to `INT1` now also
+  performs the `INT2` write.
+- **GPU `CPUINT`** (G_CTRL bit 1) latches INT1 source 1 and interrupts the
+  68000 when enabled; it reads back 0. jsim ignored it, so the STOP-sync
+  wake-up never arrived.
+- **`--strict-exempt=[check:]pc=LO[-HI]` / `[check:]addr=LO[-HI]`**
+  (repeatable): a fault there is counted but does not stop the run, e.g. the
+  mailbox read-back of the GPU halt sequence (issue 0004).
+- **`JAGEMU_IRQ_DELAY=N` or `=MIN-MAX`** (68000 cycles) delays interrupt
+  delivery; a range spreads requests deterministically so a handler's `VC` at
+  entry varies between fields and wake-up races can be swept. Off by default;
+  not calibrated.
+- **Silicon fidelity: narrow local-RAM accesses behave as on silicon.** A
+  GPU/DSP `STOREB`/`STOREW` to its own local RAM is dropped and `LOADB`/`LOADW`
+  returns `$A5` poison. Other fidelities unchanged; every fidelity counts it.
+- **OP objects per line** are counted (`op.max_objects_per_line`,
+  `lines_over_object_budget`) with a warning past 40, the platform notes'
+  measured clean budget. Not modelled.
+- **Fix: the 68000 was billed for GPU/DSP DRAM cycles.** `m68k_dram_cycles`
+  was not cleared at the start of a 68000 step, so other masters' DRAM
+  cycles reached the 68000 through the OP tax. Under functional fidelity a GPU
+  looping on DRAM doubled the 68000's cost per instruction until it ran ~10
+  instructions a field; silicon fidelity over-charged it without the runaway.
+- Tests: 422 passed (baseline 392).
+
 ### 2026-10-01 — jcc68k: calls through function-pointer variables
 
 - ☠ **Silent miscompile fixed: a call through a function-pointer VARIABLE
