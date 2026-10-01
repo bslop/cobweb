@@ -3469,3 +3469,118 @@ fn multiplies_under_register_pressure_stay_exact() {
         "123457, -98761, 40503",
     );
 }
+
+// ── issue 0009 benchmark: 68000 cycles in jsim ───────────────────────────────
+
+/// Programs measured for platform issue 0009 (calib/results/2026-10-02-jcc68k-0009.md).
+const BENCH_0009: &[(&str, &str)] = &[
+    ("glyph", r#"
+unsigned short fb[320*240];
+unsigned char font[96*8];
+int clip_lo, clip_hi;
+void glyph(int x, int y, int ch, int w, int h, unsigned short fg, unsigned short bg)
+{
+    int row, col, sx, sy, dx, dy, src, dst, bits, mask, x0, x1, y0, y1, n;
+    x0 = clip_lo; x1 = clip_hi; y0 = 0; y1 = 240;
+    src = (ch - 32) * 8; n = 0;
+    for (row = 0; row < h; row++) {
+        sy = row; dy = y + row;
+        if (dy < y0 || dy >= y1) continue;
+        bits = font[src + sy];
+        mask = 128;
+        dst = dy * 320 + x;
+        for (col = 0; col < w; col++) {
+            dx = x + col;
+            if (dx < x0 || dx >= x1) { mask >>= 1; continue; }
+            fb[dst + col] = (bits & mask) ? fg : bg;
+            mask >>= 1;
+            n++;
+        }
+    }
+    clip_hi = clip_hi + (n & 0);
+}
+int main(void){ int i, c; for (i = 0; i < 96*8; i++) font[i] = i * 37;
+  clip_lo = 4; clip_hi = 300;
+  for (c = 0; c < 40; c++) glyph((c * 8) - 8, (c * 5) % 236 - 2, 32 + c, 8, 8, 0xFFFF, 0x0000);
+  return fb[320*10 + 20] + fb[320*100 + 150]; }
+"#),
+    ("sort", r#"
+int a[200];
+struct P { int x, y, z; } ps[64];
+int walk(struct P *p, int n){ int acc = 0, i; for (i = 0; i < n; i++) { if (p[i].x > p[i].y && p[i].z != 0) acc += p[i].x - p[i].z; else acc ^= p[i].y; } return acc; }
+int main(void){ int i, j, t, s = 0;
+  for (i = 0; i < 200; i++) a[i] = (i * 7919) & 1023;
+  for (i = 0; i < 200; i++) for (j = 0; j + 1 < 200 - i; j++) if (a[j] > a[j+1]) { t = a[j]; a[j] = a[j+1]; a[j+1] = t; }
+  for (i = 0; i < 64; i++) { ps[i].x = i * 3; ps[i].y = 100 - i; ps[i].z = i & 3; }
+  for (i = 0; i < 20; i++) s += walk(ps, 64);
+  return a[0] + a[199] + s; }
+"#),
+    ("mul", r#"
+short h[64]; int a[64];
+int main(void){ int i, k, s = 0; short p, q;
+  for (i = 0; i < 64; i++) { h[i] = i * 3 - 90; a[i] = i * 5; }
+  for (k = 0; k < 20; k++) for (i = 0; i < 64; i++) {
+     p = h[i]; q = h[63 - i];
+     s += 4 * a[i];                 /* item 1 */
+     s += (int)p * 320;             /* 16-bit cast times 16-bit constant */
+     s += a[i] * a[63 - i];         /* int * int, values fit 16 bits */
+     s += (int)p * (int)q;          /* casts from short */
+  }
+  return s; }
+"#),
+    ("mulgen", r#"
+int a[64], b[64];
+int main(void){ int i, k, s = 0;
+  for (i = 0; i < 64; i++) { a[i] = i * 1237 - 30000; b[i] = (i - 32) * 911; }
+  for (k = 0; k < 20; k++) for (i = 0; i < 64; i++) {
+     s += a[i] * b[i];          /* general, values beyond 16 bits */
+     s += a[i] * 1000;          /* constant that doesn't decompose */
+     s += (a[i] & 0xFFF) * b[i]; /* one operand 0..4095 */
+  }
+  return s; }
+"#),
+];
+
+/// Prints the 68000 cycles and result of each BENCH_0009 program. Compiled by
+/// this crate, or by the `jcc68k` binary named in `JCC68K` (to measure an
+/// older edition); startup and runtime are this crate's either way.
+///   cargo test --release -p jcc68k bench_issue_0009 -- --ignored --nocapture
+#[test]
+#[ignore]
+fn bench_issue_0009_cycles() {
+    for (name, src) in BENCH_0009 {
+        let user = match std::env::var("JCC68K") {
+            Ok(bin) => {
+                let dir = std::env::temp_dir().join(format!("jcc_bench_{}", std::process::id()));
+                std::fs::create_dir_all(&dir).unwrap();
+                let (c, s) = (dir.join(format!("{name}.c")), dir.join(format!("{name}.s")));
+                std::fs::write(&c, src).unwrap();
+                let st = std::process::Command::new(&bin).arg(&c).arg("-o").arg(&s).status().unwrap();
+                assert!(st.success(), "{bin} failed on {name}");
+                std::fs::read_to_string(&s).unwrap()
+            }
+            Err(_) => crate::compile(src).unwrap(),
+        };
+        let asm = format!("{}\n{}\n{}", crate::startup(), user, crate::runtime());
+        let org = 0x4000u32;
+        let res = jas::assemble(&asm, &jas::Options { org, start_m68k: true, ..Default::default() });
+        assert_eq!(res.errors(), 0, "{name}: {:#?}", res.diags);
+        let mut jag = Jaguar::new();
+        for (i, b) in res.bytes.iter().enumerate() {
+            jag.bus.write8(org + i as u32, *b);
+        }
+        jag.reset_to_ssp(org, jag_core::mem::DRAM_END);
+        // display off: the OP on a bare STOP list
+        jag.bus.write32(0x1000, 0);
+        jag.bus.write32(0x1004, 4);
+        jag.bus.write32(jag_core::mem::OLP, 0x1000 << 16);
+        jag.cpu.set_pc(res.symbols["_start"]);
+        let c0 = jag.cpu.cycles;
+        let mut prev = u32::MAX;
+        while jag.cpu.pc != prev {
+            prev = jag.cpu.pc;
+            jag.step_instruction();
+        }
+        println!("{name:8} {:>12} cycles  result {:#x}", jag.cpu.cycles - c0, jag.bus.read32(0x100));
+    }
+}
