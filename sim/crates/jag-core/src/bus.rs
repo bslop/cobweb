@@ -348,8 +348,11 @@ pub struct Bus {
     /// the RISCs bumping it between 68k steps is harmless — the scheduler runs
     /// each 68k instruction to completion before granting GPU/DSP budget.
     /// Basis for the HARDWARE-CALIBRATED external-bus charge (see m68k.rs
-    /// M68K_FETCH_WAIT_X10 / M68K_DATA_WAIT_X10).
+    /// M68K_FETCH_WAIT_X10 / M68K_READ_WAIT_X10 / M68K_WRITE_WAIT_X10).
     pub m68k_bus_cycles: u32,
+    /// Write subset of `m68k_bus_cycles`: silicon charges a 68000 write
+    /// about twice a read (see m68k.rs `M68K_WRITE_WAIT_X10`).
+    pub m68k_write_cycles: u32,
     /// DRAM-only subset of `m68k_bus_cycles` for the CURRENT 68000 instruction.
     /// The Object Processor's scan-out tax is levied per DRAM access and must
     /// NOT be charged for Tom/Jerry register cycles, which are not on the DRAM
@@ -473,6 +476,14 @@ pub struct Bus {
     /// exactly the poll-after-start pattern BLITTER.md §6 forbids. Nonzero
     /// means the program would misbehave on silicon while passing here.
     pub bcmd_poll_in_settle: std::sync::atomic::AtomicU64,
+    /// `B_CMD` status reads by the 68000. HARDWARE (platform timing bench,
+    /// jagq jobs 45-47): during a 68000-launched 320x200 fill, 4096 back-to-
+    /// back 68000 long reads of B_CMD showed BUSY 0 times in each of three
+    /// runs (the first read once did), and 4096 word reads of the low half
+    /// showed it 0 or 4096 times depending on the run. A 68000 poll is not a
+    /// reliable wait-for-idle on silicon; jsim answers it truthfully, so the
+    /// count is reported (see jagemu's diagnostics).
+    pub m68k_bcmd_reads: std::sync::atomic::AtomicU64,
 }
 
 /// Cap on retained watch hits — enough to see the pattern, bounded so a
@@ -554,6 +565,7 @@ impl Bus {
         Bus {
             m68k_on_bus: true,
             m68k_dram_cycles: 0,
+            m68k_write_cycles: 0,
             m68k_dram_read_addr: None,
             m68k_stray_write: None,
             m68k_in_fetch: false,
@@ -587,6 +599,7 @@ impl Bus {
             frame_mirror: 0,
             bcmd_busy_reads: std::sync::atomic::AtomicU64::new(0),
             bcmd_poll_in_settle: std::sync::atomic::AtomicU64::new(0),
+            m68k_bcmd_reads: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -702,6 +715,7 @@ impl Bus {
 
     pub fn write8(&mut self, addr: u32, v: u8) {
         self.m68k_bus_cycles += 1;
+        self.m68k_write_cycles += 1;
         self.access_count += 1;
         let a = addr & ADDR_MASK;
         // GPU SRAM $F03000-$F03FFF, DSP SRAM $F1B000-$F1CFFF: 32-bit only.
@@ -810,6 +824,7 @@ impl Bus {
         self.watch_note(a, 16, v as u32);
         if mem::is_dram(a) && a + 1 < mem::DRAM_END {
             self.m68k_bus_cycles += 1;
+            self.m68k_write_cycles += 1;
             self.m68k_dram_cycles += 1;
             self.m68k_dram_wrote = true;
             let i = a as usize;
@@ -818,6 +833,7 @@ impl Bus {
             self.dram[i + 1] = b[1];
         } else if mem::is_tom(a) {
             self.m68k_bus_cycles += 1;
+            self.m68k_write_cycles += 1;
             self.tom_write16(a, v);
         } else {
             self.watch_suppress += 1;
@@ -832,6 +848,12 @@ impl Bus {
         if a == mem::INT1 {
             // Reading INT1 returns which interrupt sources are *pending*.
             return self.tom.int1_pending;
+        }
+        if a & !3 == mem::B_CMD {
+            // A word read of B_CMD is half of the STATUS, like the long read
+            // (it returned the stored command word before).
+            let st = self.tom_read32(mem::B_CMD);
+            return if a & 2 == 0 { (st >> 16) as u16 } else { st as u16 };
         }
         self.tom.win.r16(a)
     }
@@ -893,6 +915,7 @@ impl Bus {
         self.watch_note(a, 32, v);
         if mem::is_dram(a) && a + 3 < mem::DRAM_END {
             self.m68k_bus_cycles += 2;
+            self.m68k_write_cycles += 2;
             self.m68k_dram_cycles += 2;
             self.m68k_dram_wrote = true;
             let i = a as usize;
@@ -900,6 +923,7 @@ impl Bus {
             self.dram[i..i + 4].copy_from_slice(&b);
         } else if mem::is_tom(a) {
             self.m68k_bus_cycles += 2;
+            self.m68k_write_cycles += 2;
             self.tom_write32(a, v);
         } else {
             self.watch_suppress += 1;
@@ -911,6 +935,9 @@ impl Bus {
 
     fn tom_read32(&self, a: u32) -> u32 {
         if a == mem::B_CMD {
+            if self.cur_master == Master::Cpu {
+                self.m68k_bcmd_reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             // Data-wise the blit completed at launch; TIME-wise it is still on
             // the bus until blit_busy drains. bit0 = idle.
             if self.tom.blit_busy > 0 {
@@ -952,7 +979,26 @@ impl Bus {
                 let (m, pc) = (self.cur_master, self.cur_master_pc);
                 self.cur_master = Master::Blitter;
                 self.cur_master_pc = 0;
+                // The blit runs synchronously inside the storing instruction,
+                // but its DRAM traffic is the Blitter's, not the 68000's: keep
+                // it out of the per-instruction 68000 bus counters. (Billing it
+                // charged a 68000 `move.l` to B_CMD the wait states of every
+                // pixel the blit wrote.)
+                let saved = (
+                    self.m68k_bus_cycles,
+                    self.m68k_write_cycles,
+                    self.m68k_dram_cycles,
+                    self.m68k_dram_read_addr,
+                    self.m68k_dram_wrote,
+                );
                 crate::tom::blit::run(self, v);
+                (
+                    self.m68k_bus_cycles,
+                    self.m68k_write_cycles,
+                    self.m68k_dram_cycles,
+                    self.m68k_dram_read_addr,
+                    self.m68k_dram_wrote,
+                ) = saved;
                 // `run` always assigns both fields on every path, so reading
                 // (not taking) them here is exact and leaves the RISC
                 // pipeline's own `mem::take` accounting untouched.

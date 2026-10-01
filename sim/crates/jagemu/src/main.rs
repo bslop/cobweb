@@ -490,6 +490,16 @@ fn report_hazard_diagnostics(jag: &Jaguar) {
             }
         }
     }
+    let m68k_polls = jag.bus.m68k_bcmd_reads.load(std::sync::atomic::Ordering::Relaxed);
+    if m68k_polls > 0 {
+        eprintln!(
+            "jagemu: NOTE — the 68000 read B_CMD {m68k_polls} time(s). On silicon a 68000 \
+             B_CMD read is not a reliable wait-for-idle: during a running 68000-launched \
+             blit, 4096 long reads showed BUSY 0 times in three bench runs (platform timing \
+             bench). jsim reports the true state. Synchronise blits from the GPU, or allow \
+             for a blit's worst-case time before reprogramming the Blitter from the 68000."
+        );
+    }
     let op = &jag.bus.tom.op;
     if op.lines_over_object_budget > 0 {
         eprintln!(

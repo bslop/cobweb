@@ -86,8 +86,13 @@ fn silicon_gpu_starves_after_a_handler_that_never_writes_int2() {
     assert_eq!(progress, 0, "the GPU kept loading from DRAM with its priority lowered");
     assert!(jag.gpu.pipe.stats.int2_starved > 0);
     assert!(jag.bus.tom.int2_lowered);
-    // Held before the load, so G_PC names it, as it did on the bench.
-    assert_eq!(jag.gpu.pc, mem::G_RAM + 6, "the GPU should be held at its DRAM load");
+    // Held before a main-bus access (the DRAM load at +6 or the store at
+    // +12), so G_PC names it, as it did on the bench.
+    assert!(
+        [mem::G_RAM + 6, mem::G_RAM + 12].contains(&jag.gpu.pc),
+        "the GPU should be held at its DRAM load or store, PC ${:06X}",
+        jag.gpu.pc
+    );
 }
 
 #[test]

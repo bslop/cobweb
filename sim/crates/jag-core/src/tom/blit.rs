@@ -50,6 +50,13 @@ const BLIT_LAUNCH_TICKS: u64 = 16;
 const BLIT_SETTLE_TICKS: u64 = 6;
 /// Ticks per DRAM phrase access ×10 (5.6), kept integer for exactness.
 const BLIT_ACCESS_TICKS_X10: u64 = 56;
+/// Ticks per destination phrase ×10 for a PHRASE-mode (XADDPHR) blit that
+/// only writes (no SRCEN, no DSTEN read): sequential page-mode writes.
+/// HARDWARE (platform timing bench, jagq jobs 46-47): 200 full-screen
+/// 320x240x16bpp fills (3.84 M phrases) took 19 fields with the OP on a bare
+/// STOP list, 2.19 ticks a phrase; the 5.6 above (a pixel-mode copy figure)
+/// made them take 50.
+const BLIT_PHRASE_WRITE_TICKS_X10: u64 = 22;
 
 /// Decode the 6-bit floating WIDTH field (4-bit exp, 2-bit mantissa + implied 1)
 /// into a pixel count: `((4 + mant) << exp) >> 2` (spec §2.2).
@@ -684,7 +691,19 @@ pub fn run(bus: &mut Bus, cmd: u32) {
     // 2026-07-20 always-charge, which the same probe showed over-priced
     // non-SRCEN RMW 2x — COBWEB_BUG_blitter_overcharged round 2.)
     let dst_reads = if dsten && srcen { dst_phrases } else { 0 };
-    let transfer = (dst_phrases + dst_reads + src_phrases) * BLIT_ACCESS_TICKS_X10 / 10;
+    let phrase_fill = gens[dst].xadd == 0 && !srcen && !dsten;
+    let mut transfer = if phrase_fill {
+        dst_phrases * BLIT_PHRASE_WRITE_TICKS_X10 / 10
+    } else {
+        (dst_phrases + dst_reads + src_phrases) * BLIT_ACCESS_TICKS_X10 / 10
+    };
+    // The Object Processor holds the bus while it fetches a line, and the
+    // Blitter ranks below it: the same proportional share as the 68000
+    // (crate::m68k::OP_TAX_PPM_PER_PHRASE). HARDWARE (jagq jobs 46-47, OP
+    // showing 80 phrases a line vs a bare STOP list): full-screen fills
+    // +16%, GPU-issued 5-pixel spans +17%.
+    let ppl = crate::m68k::op_fetch_phrases(bus);
+    transfer += transfer * ppl * crate::m68k::OP_TAX_PPM_PER_PHRASE / 1_000_000;
     {
         // Bucket by shape so a per-blit breakdown is available without a trace.
         let key = (

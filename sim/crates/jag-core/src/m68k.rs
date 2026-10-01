@@ -12,10 +12,20 @@
 use crate::bus::Bus;
 use crate::debug::Debugger;
 
-/// Extra 68k cycles per instruction-FETCH bus cycle, tenths (calibrated).
-const M68K_FETCH_WAIT_X10: u32 = 3;
-/// Extra 68k cycles per DATA bus cycle, tenths (calibrated).
-const M68K_DATA_WAIT_X10: u32 = 5;
+/// Extra 68000 cycles per bus cycle, tenths, by kind. HARDWARE (platform
+/// timing bench `bench/perf.s`, jagq jobs 45-47, NTSC Jaguar, GameDrive
+/// cart mode, code and data in DRAM, OP showing a bare STOP list): three
+/// mixes timed in VI fields, silicon vs this model at the old 0.3 / 0.5 -
+/// fetch-only DBRA loop 63 vs 53, a 16 x `move.l (a0)+` read stream 74 vs
+/// 38, a bytewise copy 113 vs 68. jsim was 1.19x / 1.95x / 1.66x too fast,
+/// in line with calib/NEXT_BENCH.md's own 1.23x / 1.44x / 1.60x. One data
+/// constant cannot fit both the read stream and the copy: writes cost about
+/// twice reads. Fit (exact on the three mixes): fetch 1.3, read 5.1, write
+/// 10.3. Check on a fourth mix not used in the fit (load/add/subq/bne loop):
+/// 85.8 fields predicted against 91 measured (was 62).
+const M68K_FETCH_WAIT_X10: u32 = 13;
+const M68K_READ_WAIT_X10: u32 = 51;
+const M68K_WRITE_WAIT_X10: u32 = 103;
 
 /// Longest run of same-address 68000 DRAM operand reads that real silicon
 /// survives. **[HW]**, jag_viewpoint 2026-08-18: with the poll count as the
@@ -42,33 +52,35 @@ const POLL_MISS_TOLERANCE: u32 = 16;
 
 /// ── OBJECT-PROCESSOR TAX ON THE 68000 ───────────────────────────────────────
 ///
-/// The two constants above are a CONSTANT wait per bus cycle. The RISC cores
-/// pay that same kind of constant *plus* a LOAD-DEPENDENT charge that scales
-/// with how much the Object Processor is fetching this line
-/// (`Pipe::charge_op_tax`, `risc/timing.rs`). The 68000 had no load-dependent
-/// term at all, so a 68k DRAM loop cost the same whether the OP was scanning a
-/// full-width bitmap or drawing nothing.
-///
-/// That is the wrong way round for this machine: the 68000 is the LOWEST
-/// priority bus master (refresh > OP > Blitter > GPU > DSP > 68k), so it is the
-/// master that should lose the most when the OP is busy. The symptom is a
-/// hardware/simulator divergence with a very specific shape — a 68k poll loop
-/// that always makes progress in simulation and stalls out on silicon while the
-/// OP is scanning — and no counter in the model could see it, because the model
-/// had no term for it.
-///
-/// ⭐ THE COEFFICIENT IS DERIVED, NOT FITTED. The RISC tax is a hardware
-/// calibration of the same physical bus occupancy: `OP_TAX_MILLI_NUM/DEN` =
-/// 5.75 milli-ticks per phrase per access, in RISC ticks. The scheduler runs the
-/// RISCs at exactly 2x the 68000 clock (`risc_ticks = cpu_cycles * 2`), so the
-/// identical occupancy expressed in 68000 cycles is half of it: 2.875
-/// milli-cycles per phrase per access. No new constant is being invented, and
-/// nothing here was tuned to make a particular program behave.
-///
-/// Charged on DRAM cycles ONLY (`bus.m68k_dram_cycles`) — Tom and Jerry register
-/// accesses are not on the DRAM bus and the OP does not contend for them.
-const M68K_OP_TAX_MILLI_NUM: u64 = 2875;
-const M68K_OP_TAX_MILLI_DEN: u64 = 1000;
+/// The 68000 is the lowest-priority bus master, so while the Object Processor
+/// fetches a line it waits. HARDWARE (platform timing bench, jagq job 47):
+/// with a 320x240 16bpp bitmap on screen (80 phrases a line) every 68000 mix
+/// ran 16-18% longer than with a bare STOP list - the fetch-only DBRA loop as
+/// much as the DRAM read stream (73/63, 87/74, 131/113, 106/91 fields) - so
+/// the tax is proportional to the 68000's TIME, not to its DRAM accesses.
+/// (The earlier per-DRAM-access term, derived from the RISC tax, gave +3-5%.)
+/// The Blitter measured the same (+16% fills, +17% spans; tom/blit.rs).
+/// Coefficient: 0.165 / 80 phrases = 2.06 thousandths of the time per phrase
+/// a line, charged on the instruction's whole cost, in millionths.
+pub const OP_TAX_PPM_PER_PHRASE: u64 = 2060;
+
+/// Phrases the Object Processor fetches a line, for the bus-share taxes:
+/// zero while video is off (VMODE VIDEN clear: the OP is not scanning, and an
+/// unprogrammed OLP must not tax anything through objects decoded from
+/// garbage), capped at 360 (a full 720-pixel 16bpp line buffer, twice).
+pub fn op_fetch_phrases(bus: &Bus) -> u64 {
+    if bus.tom.win.r16(crate::mem::VMODE) & 1 == 0 {
+        return 0;
+    }
+    (bus.tom.op.phrases_per_line as u64).min(360)
+}
+
+/// Extra cost, tenths of the instruction's own, of a 68000 instruction that
+/// needs the bus while a blit is in flight (see `step`). Fitted on one
+/// workload (jagq job 47, 68000 loop + GPU spans: 139 fields on silicon):
+/// x2.2 gave 120, x3.0 gives 128; the cap at the blit's remaining time is
+/// what keeps back-to-back fills right (23 vs 21-22), and limits the rest.
+const BLIT_CONTENTION_X10: u64 = 20;
 
 // Condition-code register bits (in the low byte of SR).
 const FLAG_C: u16 = 1 << 0;
@@ -157,10 +169,12 @@ pub struct M68k {
     fetch_ba: u32,
     /// Sub-cycle remainder of the external-bus wait charge (tenths).
     bus_debt: u32,
-    /// Fractional Object-Processor tax owed, in milli-cycles (see
-    /// `M68K_OP_TAX_MILLI_NUM`). Carried between instructions so a charge
-    /// smaller than one cycle per access still accumulates instead of vanishing.
+    /// Fractional Object-Processor tax owed, in millionths of a cycle (see
+    /// `OP_TAX_PPM_PER_PHRASE`). Carried between instructions so a charge
+    /// smaller than one cycle still accumulates instead of vanishing.
     op_tax_debt: u64,
+    /// 68000 cycles spent waiting for a blit in flight (see `step`).
+    pub blit_wait_cycles: u64,
     /// The (PC, address) pair the 68000 is currently re-reading, and how many
     /// times that same instruction has read that same address. See
     /// `M68K_DRAM_POLL_BUDGET`.
@@ -246,6 +260,7 @@ impl M68k {
             sr: 0x2700,
             pending_level: 0,
             irq_delay: irq_delay_from_env(),
+            blit_wait_cycles: 0,
             irq_wait: 0,
             irq_seq: 0,
             stopped: false,
@@ -402,6 +417,7 @@ impl M68k {
     /// 68000 apart from a spinning one.
     pub fn step(&mut self, bus: &mut Bus, dbg: &mut Debugger) -> u32 {
         bus.m68k_bus_cycles = 0;
+        bus.m68k_write_cycles = 0;
         // Cleared here like `m68k_bus_cycles`: the bus counts every master's
         // DRAM cycles, and the GPU/DSP run between two 68000 steps. Left
         // standing, a GPU looping on DRAM was billed to the 68000's next
@@ -484,32 +500,50 @@ impl M68k {
         }
 
         let total = std::mem::take(&mut bus.m68k_bus_cycles);
-        let dram = std::mem::take(&mut bus.m68k_dram_cycles);
+        let writes = std::mem::take(&mut bus.m68k_write_cycles);
+        let _dram = std::mem::take(&mut bus.m68k_dram_cycles);
         let fetch = self.fetch_ba.min(total);
         let data = total - fetch;
-        self.bus_debt += fetch * M68K_FETCH_WAIT_X10 + data * M68K_DATA_WAIT_X10;
+        let writes = writes.min(data);
+        let reads = data - writes;
+        self.bus_debt += fetch * M68K_FETCH_WAIT_X10
+            + reads * M68K_READ_WAIT_X10
+            + writes * M68K_WRITE_WAIT_X10;
         let extra = self.bus_debt / 10;
         self.bus_debt -= extra * 10;
 
-        // Object-Processor tax: the OP holds DRAM while it scans, and the 68000
-        // is the lowest-priority master, so it waits. Accumulated in
-        // milli-cycles so a sub-cycle-per-access charge is not rounded away —
-        // the same debt trick `charge_op_tax` uses on the RISC side.
-        let phrases = bus.tom.op.phrases_per_line as u64;
+        // Object-Processor tax: a fixed share of the 68000's time per phrase
+        // the OP fetches a line (see OP_TAX_PPM_PER_PHRASE). Accumulated in
+        // millionths so it is not rounded away on short instructions.
+        let phrases = op_fetch_phrases(bus);
         let mut op_extra: u32 = 0;
-        if phrases > 0 && dram > 0 {
-            self.op_tax_debt +=
-                dram as u64 * phrases * M68K_OP_TAX_MILLI_NUM / M68K_OP_TAX_MILLI_DEN;
-            let whole = self.op_tax_debt / 1000;
+        if phrases > 0 {
+            self.op_tax_debt += (c0 + extra) as u64 * phrases * OP_TAX_PPM_PER_PHRASE;
+            let whole = self.op_tax_debt / 1_000_000;
             if whole > 0 {
-                self.op_tax_debt -= whole * 1000;
+                self.op_tax_debt -= whole * 1_000_000;
                 self.op_tax_cycles += whole;
                 op_extra = whole as u32;
             }
         }
 
-        self.cycles += (extra + op_extra) as u64;
-        let c = c0 + extra + op_extra;
+        // A blit in flight takes most of the bus: the Blitter outranks the
+        // 68000, so an instruction that needs the bus while a blit runs costs
+        // BLIT_CONTENTION_X10 / 10 more, never more than the blit has left.
+        // HARDWARE (platform timing bench, jagq jobs 45-47): a 68000 load/add
+        // loop took 106 fields alone and 139 while the GPU issued 5-pixel
+        // spans (this model: 128). An
+        // independent report (platform issue 0008) saw 2-3x as well. Not a
+        // full block: during back-to-back full-screen fills the 68000 still
+        // serviced every vertical interrupt on silicon.
+        let mut blit_wait = 0u32;
+        if total > 0 && bus.tom.blit_busy > 0 {
+            let want = (c0 + extra + op_extra) as u64 * BLIT_CONTENTION_X10 / 10;
+            blit_wait = want.min(bus.tom.blit_busy.div_ceil(2)) as u32;
+            self.blit_wait_cycles += blit_wait as u64;
+        }
+        self.cycles += (extra + op_extra + blit_wait) as u64;
+        let c = c0 + extra + op_extra + blit_wait;
         self.irq_wait = self.irq_wait.saturating_sub(c);
 
         if dbg.prof.is_some() {
