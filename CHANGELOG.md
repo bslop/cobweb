@@ -6,6 +6,20 @@ assigned at release.
 
 ## Unreleased
 
+### 2026-10-02 — jsim: unscaled bitmap objects need 16-byte alignment
+
+Platform issue 0010, measured on the bench (job 55,
+`calib/results/2026-10-01-op-bitmap-alignment.md`).
+
+- An unscaled BITMAP object at 8 mod 16 displays garbage on silicon on every
+  field its list is shown; the list start itself needs only 8, and 16 mod 32 is
+  fine. jsim drew it perfectly. Now `--fidelity silicon` draws nothing from
+  that object on (as for a misaligned SCALED object), every fidelity counts it
+  and jagemu warns with its address, and **`--strict=op-align`** (part of bare
+  `--strict`) stops at it: `strict_fault` = `op_bitmap_misaligned`, master
+  `op`, `addr` the object.
+- Tests: 443 passed.
+
 ### 2026-10-02 — jcc68k: inline multiplies, branches on comparisons, more locals in registers
 
 Platform issue 0009, items 2 and 3. Measured in jsim (68000 cycles, whole

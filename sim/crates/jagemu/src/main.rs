@@ -113,11 +113,12 @@ fn usage() {
          \x20      [--gpu-map g.map] [--dsp-map d.map] [--start S] [--top K] [--bucket N]\n\
          \x20      [--prof-json p.json]      # full per-PC profile; diff two with profdiff.py\n\
          \x20 jagemu run <rom> --watchdog N   # warn if a core runs N frames without clearing GO\n\
-         \x20 --strict[=narrow,dram-stale,roundtrip,div0,int2]   (any command that boots a ROM)\n\
+         \x20 --strict[=narrow,dram-stale,roundtrip,div0,int2,op-align]   (any command that boots a ROM)\n\
          \x20                   stop at the first silicon fault jsim would run through:\n\
          \x20                   narrow GPU/DSP local-RAM access, JAGEMU_DRAM_STALE hit,\n\
          \x20                   store->load DRAM round trip, DIV by zero, a 68000 rte\n\
-         \x20                   out of an interrupt that never wrote INT2. Bare = all.\n\
+         \x20                   out of an interrupt that never wrote INT2, an unscaled\n\
+         \x20                   OP bitmap object at 8 mod 16. Bare = all.\n\
          \x20                   The JSON's \"strict_fault\" names it (PC, address); exit 3\n\
          \x20 --strict-exempt=[check:]pc=LO[-HI] | [check:]addr=LO[-HI]   (repeatable)\n\
          \x20                   count but do not stop on a known-safe site (hex numbers),\n\
@@ -511,6 +512,18 @@ fn report_hazard_diagnostics(jag: &Jaguar) {
              objects by Y.",
             op.max_objects_per_line, op.max_objects_vc, op.lines_over_object_budget,
             jag_core::tom::OP_OBJECTS_PER_LINE_BUDGET
+        );
+    }
+    if op.bitmap_misaligned_hits > 0 {
+        eprintln!(
+            "jagemu: WARNING — the Object Processor reached an unscaled BITMAP object at 8 mod \
+             16 ({} line walk(s); first ${:06X}, last ${:06X}). On silicon such a list shows \
+             garbage, horizontal noise rows and wrong colours, on every field it is displayed \
+             (platform bench job 55, issue 0010). jsim draws it unless --fidelity silicon, \
+             which draws nothing from that object on. Put each bitmap object on a 16-byte \
+             boundary; the list start itself needs only 8. --strict=op-align stops at it. \
+             The first address can be boot residue; the last is usually your list.",
+            op.bitmap_misaligned_hits, op.bitmap_misaligned_addr, op.bitmap_misaligned_last
         );
     }
     if jag.bus.tom.rte_without_int2 > 0 {

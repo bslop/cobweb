@@ -49,6 +49,10 @@ pub struct Strict {
     /// silicon leaves the GPU and Blitter at lowered bus priority, and a GPU
     /// that loads from DRAM then never finishes (platform issue 0008).
     pub int2: bool,
+    /// An unscaled BITMAP object the OP reaches at 8 mod 16: silicon displays
+    /// garbage on every field that list is shown (platform issue 0010, bench
+    /// job 55). The list itself needs only phrase alignment.
+    pub op_align: bool,
     /// Faults that are counted but do not stop the run (`--strict-exempt`):
     /// a known-safe site, such as the mailbox read-back of a GPU halt.
     pub exempt: [Option<StrictExempt>; Strict::MAX_EXEMPT],
@@ -73,9 +77,10 @@ impl Strict {
         roundtrip: true,
         div0: true,
         int2: true,
+        op_align: true,
         exempt: [None; Strict::MAX_EXEMPT],
     };
-    pub const NAMES: &'static str = "narrow,dram-stale,roundtrip,div0,int2";
+    pub const NAMES: &'static str = "narrow,dram-stale,roundtrip,div0,int2,op-align";
     pub const MAX_EXEMPT: usize = 16;
 
     /// Parse a comma-separated list of `NAMES` (or `all`). Exemptions already
@@ -90,6 +95,7 @@ impl Strict {
                 "roundtrip" => s.roundtrip = true,
                 "div0" => s.div0 = true,
                 "int2" => s.int2 = true,
+                "op-align" => s.op_align = true,
                 other => return Err(format!("unknown strict check `{other}` (expected {})", Strict::NAMES)),
             }
         }
@@ -104,6 +110,7 @@ impl Strict {
             "roundtrip" => &["store_load_roundtrip"],
             "div0" => &["div_by_zero"],
             "int2" => &["rte_without_int2"],
+            "op-align" => &["op_bitmap_misaligned"],
             _ => return None,
         })
     }

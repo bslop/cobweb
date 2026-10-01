@@ -713,6 +713,14 @@ impl Bus {
         }
     }
 
+    /// Latch the first strict fault raised by the Object Processor (no PC: the
+    /// address names the object), unless an `--strict-exempt` entry covers it.
+    pub fn strict_trip_op(&mut self, kind: &'static str, addr: u32) {
+        if self.strict_fault.is_none() && !self.strict.exempts(kind, 0, addr) {
+            self.strict_fault = Some(crate::debug::StrictFault { kind, master: "op", pc: 0, addr });
+        }
+    }
+
     pub fn write8(&mut self, addr: u32, v: u8) {
         self.m68k_bus_cycles += 1;
         self.m68k_write_cycles += 1;

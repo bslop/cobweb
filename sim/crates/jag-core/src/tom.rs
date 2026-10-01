@@ -207,8 +207,14 @@ pub struct OpState {
     /// Counted per line-walk that reaches it; first offending address kept.
     pub scaled_misaligned_hits: u64,
     pub scaled_misaligned_addr: u32,
-    /// Plain BITMAP objects need 16 (double-phrase): an 8-mod-16 object drew
-    /// on alternate fields only (jag_quake, 2026-08-13). Counted per walk, not modelled.
+    /// Plain BITMAP objects need 16 (double-phrase). HARDWARE (platform bench
+    /// job 55, `bench/olist.s`, platform issue 0010): a list whose bitmap
+    /// object sits at 8 mod 16 displays garbage on every field it is shown,
+    /// whatever the list's own alignment; 16 mod 32 is fine, and so is a list
+    /// that starts 8 off with its bitmap aligned. With two alternating lists
+    /// only one of which is off, that is garbage on alternate fields (one
+    /// project, 2026-08-13). Counted per walk; under silicon fidelity nothing
+    /// from the object on is drawn that line; `--strict=op-align` stops.
     pub bitmap_misaligned_hits: u64,
     /// ...and WHERE, first offender kept, exactly as the scaled counter does.
     /// Without it the count answers "how often" and never "which object", which
@@ -789,6 +795,16 @@ fn op_walk_line(
                     }
                     bus.tom.op.bitmap_misaligned_last = addr8;
                     bus.tom.op.bitmap_misaligned_hits += 1;
+                    if bus.strict.op_align {
+                        bus.strict_trip_op("op_bitmap_misaligned", addr8);
+                    }
+                    // Silicon shows garbage (horizontal noise rows, wrong
+                    // colours) that depends on whatever the misaligned fetch
+                    // reads; jsim can't reproduce it, so show the failure
+                    // instead: nothing from this object on, as for SCALED.
+                    if gpu.fidelity == crate::risc::timing::Fidelity::Silicon {
+                        break;
+                    }
                 }
                 // Draw from the object's CURRENT DATA pointer and write the
                 // header back, exactly as the OP does: DATA advances one DWIDTH
@@ -1008,8 +1024,15 @@ fn decode_pixel(px: u16, fmt: PixFmt) -> (u8, u8, u8) {
 /// state and return the composited frame. Production capture reads the
 /// accumulated `bus.tom.fb` directly (the scheduler drives `op_render_line`).
 pub fn compose_frame(bus: &mut Bus) -> Framebuffer {
+    compose_frame_at(bus, crate::risc::timing::Fidelity::Functional)
+}
+
+/// [`compose_frame`] under a given fidelity (the OP models some silicon
+/// faults only under `Fidelity::Silicon`).
+pub fn compose_frame_at(bus: &mut Bus, fidelity: crate::risc::timing::Fidelity) -> Framebuffer {
     let mut cpu = M68k::new();
     let mut gpu = Risc::new(crate::risc::RiscKind::Gpu);
+    gpu.fidelity = fidelity;
     bus.tom.op.started = false;
     let mut hl = 0u16;
     while hl < 524 {
@@ -1223,6 +1246,44 @@ mod tests {
         );
         assert!(bad.tom.op.scaled_misaligned_hits > 0, "the fault must be counted");
         assert_eq!(bad.tom.op.scaled_misaligned_addr, 0x1010);
+    }
+
+    /// HARDWARE (bench job 55, platform issue 0010): an unscaled BITMAP object
+    /// at 8 mod 16 is garbage on silicon; one at 16 mod 32 is fine. jsim drew
+    /// both. Silicon fidelity now draws nothing from it; every fidelity counts
+    /// it; `--strict=op-align` latches a fault naming the object.
+    #[test]
+    fn op_bitmap_object_needs_16_byte_alignment() {
+        use crate::risc::timing::Fidelity;
+        let (fb, w, h) = (0x10_0000u32, 320u32, 240u32);
+        let center = ((120 * 320 + 160) * 4) as usize;
+        let red = [255u8, 0, 0, 255];
+        let draw = |ol: u32, fid: Fidelity, strict: bool| {
+            let mut bus = Bus::new();
+            bus.strict.op_align = strict;
+            for i in 0..(w * h) {
+                bus.write16(fb + i * 2, 0xF800);
+            }
+            setup_a3d_style(&mut bus, fb, ol, w, h, 16, 16);
+            let f = compose_frame_at(&mut bus, fid);
+            (f.rgba.get(center..center + 4).map(|p| p == red).unwrap_or(false), bus)
+        };
+        // 16 mod 32: draws under every fidelity, nothing counted.
+        let (drawn, bus) = draw(0x1010, Fidelity::Silicon, true);
+        assert!(drawn, "a 16-mod-32 bitmap object draws on silicon");
+        assert_eq!(bus.tom.op.bitmap_misaligned_hits, 0);
+        assert!(bus.strict_fault.is_none());
+        // 8 mod 16: functional still draws (and counts); silicon does not.
+        let (drawn, bus) = draw(0x1008, Fidelity::Functional, false);
+        assert!(drawn, "functional fidelity keeps drawing it");
+        assert!(bus.tom.op.bitmap_misaligned_hits > 0);
+        assert_eq!(bus.tom.op.bitmap_misaligned_last, 0x1008);
+        let (drawn, _) = draw(0x1008, Fidelity::Silicon, false);
+        assert!(!drawn, "an 8-mod-16 bitmap object must NOT draw under silicon fidelity");
+        // strict: the fault names the object.
+        let (_, bus) = draw(0x1008, Fidelity::Functional, true);
+        let f = bus.strict_fault.as_ref().expect("op-align must trip");
+        assert_eq!((f.kind, f.master, f.addr), ("op_bitmap_misaligned", "op", 0x1008));
     }
 
     #[test]
