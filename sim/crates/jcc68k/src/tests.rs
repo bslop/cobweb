@@ -1101,9 +1101,9 @@ fn constant_on_the_left_of_multiply_is_reduced() {
     )
     .expect("compile");
     assert!(!asm.contains("jsr __mulsi3"), "C * x still calls the helper:\n{asm}");
-    // A constant the decomposition rejects still goes to the helper.
+    // A constant the decomposition rejects is two inline MULUs (issue 0009 #2).
     let asm = crate::compile_program("int f(int x){ return 12345 * x; }").expect("compile");
-    assert!(asm.contains("jsr __mulsi3"), "12345 * x lost its helper call:\n{asm}");
+    assert!(!asm.contains("jsr __mulsi3") && asm.contains("mulu.w #12345,d0"), "12345 * x:\n{asm}");
 }
 
 #[test]
@@ -3380,4 +3380,92 @@ fn xor_assign_from_a_frame_variable_assembles() {
         v = v * (k + 2) / 3;
     }
     assert_eq!(run(src) as i32, u ^ v);
+}
+
+// ── issue 0009 item 2: inline 32-bit multiplies ──────────────────────────────
+
+const MUL_VALUES: &[i32] = &[
+    0, 1, -1, 2, 3, 0x7F, 0xFF, 0x7FFF, 0x8000, 0xFFFF, 0x10000, 0x10001, -0x8000, -0x8001,
+    -0x10000, 12345678, -98765, 0x7FFF_FFFF, i32::MIN, 0x1234_5678, 0xDEAD_BEEFu32 as i32,
+];
+
+/// Run `expr` (over `int x, y`, read from volatile globals so no range is
+/// known) for every pair of MUL_VALUES; `want` gives the expected value.
+fn check_products(expr: &str, want: impl Fn(i32, i32) -> i32) {
+    let n = MUL_VALUES.len();
+    let vals = MUL_VALUES.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",");
+    let mut expect = Vec::new();
+    for &x in MUL_VALUES {
+        for &y in MUL_VALUES {
+            expect.push(want(x, y).to_string());
+        }
+    }
+    let src = format!(
+        "volatile int vx, vy; int v[{n}] = {{{vals}}}; int e[{nn}] = {{{exp}}};\
+         int f(void){{ int x = vx, y = vy; return {expr}; }}\
+         int main(void){{ int i, j; for (i = 0; i < {n}; i++) for (j = 0; j < {n}; j++) {{\
+           vx = v[i]; vy = v[j]; if (f() != e[i * {n} + j]) return i * {n} + j + 1; }} return 0; }}",
+        nn = n * n,
+        exp = expect.join(","),
+    );
+    let bad = run(&src) as usize;
+    if bad != 0 {
+        let (i, j) = ((bad - 1) / n, (bad - 1) % n);
+        let (x, y) = (MUL_VALUES[i], MUL_VALUES[j]);
+        panic!("`{expr}` wrong for x={x:#x}, y={y:#x}: want {:#x}", want(x, y));
+    }
+}
+
+#[test]
+fn inline_multiply_general_is_exact() {
+    check_products("x * y", |x, y| x.wrapping_mul(y));
+    check_products("(unsigned)x * (unsigned)y", |x, y| (x as u32).wrapping_mul(y as u32) as i32);
+}
+
+#[test]
+fn inline_multiply_with_a_16_bit_operand_is_exact() {
+    check_products("x * (y & 0xFFFF)", |x, y| x.wrapping_mul(y & 0xFFFF));
+    check_products("(x & 0xFFFF) * y", |x, y| (x & 0xFFFF).wrapping_mul(y));
+    check_products("(x & 0x3FF) * (y + 0)", |x, y| (x & 0x3FF).wrapping_mul(y));
+    check_products("((unsigned)x >> 16) * y", |x, y| (((x as u32) >> 16) as i32).wrapping_mul(y));
+    check_products("(x >> 20) * (y >> 20)", |x, y| (x >> 20).wrapping_mul(y >> 20));
+    check_products("(x >> 24) * y", |x, y| (x >> 24).wrapping_mul(y));
+}
+
+#[test]
+fn inline_multiply_by_constants_is_exact() {
+    for k in [0i32, 1, 3, 7, 11, 100, 1000, 12345, 0xFFFF, 0x10000, 0x10001, 100000, -3, -1000, -0x10000] {
+        check_products(&format!("x * {k} + y * 0"), move |x, _| x.wrapping_mul(k));
+        check_products(&format!("{k} * y"), move |_, y| y.wrapping_mul(k));
+    }
+}
+
+#[test]
+fn general_multiplies_do_not_call_the_helper() {
+    let asm = crate::compile_program(
+        "int f(int x, int y){ return x * y; } int g(int x){ return x * 1000; }\
+         int h(int x, int y){ return (x & 0xFF) * y; } int k(int x){ return (x & 0xFF) * (x >> 24); }",
+    )
+    .expect("compile");
+    assert!(!asm.contains("jsr __mulsi3"), "a multiply still calls the helper:\n{asm}");
+    // (x & 0xFF) * (x >> 24): both fit 16 bits signed, one MULS.
+    let k = &asm[asm.find("\nk:").unwrap()..];
+    assert!(k[..k.find("rts").unwrap()].contains("muls.w"), "k should be one muls.w:\n{k}");
+}
+
+#[test]
+fn multiplies_under_register_pressure_stay_exact() {
+    // Deep products with every local live: the inline multiply's third register
+    // may be unavailable, and then it must fall back to the helper correctly.
+    same_with_volatile_locals(
+        "int a, b, c, d, e, g, i, s;",
+        "a = x; b = y; c = z; d = x - y; e = y * 7 + 1; g = z ^ 0x5A5A; s = 0;\
+         for (i = 0; i < 5; i++) {\
+           s += a * (b * (c * (d * (e * (g * (i + 1))))));\
+           s ^= (a * b) * (c * d) + (e * g) * (s * i);\
+           a += s * 3; b -= i * c; c = c * d + 1;\
+         }\
+         return s ^ a ^ b ^ c;",
+        "123457, -98761, 40503",
+    );
 }

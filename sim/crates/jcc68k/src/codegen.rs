@@ -1251,6 +1251,29 @@ impl Gen {
                     self.line(&format!("{ins} {rhs},d0"));
                 }
             }
+            ExprK::Binary(BinOp::Mul, a, b)
+                if !a.ty.is_fixed()
+                    && !b.ty.is_fixed()
+                    && !matches!(a.kind, ExprK::Num(_))
+                    && !matches!(b.kind, ExprK::Num(_))
+                    && (is_u16(a) || is_u16(b)) =>
+            {
+                // One operand provably 0..65535 (`(x & 0xFF) * y`, an unsigned
+                // short times an int): its high half is zero, so two MULUs do.
+                let (rhs, _) = self.gen_binary_operands(BinOp::Mul, a, b)?;
+                if !is_u16(b) {
+                    // the narrow one is in D0: move it to D1, the wide one to D0
+                    self.line("move.l d0,a1");
+                    self.line(&format!("move.l {rhs},d0"));
+                    self.line("move.l a1,d1");
+                    self.mul_by_u16("d1");
+                } else if is_machine_reg(&rhs) && rhs.starts_with('d') {
+                    self.mul_by_u16(&rhs);
+                } else {
+                    self.line(&format!("move.l {rhs},d1"));
+                    self.mul_by_u16("d1");
+                }
+            }
             ExprK::Binary(op, a, b) => {
                 // `C * x` as `x * C`: the constant must be on the right to fold
                 // into shifts, and a constant has no side effects to reorder.
@@ -1658,6 +1681,59 @@ impl Gen {
     /// a drop-in like OpenLara's divmod68k.S would otherwise read stack
     /// garbage as operands and miscompile silently (the gpu.c/jerry.c
     /// black-screen boot from the adoption report, round 2).
+    /// D0 = D0 * `rhs`, low 32 bits, inline: the 68000 has only a 16x16
+    /// multiply, so `a * b` is `al*bl + ((ah*bl + al*bh) << 16)`, three MULUs.
+    /// A `__mulsi3` call cost about 240 cycles in a game's profile, mostly
+    /// stack traffic and the call (issue 0009). It needs a third data
+    /// register: a callee-saved one the eval stack isn't holding a value in
+    /// (the prologue saves it). Without one, the helper is called as before.
+    /// Clobbers D1 and A0, which a libgcc `__mulsi3` may clobber too.
+    fn mul_inline(&mut self, rhs: &str) {
+        let Some(t) = self.dpool.get(self.dtemp..).and_then(|free| free.iter().find(|r| **r != rhs)).copied()
+        else {
+            self.call_runtime_rhs(rhs, "__mulsi3");
+            return;
+        };
+        if rhs != "d1" {
+            self.line(&format!("move.l {rhs},d1"));
+        }
+        for l in [
+            format!("move.l d1,{t}"),  // b
+            format!("swap {t}"),       // bh
+            format!("mulu.w d0,{t}"),  // bh*al
+            "move.l d0,a0".into(),     // a
+            "swap d0".into(),          // ah
+            "mulu.w d1,d0".into(),     // ah*bl
+            format!("add.w {t},d0"),   // low word of the cross products
+            "swap d0".into(),
+            "clr.w d0".into(),         // << 16
+            format!("move.l a0,{t}"),  // a
+            format!("mulu.w d1,{t}"),  // al*bl
+            format!("add.l {t},d0"),
+        ] {
+            self.line(&l);
+        }
+    }
+
+    /// D0 = D0 * `src` where `src` is known to be 0..=65535 (its high half is
+    /// zero): `al*s + ((ah*s) << 16)`, two MULUs. `src` is an immediate or a
+    /// data register other than D0. Clobbers A0 and A1.
+    fn mul_by_u16(&mut self, src: &str) {
+        for l in [
+            "move.l d0,a0".to_string(),
+            "swap d0".into(),
+            format!("mulu.w {src},d0"), // ah*s
+            "swap d0".into(),
+            "clr.w d0".into(),          // << 16
+            "move.l d0,a1".into(),
+            "move.l a0,d0".into(),
+            format!("mulu.w {src},d0"), // al*s
+            "add.l a1,d0".into(),
+        ] {
+            self.line(&l);
+        }
+    }
+
     fn call_runtime_rhs(&mut self, rhs: &str, name: &str) {
         self.line(&format!("move.l {rhs},-(a7)"));
         self.line("move.l d0,-(a7)");
@@ -1689,7 +1765,7 @@ impl Gen {
                 if lt.is_fixed() || rt.is_fixed() {
                     self.call_runtime_rhs(rhs, "__mulfix");
                 } else {
-                    self.call_runtime_rhs(rhs, "__mulsi3");
+                    self.mul_inline(rhs);
                 }
             }
             BinOp::Div => {
@@ -1815,6 +1891,10 @@ impl Gen {
                 if !lt.is_fixed() && !rt.is_fixed() {
                     if let Some(n) = parse_imm(src, _is_imm) {
                         if self.fold_pow2(op, lt, rt, n) {
+                            return;
+                        }
+                        if matches!(op, BinOp::Mul) && (0..=0xFFFF).contains(&n) {
+                            self.mul_by_u16(src);
                             return;
                         }
                     }
@@ -2296,7 +2376,8 @@ fn dead_after(lines: &[&str], from: usize, r: &str) -> bool {
             }
             None => {
                 if !ops.is_empty() && mentions(ops, r) {
-                    return base == "clr" && ops.trim() == r;
+                    // `clr.w`/`clr.b` keep the rest of the register.
+                    return base == "clr" && ops.trim() == r && m.ends_with(".l");
                 }
             }
         }
@@ -3063,6 +3144,11 @@ fn is_pow2_const(e: &Expr) -> bool {
 /// of each operand SIGN-extended and `mulu.w` ZERO-extended, and the 32-bit
 /// result is exact, so this is only chosen when the full 32-bit operand value
 /// equals that extension of its low word.
+/// Whether `e`'s value is provably 0..=65535 (a zero high half).
+fn is_u16(e: &Expr) -> bool {
+    matches!(value_range(e, true), Some((lo, hi)) if lo >= 0 && hi <= 0xFFFF)
+}
+
 fn narrow_mul(a: &Expr, b: &Expr) -> Option<&'static str> {
     let (ra, rb) = (value_range(a, true)?, value_range(b, true)?);
     let s16 = |r: (i64, i64)| r.0 >= -32768 && r.1 <= 32767;
@@ -3139,10 +3225,19 @@ fn value_range(e: &Expr, direct: bool) -> Option<(i64, i64)> {
             Some((*c.iter().min().unwrap(), *c.iter().max().unwrap()))
         }
         ExprK::Binary(BinOp::Shr, x, y) => match &y.kind {
-            ExprK::Num(s) if (0..32).contains(s) => {
-                let a = value_range(x, false)?;
-                if a.0 >= 0 { Some((a.0 >> s, a.1 >> s)) } else { None }
-            }
+            ExprK::Num(s) if (0..32).contains(s) => match value_range(x, false) {
+                Some(a) if a.0 >= 0 => Some((a.0 >> s, a.1 >> s)),
+                Some(_) => None,
+                // An unknown 32-bit value shifted right still narrows: `x >> 24`
+                // is -128..127 (asr) or 0..255 (lsr).
+                None if x.ty.size() == 4 && x.ty.is_integer() && !forces_unsigned(&x.ty)
+                    && !forces_unsigned(&y.ty) =>
+                {
+                    Some(((i32::MIN as i64) >> s, (i32::MAX as i64) >> s))
+                }
+                None if x.ty.size() == 4 && x.ty.is_integer() => Some((0, (u32::MAX as i64) >> s)),
+                None => None,
+            },
             _ => None,
         },
         ExprK::Unary(UnOp::Neg, x) => {
