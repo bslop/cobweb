@@ -6,6 +6,35 @@ assigned at release.
 
 ## Unreleased
 
+### 2026-10-02 — jcc68k: inline multiplies, branches on comparisons, more locals in registers
+
+Platform issue 0009, items 2 and 3. Measured in jsim (68000 cycles, whole
+program, identical results) against edition 2026-10-02: a glyph blitter with
+15 locals -30%, a general multiply loop -32%, a 16-bit multiply loop -9%, a
+bubble sort with a struct walk -12%.
+
+- **Multiplies are inline.** `a * b` on ints is three `mulu.w` instead of a
+  `__mulsi3` call (about 240 cycles); with one operand provably 0..65535 (a
+  constant that doesn't reduce to shifts, `(x & 0xFFF) * y`) it is two. It
+  borrows a callee-saved data register the eval stack isn't using and falls
+  back to the helper without one. Compiled code still calls only
+  libgcc-named helpers. A general multiply site grows from 12 to 24 bytes.
+- `x >> s` on an unknown 32-bit int now has a known range, so
+  `(x & 0xFF) * (x >> 24)` is one `muls.w`.
+- **Conditions branch directly.** `&&`, `||` and `!` in `if`/`while`/`for`/
+  `do`/`?:` are control flow, and a comparison branches on its `cmp` flags:
+  `if (a < 0 || a >= 240)` is two `cmp`/`b<cc>` pairs, not a 0/1 in D0.
+- **Locals in registers, loop-weighted.** A reference counts 8x per enclosing
+  loop when locals are ranked. d3/d2, and the a2..a4 pointers leave free, now
+  take further hot ints when the generated body shows the eval stacks didn't
+  need them (the body is generated again). Ints in address registers are
+  read, compared and added in place; `and`/`or` go through D1.
+- Fix: the copy-folding peephole could fold a load into EOR
+  (`eor.l -20(a6),d0`, which has no such form), so `x ^= y` with `y` in the
+  frame failed to assemble in some functions.
+- Fix: `dead_after` treated `clr.w`/`clr.b` as overwriting a whole register.
+- Tests: 442 passed (baseline 431).
+
 ### 2026-10-01 — jcc68k: a constant on the left of `*` is strength-reduced
 
 - `C * x` is generated as `x * C`, so it takes the shift/add path `x * C`
