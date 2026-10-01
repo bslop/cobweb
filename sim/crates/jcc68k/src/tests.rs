@@ -1092,6 +1092,33 @@ fn multiply_by_constant_strength_reduction_is_exact() {
 }
 
 #[test]
+fn constant_on_the_left_of_multiply_is_reduced() {
+    // `C * x` must take the same shift path as `x * C` (issue 0009): the
+    // constant used to reach the helper as the left operand.
+    let asm = crate::compile_program(
+        "int f(int x){ return 4 * x; } int g(int x){ return 320 * x; }\
+         int h(int x){ return 2 * (x & 1); }",
+    )
+    .expect("compile");
+    assert!(!asm.contains("jsr __mulsi3"), "C * x still calls the helper:\n{asm}");
+    // A constant the decomposition rejects still goes to the helper.
+    let asm = crate::compile_program("int f(int x){ return 12345 * x; }").expect("compile");
+    assert!(asm.contains("jsr __mulsi3"), "12345 * x lost its helper call:\n{asm}");
+}
+
+#[test]
+fn constant_on_the_left_of_multiply_is_exact() {
+    let vals: &[i64] = &[0, 1, 3, -3, 1234, -1234, 32767, -32768, 65535];
+    for &n in &[2i64, 4, 5, 7, 12, 16, 256, 320, 1024, 12345] {
+        for &x in vals {
+            let src = format!("int main(){{ int x = {x}; return {n} * x; }}");
+            let want = (x as i32).wrapping_mul(n as i32);
+            assert_eq!(run(&src) as i32, want, "wrong product for {n} * {x}");
+        }
+    }
+}
+
+#[test]
 fn struct_array_index_walk() {
     // `p[i].field` on a 12-byte struct is the case that made index scaling a
     // __mulsi3 call; the values must survive the strength reduction.

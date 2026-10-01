@@ -6,6 +6,13 @@ assigned at release.
 
 ## Unreleased
 
+### 2026-10-01 — jcc68k: a constant on the left of `*` is strength-reduced
+
+- `C * x` is generated as `x * C`, so it takes the shift/add path `x * C`
+  already had: `4 * x` was a `__mulsi3` call (about 240 cycles), now one
+  `asl.l` (issue 0009, item 1). Constants the decomposition rejects still
+  call the helper.
+
 ### 2026-10-01 — measured on silicon: Blitter lanes, OP window, 68000/Blitter timing
 
 Every item below comes from the platform's silicon bench (jagq jobs 39-47); the

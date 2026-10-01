@@ -1164,6 +1164,17 @@ impl Gen {
                 }
             }
             ExprK::Binary(op, a, b) => {
+                // `C * x` as `x * C`: the constant must be on the right to fold
+                // into shifts, and a constant has no side effects to reorder.
+                // `4 * x` called `__mulsi3` while `x * 4` was one `asl` (issue 0009).
+                let (a, b) = if matches!(op, BinOp::Mul)
+                    && matches!(a.kind, ExprK::Num(_))
+                    && !matches!(b.kind, ExprK::Num(_))
+                {
+                    (b, a)
+                } else {
+                    (a, b)
+                };
                 // Fast path: a cheap rhs (a constant or a 4-byte scalar variable)
                 // folds straight into the instruction, sparing the temp register
                 // and the operand's load — `x + 5` → `add.l #5,d0`, not a push/pop.
