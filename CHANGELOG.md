@@ -6,6 +6,15 @@ assigned at release.
 
 ## Unreleased
 
+### 2026-10-02 — jsim: a GPU/DSP DRAM burst streams one access per 5 ticks
+
+Measured on the bench (job 140, `calib/results/2026-10-02-gpu-dram-spacing.md`).
+
+- Back-to-back GPU loads or stores to DRAM ran at ~2.4 ticks an access in jsim,
+  ~4.9 on silicon, so load streams and stores were ~35% fast with the display
+  off. Two DRAM accesses by one core now start at least 5 ticks apart.
+- Remaining: 2-access bursts 12-21% fast, a lone store 19% slow.
+
 ### 2026-10-02 — jsim: the GPU and DSP slow under any display, by the same share
 
 Measured on the bench (job 138, `calib/results/2026-10-02-op-share-gpu.md`).

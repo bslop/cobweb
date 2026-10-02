@@ -1029,6 +1029,11 @@ impl Risc {
                 let stretch = crate::m68k::op_stretch_ppm(bus);
                 let wait = if stretch > 0 { self.pipe.charge_op_stretch(gap, stretch) } else { 0 };
                 self.pipe.note_ext_wait(wait);
+                if c == MemClass::Dram {
+                    // stretches spacing without raising issue density: keep
+                    // it out of the next access's density-regime gap
+                    self.pipe.note_dram_stretch(wait as u64);
+                }
                 occ += wait;
             }
             cost += occ;

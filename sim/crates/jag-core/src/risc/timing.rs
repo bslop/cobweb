@@ -120,6 +120,9 @@ const DRAM_ROW_SHIFT: u32 = 11; // 2 KB pages
 /// page hit / miss. HARDWARE: lddram B pair = 4.1 (occupancy ~1), ldstride
 /// B pair = 5.1 (~2), stdram identical — stores pay it too.
 const DRAM_OCC_HIT: u32 = 1;
+/// Fewest ticks between the starts of two DRAM accesses by one RISC core
+/// (platform bench job 140; see `ext_access`).
+const DRAM_MIN_SPACING: u64 = 5;
 const DRAM_OCC_MISS: u32 = 2;
 /// Additional result latency of a CONSUMED external DRAM load beyond
 /// LOAD_INTERNAL. HARDWARE (session 2, lddramc B): consumed load-to-use is
@@ -645,6 +648,19 @@ impl Pipeline {
                 occ += 4; // streaming under 68k pressure (lddram A−B = 4.3)
                 self.stats.contention += 4;
                 extra += 4;
+            }
+            // MINIMUM SPACING — HARDWARE (platform bench job 140, display off,
+            // ticks per loop iteration; N back-to-back loads, or stores, from
+            // one address): silicon L1 10.6 / L2 21.0 / L4 29.3 / L8 46.1 (S8
+            // 44.4) — a burst streams at one access per ~4.9 ticks, while this
+            // model let back-to-back accesses through at ~2.4 (L8 26.6). An
+            // access closer than DRAM_MIN_SPACING to the previous one waits
+            // out the difference. The lddram stream (gap ~4, "pays nothing")
+            // is consistent: it sits at the limit already.
+            if gap < DRAM_MIN_SPACING {
+                let wait = (DRAM_MIN_SPACING - gap) as u32;
+                occ += wait;
+                extra += wait as u64;
             }
             self.last_dram_cycle = now;
             self.last_dram_extra = extra;
