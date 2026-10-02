@@ -26,20 +26,18 @@ bitmap in the cart takes about 90% of the bus: everything else runs 8-10 times s
 GPU reads from the cart cost about 35 ticks a loop against about 23 from DRAM, with the
 display off.
 
-**Model (this series):** `m68k::op_share_ppm` = DRAM phrases x 1770 + cart phrases x
-11200 millionths, capped at 0.96. The 68000 and the Blitter take time x 1/(1 - share).
-The GPU/DSP keep their per-access DRAM tax, and each external access waits a further
-21.5 (DRAM) or 28.5 (other external) ticks x share/(1 - share) of the cartridge share.
-jsim afterwards (same ROM, `--fidelity silicon`):
+**Model:** see `2026-10-02-op-share-gpu.md`, which refits the share with a per-pixel term
+and replaces the RISC taxes. jsim afterwards (same ROM, `--fidelity silicon`):
 
 | Display | 68K | GD | GC | 68C |
 |---|---:|---:|---:|---:|
 | off | 43 | 83 | 10 | 43 |
-| 16bpp in DRAM | 51 | 84 | 10 | 51 |
-| 16bpp in the cart | 442 | 756 | 98 | 442 |
-| 8bpp in DRAM | 47 | 84 | 10 | 47 |
-| 8bpp in the cart | 79 | 143 | 18 | 79 |
+| 16bpp in DRAM | 51 | 97 | 11 | 51 |
+| 16bpp in the cart | 417 | 789 | 82 | 417 |
+| 8bpp in DRAM | 49 | 92 | 11 | 49 |
+| 8bpp in the cart | 83 | 158 | 18 | 83 |
 
-Before this series, the cart rows equalled the DRAM rows. The remaining gaps: the GPU's
-DRAM-display tax is still per access (silicon GD +16% with a DRAM bitmap, jsim +1%), and
-68000 cart reads run ~10% fast in jsim.
+Before, the cart rows equalled the DRAM rows. Cart cells are now within ~15% of silicon:
+the GPU's ratio under cart contention is a little lower on silicon than the 68000's,
+and one shared share coefficient can't capture both. The remaining gaps are the GPU's
+base access rate (see the other log) and 68000 cart reads ~15% fast.

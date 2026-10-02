@@ -142,20 +142,13 @@ const EXT_FETCH_MISS: u32 = 7;
 /// Instruction fetch: ~+7/word (mains A 13.46 vs B 6.24 cyc/instr).
 const CONTENTION_HIT_EXTRA: u32 = 4;
 const CONTENTION_FETCH_EXTRA: u32 = 7;
-/// Object Processor scan-out tax, in **milli-ticks per external DRAM access per
-/// OP phrase-per-line**. The OP re-reads the display list's bitmaps every
-/// visible line and outranks the GPU, so its traffic is a continuous background
-/// load the RISCs arbitrate against.
-///
-/// HARDWARE-CALIBRATED (Skunkboard 2026-07-19, probe `lddramop`, mode B):
-/// Tom's DRAM load stream ran 655 ticks with the OP parked on a STOP object and
-/// 728 ticks with a full-screen 320x240 16bpp bitmap (80 phrases/line) — +11.1%,
-/// i.e. **+0.46 cycles per external access at 80 phrases/line** → 5.75
-/// milli-ticks per phrase. (The DSP, given the same treatment, moved Tom by
-/// 0.0%: the GPU outranks Jerry, so Jerry is *not* a contention source. See
-/// COBWEB_GAP_tom_jerry_contention.)
-const OP_TAX_MILLI_NUM: u64 = 575; // 5.75 milli-ticks per phrase, per access
-const OP_TAX_MILLI_DEN: u64 = 100;
+// The Object Processor's scan-out tax on the RISCs used to be a fixed
+// 5.75 milli-ticks per DRAM access per OP phrase (Skunkboard 2026-07-19,
+// probe `lddramop`: a load stream +11.1% under a 16bpp 320x240 bitmap). The
+// platform bench (jobs 135, 138, 2026-10-02) measured +16-19% for consumed
+// loads, load streams and stores alike, x8.9 with the bitmap in the cartridge,
+// and none for compute: the share model in crate::m68k::op_share_ppm, charged
+// per access in risc.rs (`ext_gap` / `charge_op_stretch`).
 /// Non-DRAM external data (cross-chip registers, cart): consumed-read cost
 /// ~15-16 cycles. HARDWARE: derived from the null-probe overhead delta (a
 /// consumed GPU read of Tom's VC); other cross-chip paths may differ. CAL.
@@ -392,8 +385,9 @@ pub struct Pipeline {
     div_busy_until: u64,
     /// Fractional OP-tax carry (milli-ticks) so a sub-tick per-access cost
     /// accumulates instead of rounding to zero.
-    op_tax_debt: u64,
     op_stretch_debt: u64,
+    last_ext_cycle: u64,
+    last_ext_wait: u64,
     /// Last DRAM row touched by this core. CAL: per-core rows ignore
     /// cross-master page thrash (OP/Blitter/68k); calibration will decide
     /// whether a shared row + contention model is needed.
@@ -413,8 +407,9 @@ impl Pipeline {
         self.pend.clear();
         self.flags_ready = 0;
         self.div_busy_until = 0;
-        self.op_tax_debt = 0;
         self.op_stretch_debt = 0;
+        self.last_ext_cycle = 0;
+        self.last_ext_wait = 0;
         self.last_dram_row = None;
         self.last_dram_cycle = 0;
         self.last_dram_extra = 0;
@@ -510,25 +505,25 @@ impl Pipeline {
         }
     }
 
-    /// Charge one external DRAM access its share of Object Processor scan-out
-    /// contention. `phrases` is the OP's per-line fetch demand (0 = idle list).
-    /// The per-access cost is a fraction of a tick, so it accumulates in
-    /// `op_tax_debt` and is released as whole ticks — attributed to `contention`.
-    pub fn charge_op_tax(&mut self, phrases: u32) -> u32 {
-        if phrases == 0 {
-            return 0;
-        }
-        self.op_tax_debt += phrases as u64 * OP_TAX_MILLI_NUM / OP_TAX_MILLI_DEN;
-        let whole = self.op_tax_debt / 1000;
-        if whole > 0 {
-            self.op_tax_debt -= whole * 1000;
-            self.stats.contention += whole;
-        }
-        whole as u32
+    /// The core's own ticks since its previous external access, not counting
+    /// that access's OP wait, capped at `cap`; notes this access. The OP-share
+    /// wait is charged on it (risc.rs).
+    pub fn ext_gap(&mut self, now: u64, cap: u32) -> u32 {
+        let gap = now
+            .saturating_sub(self.last_ext_cycle)
+            .saturating_sub(self.last_ext_wait)
+            .min(cap as u64) as u32;
+        self.last_ext_cycle = now;
+        gap
+    }
+
+    /// Record the OP wait just charged to this access (see `ext_gap`).
+    pub fn note_ext_wait(&mut self, wait: u32) {
+        self.last_ext_wait = wait as u64;
     }
 
     /// Charge `cost` x `ppm` millionths of a tick for waiting on the OP's
-    /// cartridge-window bus share. Accumulated in `op_stretch_debt` so small
+    /// bus share. Accumulated in `op_stretch_debt` so small
     /// waits are not rounded away; released as whole ticks, attributed to
     /// `contention`.
     pub fn charge_op_stretch(&mut self, cost: u32, ppm: u64) -> u32 {

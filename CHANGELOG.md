@@ -6,6 +6,24 @@ assigned at release.
 
 ## Unreleased
 
+### 2026-10-02 — jsim: the GPU and DSP slow under any display, by the same share
+
+Measured on the bench (job 138, `calib/results/2026-10-02-op-share-gpu.md`).
+
+- Every bus-bound master slows by the same ratio under a display (x1.17 for a
+  16bpp 320x240 bitmap in DRAM, x1.40 for two), whatever its access pattern,
+  and compute-only GPU code not at all. jsim slowed the GPU by 1-5% (a fixed
+  per-access tax).
+- The share gains a per-pixel term (an 8bpp bitmap costs more than its
+  phrases): DRAM phrase 1090, cart phrase 10400, pixel 182 ppm.
+- GPU/DSP: each external access waits share/(1 - share) x the core's own
+  ticks since its previous external access (capped at 32), so a bus-bound
+  loop runs at T/(1 - share). This replaces the per-access tax and the fixed
+  cart wait.
+- Not fixed: the GPU's base external-access rate (load streams and stores
+  ~35% fast with the display off).
+- Tests: 444 passed.
+
 ### 2026-10-02 — jsim: Object Processor bitmaps in the cartridge window cost the bus
 
 Platform issue 0011, measured on the bench (job 135,
@@ -14,12 +32,9 @@ Platform issue 0011, measured on the bench (job 135,
 - A phrase the OP fetches from the cartridge window holds the bus about 6.3
   times as long as a DRAM phrase. A 16bpp 320x240 bitmap in the cart made the
   68000 and GPU 8-10x slower on silicon (8bpp: 1.8x), and jsim charged nothing.
-- The OP's bus share is now `m68k::op_share_ppm`: DRAM phrases x 1770 + cart
-  phrases x 11200 millionths, capped at 0.96. The 68000 and the Blitter take
-  time x 1/(1 - share) (identical to the old linear tax at the job-47 point,
-  80 DRAM phrases). The GPU/DSP keep their per-access DRAM tax, and each
-  external access waits 21.5 (DRAM) or 28.5 (other) ticks x share/(1 - share)
-  of the cartridge share, as `contention`.
+- The OP's bus share is now `m68k::op_share_ppm`, with a cartridge phrase
+  costing about 6x a DRAM phrase (coefficients refitted in the entry above).
+  The 68000 and the Blitter take time x 1/(1 - share).
 - `OpState::cart_phrases_per_line` counts the cartridge part of the walk.
 - Tests: 444 passed.
 

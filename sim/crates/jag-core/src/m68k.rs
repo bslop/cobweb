@@ -68,10 +68,20 @@ const POLL_MISS_TOLERANCE: u32 = 16;
 /// 320x240 in DRAM / in the cart / 8bpp in DRAM / in the cart):
 ///   68000 DRAM loop    46 / 54 / 437 / 51 / 84
 ///   GPU DRAM loads     77 / 89 / 686 / 85 / 139
-/// Share per phrase a line, in millionths: DRAM 1770 (time x1.165 at 80
-/// phrases, the job-47 calibration), cart 11200 (x9.6 at 80, x1.81 at 40).
-pub const OP_SHARE_PPM_PER_DRAM_PHRASE: u64 = 1770;
-pub const OP_SHARE_PPM_PER_CART_PHRASE: u64 = 11200;
+/// And by bitmap width (platform bench job 138; fields, display off / 16bpp
+/// 320x240 / 8bpp 320x240 / two 16bpp, all in DRAM):
+///   68000 DRAM loop          46 / 54 / 51 / 64
+///   GPU consumed loads       77 / 90 / 86 / 108
+///   GPU unconsumed loads     27 / 32 / 30 / 38
+///   GPU stores               25 / 29 / 28 / 35
+///   GPU compute only         33 / 33 / 33 / 33
+/// Every bus-bound master slows by the same ratio, and an 8bpp bitmap costs
+/// more than its phrases: a fetch term per phrase plus an expansion term per
+/// pixel. In millionths: DRAM phrase 1090, cart phrase 10400, pixel 182 (16bpp
+/// x1.170, 8bpp x1.113, two 16bpp x1.41; cart 16bpp x9.1, cart 8bpp x1.90).
+pub const OP_SHARE_PPM_PER_DRAM_PHRASE: u64 = 1090;
+pub const OP_SHARE_PPM_PER_CART_PHRASE: u64 = 10400;
+pub const OP_SHARE_PPM_PER_PIXEL: u64 = 182;
 /// The share never reaches the whole bus: the others still crawl (and the
 /// VI is still serviced) at a full-width cartridge bitmap.
 const OP_SHARE_CAP_PPM: u64 = 960_000;
@@ -79,22 +89,23 @@ const OP_SHARE_CAP_PPM: u64 = 960_000;
 /// The OP's share of the bus while it scans, in millionths: zero while video
 /// is off (VMODE VIDEN clear: the OP is not scanning, and an unprogrammed OLP
 /// must not tax anything through objects decoded from garbage).
-/// `cart_only` counts only cartridge-window phrases (the RISC cores, whose
-/// DRAM share is charged per access instead; see risc.rs).
-pub fn op_share_ppm(bus: &Bus, cart_only: bool) -> u64 {
+pub fn op_share_ppm(bus: &Bus) -> u64 {
     if bus.tom.win.r16(crate::mem::VMODE) & 1 == 0 {
         return 0;
     }
     let all = (bus.tom.op.phrases_per_line as u64).min(360);
     let cart = (bus.tom.op.cart_phrases_per_line as u64).min(all);
-    let dram = if cart_only { 0 } else { all - cart };
-    (dram * OP_SHARE_PPM_PER_DRAM_PHRASE + cart * OP_SHARE_PPM_PER_CART_PHRASE).min(OP_SHARE_CAP_PPM)
+    let px = (bus.tom.op.pixels_per_line as u64).min(1440);
+    ((all - cart) * OP_SHARE_PPM_PER_DRAM_PHRASE
+        + cart * OP_SHARE_PPM_PER_CART_PHRASE
+        + px * OP_SHARE_PPM_PER_PIXEL)
+        .min(OP_SHARE_CAP_PPM)
 }
 
 /// Extra time, in millionths of a master's own, from the OP's bus share:
 /// share / (1 - share).
-pub fn op_stretch_ppm(bus: &Bus, cart_only: bool) -> u64 {
-    let s = op_share_ppm(bus, cart_only);
+pub fn op_stretch_ppm(bus: &Bus) -> u64 {
+    let s = op_share_ppm(bus);
     s * 1_000_000 / (1_000_000 - s)
 }
 
@@ -538,7 +549,7 @@ impl M68k {
         // Object-Processor tax: the 68000 runs in what the OP leaves of the
         // bus (see op_share_ppm). Accumulated in millionths so it is not
         // rounded away on short instructions.
-        let stretch = op_stretch_ppm(bus, false);
+        let stretch = op_stretch_ppm(bus);
         let mut op_extra: u32 = 0;
         if stretch > 0 {
             self.op_tax_debt += (c0 + extra) as u64 * stretch;

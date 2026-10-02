@@ -703,7 +703,7 @@ pub fn run(bus: &mut Bus, cmd: u32) {
     // phrases a line vs a bare STOP list): full-screen fills +16%, GPU-issued
     // 5-pixel spans +17%; a cartridge-window bitmap costs about six times as
     // much a phrase (job 135, issue 0011).
-    transfer += transfer * crate::m68k::op_stretch_ppm(bus, false) / 1_000_000;
+    transfer += transfer * crate::m68k::op_stretch_ppm(bus) / 1_000_000;
     {
         // Bucket by shape so a per-blit breakdown is available without a trace.
         let key = (

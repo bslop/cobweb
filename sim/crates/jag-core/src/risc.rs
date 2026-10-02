@@ -16,10 +16,11 @@ use crate::mem;
 mod isa;
 pub mod timing;
 
-/// Ticks, in tenths, an external access waits per unit of the OP's cartridge
-/// stretch (see the access path in `step_timed`; issue 0011, bench job 135).
-const OP_CART_WAIT_DRAM_X10: u64 = 215;
-const OP_CART_WAIT_EXT_X10: u64 = 285;
+/// The longest bus-bound stretch an external access is charged the OP's share
+/// on (see the access path in `step_timed`): a consumed-load loop (~23 ticks)
+/// and a cart-load loop (~35, bench jobs 135/138) are bus-bound throughout;
+/// longer gaps are work inside the core.
+const OP_WAIT_GAP_CAP: u32 = 32;
 
 pub use timing::{Fidelity, TimingStats};
 
@@ -1008,27 +1009,27 @@ impl Risc {
         // Blitter-register block ($F022xx) its measured extra bus cycle and
         // returns (0,0) for everything else internal (p_bcmdidle, 2026-07-21).
         if let Some(c) = mclass {
-            let (mut occ, mut lat) = self.pipe.ext_access(c, ea.unwrap(), contended, now);
-            // A bitmap the OP fetches from the cartridge window holds the bus
-            // for most of each line, and every external access waits for a
-            // turn: a fixed base times the OP's stretch (share / (1 - share),
-            // crate::m68k::op_stretch_ppm), on the result for a load and on
-            // the occupancy for a store. Work inside the core never needs the
-            // bus and is not slowed. HARDWARE (platform bench job 135, issue
-            // 0011; fields, display off / 16bpp 320x240 in the cart / 8bpp):
-            //   1.5 M GPU DRAM loads   77 / 686 / 139  -> base ~21.5 ticks
-            //   150 k GPU cart loads   12 /  95 /  20  -> base ~28.5 ticks
+            let (mut occ, lat) = self.pipe.ext_access(c, ea.unwrap(), contended, now);
+            // The Object Processor holds the bus for a share of each line
+            // (crate::m68k::op_share_ppm) and the RISCs run in what is left,
+            // like the 68000 - but only while they need the bus. So an
+            // external access waits share / (1 - share) x the core's own time
+            // since its previous external access (not counting that access's
+            // wait), and a bus-bound loop of period T runs at T / (1 - share)
+            // whatever its access pattern. Work inside the core never needs the
+            // bus, so that time is capped. Charged on the occupancy: an
+            // unconsumed load waits for the bus as much as a consumed one.
+            // HARDWARE (platform bench jobs 135, 138): with any display,
+            // consumed loads, load streams and stores all slowed by the
+            // 68000's ratio (x1.17 for a 16bpp 320x240 bitmap in DRAM, x1.41
+            // for two, x8.9 for one in the cartridge), and a compute-only
+            // kernel not at all.
             if c != MemClass::Internal {
-                let stretch = crate::m68k::op_stretch_ppm(bus, true);
-                if stretch > 0 {
-                    let base_x10 = if c == MemClass::Dram { OP_CART_WAIT_DRAM_X10 } else { OP_CART_WAIT_EXT_X10 };
-                    let wait_ppm = base_x10 * stretch / 10;
-                    if is_load {
-                        lat += self.pipe.charge_op_stretch(1, wait_ppm);
-                    } else {
-                        occ += self.pipe.charge_op_stretch(1, wait_ppm);
-                    }
-                }
+                let gap = self.pipe.ext_gap(now, OP_WAIT_GAP_CAP);
+                let stretch = crate::m68k::op_stretch_ppm(bus);
+                let wait = if stretch > 0 { self.pipe.charge_op_stretch(gap, stretch) } else { 0 };
+                self.pipe.note_ext_wait(wait);
+                occ += wait;
             }
             cost += occ;
             if is_load {
@@ -1047,17 +1048,7 @@ impl Risc {
                     ext_load_lat += 8;
                 }
             }
-            // Object Processor scan-out steals DRAM cycles from both RISCs every
-            // visible line (HARDWARE-CALIBRATED; see OP_TAX_MILLI_*). Unlike the
-            // 68k tax this applies to stores too — the OP occupies the bus, it
-            // does not thrash a row.
             if c == MemClass::Dram {
-                // DRAM-resident bitmaps only: cartridge-window ones stretched
-                // the access above (issue 0011).
-                let dram_ppl = bus.tom.op.phrases_per_line.saturating_sub(bus.tom.op.cart_phrases_per_line);
-                let optax = self.pipe.charge_op_tax(dram_ppl);
-                cost += optax;
-                self.pipe.note_dram_stretch(optax as u64);
 
                 // ☠ THE BLITTER IS THE ONE BUS MASTER WHOSE DRAM TRAFFIC IS
                 // CHARGED TO NOBODY ELSE. The OP tax above steals cycles from
