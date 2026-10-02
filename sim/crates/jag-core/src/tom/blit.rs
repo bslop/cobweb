@@ -57,6 +57,19 @@ const BLIT_ACCESS_TICKS_X10: u64 = 56;
 /// STOP list, 2.19 ticks a phrase; the 5.6 above (a pixel-mode copy figure)
 /// made them take 50.
 const BLIT_PHRASE_WRITE_TICKS_X10: u64 = 22;
+/// Extra ticks ×10 for each source access a SRCEN blit makes in the cartridge
+/// window, over the same access in DRAM. HARDWARE (platform bench, jagq job
+/// 186, `bench/blitcost`, GameDrive cartridge SDRAM, a 16bpp 320x200 display
+/// up): 400 full-screen 16bpp phrase copies took 422 fields from the cart vs
+/// 218 from DRAM, and 50 pixel-mode 319x200 copies 113 vs 96. With the OP's
+/// stretch taken out that is +12.2 ticks a source phrase and +2.0 a source
+/// pixel. Pixel mode reads 16 bits a pixel and phrase mode 64 a phrase, so the
+/// cart's cost follows the width read; 8bpp pixel reads are unmeasured and
+/// charged as 16. These are differences: the DRAM copy itself is still priced
+/// by `BLIT_ACCESS_TICKS_X10` (job 186 has phrase-mode DRAM copies ~14% slower
+/// than that on silicon, pixel-mode ~3%).
+const BLIT_CART_PHRASE_EXTRA_X10: u64 = 122;
+const BLIT_CART_PIXEL_EXTRA_X10: u64 = 20;
 
 /// Decode the 6-bit floating WIDTH field (4-bit exp, 2-bit mantissa + implied 1)
 /// into a pixel count: `((4 + mant) << exp) >> 2` (spec §2.2).
@@ -697,6 +710,12 @@ pub fn run(bus: &mut Bus, cmd: u32) {
     } else {
         (dst_phrases + dst_reads + src_phrases) * BLIT_ACCESS_TICKS_X10 / 10
     };
+    // A source in the cartridge window costs more per access than DRAM
+    // (BLIT_CART_*_EXTRA_X10, issue 0011).
+    if srcen && mem::is_cart(gens[src].base & 0x00FF_FFFF) {
+        let extra = if gens[src].xadd == 0 { BLIT_CART_PHRASE_EXTRA_X10 } else { BLIT_CART_PIXEL_EXTRA_X10 };
+        transfer += src_phrases * extra / 10;
+    }
     // The Object Processor holds the bus while it fetches a line, and the
     // Blitter ranks below it: the same share as the 68000
     // (crate::m68k::op_share_ppm). HARDWARE (jagq jobs 46-47, OP showing 80
@@ -842,6 +861,37 @@ mod tests {
         setup(&mut bus, 8);
         bus.write32(mem::B_CMD, 0x0180_0801);
         assert_eq!(bus.tom.last_blit_ticks, 16 + (8 + 8) * 56 / 10);
+    }
+
+    #[test]
+    fn cart_source_costs_more_than_dram() {
+        // Job 186: a source in the cartridge window adds BLIT_CART_*_EXTRA_X10
+        // a source access; the destination's cost is unchanged.
+        let mut bus = Bus::new();
+        let setup = |bus: &mut Bus, src: u32, flags: u32| {
+            bus.tom.win.w32(mem::A1_BASE, src); // DSTA2: A1 is the source
+            bus.tom.win.w32(mem::A1_FLAGS, flags);
+            bus.tom.win.w32(mem::A1_PIXEL, 0);
+            bus.tom.win.w32(mem::A2_BASE, 0x18_0000);
+            bus.tom.win.w32(mem::A2_FLAGS, flags);
+            bus.tom.win.w32(mem::A2_PIXEL, 0);
+            bus.tom.win.w32(mem::B_COUNT, (1 << 16) | 256);
+        };
+        // pixel mode (8bpp, XADDPIX): 256 source reads
+        setup(&mut bus, 0x14_0000, 0x0001_4218);
+        bus.write32(mem::B_CMD, 0x0180_0801);
+        let dram = bus.tom.last_blit_ticks;
+        setup(&mut bus, 0x90_0000, 0x0001_4218);
+        bus.write32(mem::B_CMD, 0x0180_0801);
+        assert_eq!(bus.tom.last_blit_ticks, dram + 256 * BLIT_CART_PIXEL_EXTRA_X10 / 10);
+        // phrase mode (8bpp, XADDPHR): 32 source phrases
+        setup(&mut bus, 0x14_0000, 0x0000_4218);
+        bus.write32(mem::B_CMD, 0x0180_0801);
+        let dram = bus.tom.last_blit_ticks;
+        assert_eq!(dram, 16 + (32 + 32) * 56 / 10);
+        setup(&mut bus, 0x90_0000, 0x0000_4218);
+        bus.write32(mem::B_CMD, 0x0180_0801);
+        assert_eq!(bus.tom.last_blit_ticks, dram + 32 * BLIT_CART_PHRASE_EXTRA_X10 / 10);
     }
 
     #[test]

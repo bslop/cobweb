@@ -6,6 +6,17 @@ assigned at release.
 
 ## Unreleased
 
+### 2026-10-02 — jsim: Blitter copies from the cartridge window cost more
+
+Measured on the bench (jobs 171 and 186, `calib/results/2026-10-02-blit-cart-source.md`).
+
+- A SRCEN blit whose source is in the cartridge window (GameDrive cartridge SDRAM) ran
+  at DRAM speed in jsim. On silicon a full-screen 16bpp phrase copy from the cart takes
+  1.9x as long as from DRAM, and a pixel-mode copy 1.18x as long.
+- Each source access in the cart now adds 12.2 ticks (phrase mode) or 2.0 ticks
+  (pixel mode), before the OP stretch.
+- Remaining: phrase-mode DRAM copies ~14% fast, pixel-mode ~3% fast.
+
 ### 2026-10-02 — jsim: a GPU/DSP DRAM burst streams one access per 5 ticks
 
 Measured on the bench (job 140, `calib/results/2026-10-02-gpu-dram-spacing.md`).
