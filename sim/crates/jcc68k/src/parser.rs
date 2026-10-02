@@ -1798,9 +1798,13 @@ impl Parser {
                 }
                 if let Some(vr) = self.resolve(&s) {
                     Ok(Expr { kind: ExprK::Var(vr.name), ty: vr.ty, line })
+                } else if !self.at_punct("(") {
+                    // Only a call may name an undeclared function (C89 implicit
+                    // declaration). Anything else is an error, as in gcc: typing it
+                    // as a function silently made `x[i]` index `&x` (issue 0013).
+                    Err(format!("{line}: '{s}' undeclared"))
                 } else {
-                    // implicit function/global — assume int() or extern; used for
-                    // calls to not-yet-declared functions.
+                    // implicit function declaration: int f(...)
                     Ok(Expr { kind: ExprK::Var(s), ty: Rc::new(TypeK::Func { ret: t_int(), params: vec![], variadic: true }), line })
                 }
             }

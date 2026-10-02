@@ -6,6 +6,15 @@ assigned at release.
 
 ## Unreleased
 
+### 2026-10-02 — jcc68k: an undeclared identifier is an error (platform issue 0013)
+
+- A name used before its declaration was typed as an implicit `int f()`, so
+  `later[3] = 7` in a function above `later`'s declaration compiled to a store at
+  `&later + 12`: a silent overwrite of the program's own data. jcc68k now stops with
+  `'later' undeclared`, as gcc does.
+- An undeclared name followed by `(` is still an implicit function declaration, so
+  calls to functions defined further down compile as before.
+
 ### 2026-10-02 — jsim: Blitter copies from the cartridge window cost more
 
 Measured on the bench (jobs 171 and 186, `calib/results/2026-10-02-blit-cart-source.md`).

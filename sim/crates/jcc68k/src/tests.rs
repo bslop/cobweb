@@ -330,6 +330,24 @@ fn unsupported_extended_asm_is_a_hard_error() {
 }
 
 #[test]
+fn use_before_declaration_is_an_error() {
+    // Issue 0013: an identifier used before its declaration was typed as an
+    // implicit function, so `later[3] = 7` indexed `&later` and overwrote the
+    // bytes after the pointer variable. gcc: "'later' undeclared".
+    let err = crate::compile(
+        "static void f(void){ later[3] = 7; }\n\
+         static volatile unsigned *const later = (volatile unsigned *)0x1E6000u;\n\
+         int main(void){ f(); return 0; }",
+    )
+    .unwrap_err();
+    assert!(err.contains("'later' undeclared"), "got: {err}");
+    assert!(crate::compile("int f(void){ return x + 1; }").unwrap_err().contains("'x' undeclared"));
+    assert!(crate::compile("int f(void){ return &g != 0; }").is_err(), "address of an undeclared name compiled");
+    // A call may still name a function declared later (C89 implicit declaration).
+    assert_eq!(run("int main(void){ return twice(21); }\nint twice(int v){ return v * 2; }"), 42);
+}
+
+#[test]
 fn call_through_function_pointer_variable() {
     // A call through a pointer VARIABLE compiled to `jsr <variable>`, so the
     // CPU executed the pointer's bytes: silent, and fatal on hardware. Every
