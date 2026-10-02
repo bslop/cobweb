@@ -197,6 +197,11 @@ pub struct OpState {
     /// stream by 11.1%, i.e. +0.46 cycles per external access. See
     /// `timing::OP_TAX_MILLI_PER_PHRASE`.
     pub phrases_per_line: u32,
+    /// The part of `phrases_per_line` whose bitmap data lies in the cartridge
+    /// window ($800000-$DFFFFF). HARDWARE (platform bench job 135, issue
+    /// 0011): a phrase fetched from the cart costs the other bus masters about
+    /// six times a DRAM phrase (see `crate::m68k::op_share_ppm`).
+    pub cart_phrases_per_line: u32,
     /// ☠ HARDWARE (jag_quake, 2026-08-22 — "the A10 / PADTEXT boot lottery"):
     /// a SCALED bitmap object is fetched as one 4-phrase (32-byte) burst and
     /// the OP dies if that burst straddles a 32-byte boundary — the screen
@@ -253,6 +258,7 @@ impl Default for OpState {
             anchor_y: 0,
             has_gpu_object: false,
             phrases_per_line: 0,
+            cart_phrases_per_line: 0,
             scaled_misaligned_hits: 0,
             scaled_misaligned_addr: 0,
             bitmap_misaligned_addr: 0,
@@ -266,6 +272,11 @@ impl Default for OpState {
 }
 
 /// One decoded object header (first + second phrase fields).
+/// Is `addr` (a bitmap's DATA) in the cartridge window, $800000-$DFFFFF?
+fn in_cart_window(addr: u32) -> bool {
+    (0x80_0000..0xE0_0000).contains(&(addr & 0x00FF_FFFF))
+}
+
 #[derive(Clone, Copy, Default)]
 struct Obj {
     otype: u32,
@@ -334,9 +345,12 @@ pub fn op_render_line(vc: u16, cpu: &mut M68k, gpu: &mut Risc, bus: &mut Bus) {
     // the 68k may be mid-write, and a torn list decodes as garbage.
     {
         let olp = ((bus.tom.win.r16(mem::OLPH) as u32) << 16) | bus.tom.win.r16(mem::OLP) as u32;
-        let p: u32 = collect_bitmaps(bus, olp).iter().map(|b| b.iwidth_phrases).sum();
+        let bitmaps = collect_bitmaps(bus, olp);
+        let p: u32 = bitmaps.iter().map(|b| b.iwidth_phrases).sum();
+        let c: u32 = bitmaps.iter().filter(|b| in_cart_window(b.data)).map(|b| b.iwidth_phrases).sum();
         if p <= (LINE_W as u32) {
             bus.tom.op.phrases_per_line = p;
+            bus.tom.op.cart_phrases_per_line = c;
         }
     }
     let vmode = bus.tom.win.r16(mem::VMODE);
@@ -564,8 +578,15 @@ fn op_begin_field(bus: &mut Bus, fmt: PixFmt) {
         .iter()
         .map(|b| b.iwidth_phrases as u64 * (b.height as u64).min(canvas))
         .sum();
+    let weighted_cart: u64 = bitmaps
+        .iter()
+        .filter(|b| in_cart_window(b.data))
+        .map(|b| b.iwidth_phrases as u64 * (b.height as u64).min(canvas))
+        .sum();
     bus.tom.op.phrases_per_line =
         (((weighted + canvas - 1) / canvas).min(4096)) as u32;
+    bus.tom.op.cart_phrases_per_line =
+        (((weighted_cart + canvas - 1) / canvas).min(4096)) as u32;
 }
 
 /// Structural scan of the object graph for a GPU (TYPE 2) object (both BRANCH
@@ -1246,6 +1267,45 @@ mod tests {
         );
         assert!(bad.tom.op.scaled_misaligned_hits > 0, "the fault must be counted");
         assert_eq!(bad.tom.op.scaled_misaligned_addr, 0x1010);
+    }
+
+    /// HARDWARE (bench job 135, platform issue 0011): a bitmap whose data
+    /// lies in the cartridge window costs the other bus masters about six
+    /// times a DRAM one. The OP walk must count those phrases apart, and the
+    /// share must follow: x1.165 for 80 DRAM phrases (the job-47 point), about
+    /// x9.6 for 80 cart phrases, x1.81 for 40.
+    #[test]
+    fn op_counts_cartridge_phrases_and_charges_them_more() {
+        let (w, h) = (320u32, 240u32);
+        let share = |data: u32, width_px: u32, bpp_bytes: u32| {
+            let mut bus = Bus::new();
+            let ol = 0x1000u32;
+            let ph = width_px * bpp_bytes / 8;
+            let link = (ol + 16) >> 3;
+            bus.write32(ol, (data << 8) | (link >> 8));
+            bus.write32(ol + 4, (link << 24) | (h << 14) | (16 << 4));
+            bus.write32(ol + 8, ph >> 4);
+            let depth = if bpp_bytes == 2 { 4 } else { 3 };
+            bus.write32(ol + 12, (ph << 28) | (ph << 18) | (1 << 15) | (depth << 12) | 16);
+            bus.write32(ol + 16, 0);
+            bus.write32(ol + 20, 4);
+            bus.tom.win.w16(mem::VMODE, 0x06C7);
+            bus.write32(mem::OLP, (ol >> 16) | (ol << 16));
+            compose_frame(&mut bus);
+            let op = &bus.tom.op;
+            (op.phrases_per_line, op.cart_phrases_per_line,
+             crate::m68k::op_stretch_ppm(&bus, false), crate::m68k::op_stretch_ppm(&bus, true))
+        };
+        let (all, cart, st, st_cart) = share(0x10_0000, w, 2);
+        assert_eq!((all, cart, st_cart), (80, 0, 0), "a DRAM bitmap: no cartridge share");
+        assert!((160_000..170_000).contains(&st), "80 DRAM phrases: x1.165, got +{st} ppm");
+        let (all, cart, st, st_cart) = share(0x90_0000, w, 2);
+        assert_eq!((all, cart), (80, 80));
+        assert_eq!(st, st_cart, "only cartridge phrases: the two shares agree");
+        assert!((8_300_000..9_000_000).contains(&st), "80 cart phrases: about x9.6, got +{st} ppm");
+        let (_, cart, st, _) = share(0x90_0000, w, 1);
+        assert_eq!(cart, 40);
+        assert!((780_000..840_000).contains(&st), "40 cart phrases: about x1.81, got +{st} ppm");
     }
 
     /// HARDWARE (bench job 55, platform issue 0010): an unscaled BITMAP object

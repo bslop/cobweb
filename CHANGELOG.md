@@ -6,6 +6,23 @@ assigned at release.
 
 ## Unreleased
 
+### 2026-10-02 — jsim: Object Processor bitmaps in the cartridge window cost the bus
+
+Platform issue 0011, measured on the bench (job 135,
+`calib/results/2026-10-02-op-cartridge-bitmap.md`).
+
+- A phrase the OP fetches from the cartridge window holds the bus about 6.3
+  times as long as a DRAM phrase. A 16bpp 320x240 bitmap in the cart made the
+  68000 and GPU 8-10x slower on silicon (8bpp: 1.8x), and jsim charged nothing.
+- The OP's bus share is now `m68k::op_share_ppm`: DRAM phrases x 1770 + cart
+  phrases x 11200 millionths, capped at 0.96. The 68000 and the Blitter take
+  time x 1/(1 - share) (identical to the old linear tax at the job-47 point,
+  80 DRAM phrases). The GPU/DSP keep their per-access DRAM tax, and each
+  external access waits 21.5 (DRAM) or 28.5 (other) ticks x share/(1 - share)
+  of the cartridge share, as `contention`.
+- `OpState::cart_phrases_per_line` counts the cartridge part of the walk.
+- Tests: 444 passed.
+
 ### 2026-10-02 — jsim: unscaled bitmap objects need 16-byte alignment
 
 Platform issue 0010, measured on the bench (job 55,

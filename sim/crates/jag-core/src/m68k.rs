@@ -60,19 +60,42 @@ const POLL_MISS_TOLERANCE: u32 = 16;
 /// the tax is proportional to the 68000's TIME, not to its DRAM accesses.
 /// (The earlier per-DRAM-access term, derived from the RISC tax, gave +3-5%.)
 /// The Blitter measured the same (+16% fills, +17% spans; tom/blit.rs).
-/// Coefficient: 0.165 / 80 phrases = 2.06 thousandths of the time per phrase
-/// a line, charged on the instruction's whole cost, in millionths.
-pub const OP_TAX_PPM_PER_PHRASE: u64 = 2060;
+///
+/// The OP holds the bus for a SHARE of each line, so the others run at
+/// (1 - share) of their speed: time x 1/(1 - share). A phrase fetched from the
+/// cartridge window holds the bus about six times as long as a DRAM phrase.
+/// HARDWARE (platform bench job 135, issue 0011; fields, display off / 16bpp
+/// 320x240 in DRAM / in the cart / 8bpp in DRAM / in the cart):
+///   68000 DRAM loop    46 / 54 / 437 / 51 / 84
+///   GPU DRAM loads     77 / 89 / 686 / 85 / 139
+/// Share per phrase a line, in millionths: DRAM 1770 (time x1.165 at 80
+/// phrases, the job-47 calibration), cart 11200 (x9.6 at 80, x1.81 at 40).
+pub const OP_SHARE_PPM_PER_DRAM_PHRASE: u64 = 1770;
+pub const OP_SHARE_PPM_PER_CART_PHRASE: u64 = 11200;
+/// The share never reaches the whole bus: the others still crawl (and the
+/// VI is still serviced) at a full-width cartridge bitmap.
+const OP_SHARE_CAP_PPM: u64 = 960_000;
 
-/// Phrases the Object Processor fetches a line, for the bus-share taxes:
-/// zero while video is off (VMODE VIDEN clear: the OP is not scanning, and an
-/// unprogrammed OLP must not tax anything through objects decoded from
-/// garbage), capped at 360 (a full 720-pixel 16bpp line buffer, twice).
-pub fn op_fetch_phrases(bus: &Bus) -> u64 {
+/// The OP's share of the bus while it scans, in millionths: zero while video
+/// is off (VMODE VIDEN clear: the OP is not scanning, and an unprogrammed OLP
+/// must not tax anything through objects decoded from garbage).
+/// `cart_only` counts only cartridge-window phrases (the RISC cores, whose
+/// DRAM share is charged per access instead; see risc.rs).
+pub fn op_share_ppm(bus: &Bus, cart_only: bool) -> u64 {
     if bus.tom.win.r16(crate::mem::VMODE) & 1 == 0 {
         return 0;
     }
-    (bus.tom.op.phrases_per_line as u64).min(360)
+    let all = (bus.tom.op.phrases_per_line as u64).min(360);
+    let cart = (bus.tom.op.cart_phrases_per_line as u64).min(all);
+    let dram = if cart_only { 0 } else { all - cart };
+    (dram * OP_SHARE_PPM_PER_DRAM_PHRASE + cart * OP_SHARE_PPM_PER_CART_PHRASE).min(OP_SHARE_CAP_PPM)
+}
+
+/// Extra time, in millionths of a master's own, from the OP's bus share:
+/// share / (1 - share).
+pub fn op_stretch_ppm(bus: &Bus, cart_only: bool) -> u64 {
+    let s = op_share_ppm(bus, cart_only);
+    s * 1_000_000 / (1_000_000 - s)
 }
 
 /// Extra cost, tenths of the instruction's own, of a 68000 instruction that
@@ -170,7 +193,7 @@ pub struct M68k {
     /// Sub-cycle remainder of the external-bus wait charge (tenths).
     bus_debt: u32,
     /// Fractional Object-Processor tax owed, in millionths of a cycle (see
-    /// `OP_TAX_PPM_PER_PHRASE`). Carried between instructions so a charge
+    /// `op_share_ppm`). Carried between instructions so a charge
     /// smaller than one cycle still accumulates instead of vanishing.
     op_tax_debt: u64,
     /// 68000 cycles spent waiting for a blit in flight (see `step`).
@@ -512,13 +535,13 @@ impl M68k {
         let extra = self.bus_debt / 10;
         self.bus_debt -= extra * 10;
 
-        // Object-Processor tax: a fixed share of the 68000's time per phrase
-        // the OP fetches a line (see OP_TAX_PPM_PER_PHRASE). Accumulated in
-        // millionths so it is not rounded away on short instructions.
-        let phrases = op_fetch_phrases(bus);
+        // Object-Processor tax: the 68000 runs in what the OP leaves of the
+        // bus (see op_share_ppm). Accumulated in millionths so it is not
+        // rounded away on short instructions.
+        let stretch = op_stretch_ppm(bus, false);
         let mut op_extra: u32 = 0;
-        if phrases > 0 {
-            self.op_tax_debt += (c0 + extra) as u64 * phrases * OP_TAX_PPM_PER_PHRASE;
+        if stretch > 0 {
+            self.op_tax_debt += (c0 + extra) as u64 * stretch;
             let whole = self.op_tax_debt / 1_000_000;
             if whole > 0 {
                 self.op_tax_debt -= whole * 1_000_000;

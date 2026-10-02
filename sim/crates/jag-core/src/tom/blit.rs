@@ -698,12 +698,12 @@ pub fn run(bus: &mut Bus, cmd: u32) {
         (dst_phrases + dst_reads + src_phrases) * BLIT_ACCESS_TICKS_X10 / 10
     };
     // The Object Processor holds the bus while it fetches a line, and the
-    // Blitter ranks below it: the same proportional share as the 68000
-    // (crate::m68k::OP_TAX_PPM_PER_PHRASE). HARDWARE (jagq jobs 46-47, OP
-    // showing 80 phrases a line vs a bare STOP list): full-screen fills
-    // +16%, GPU-issued 5-pixel spans +17%.
-    let ppl = crate::m68k::op_fetch_phrases(bus);
-    transfer += transfer * ppl * crate::m68k::OP_TAX_PPM_PER_PHRASE / 1_000_000;
+    // Blitter ranks below it: the same share as the 68000
+    // (crate::m68k::op_share_ppm). HARDWARE (jagq jobs 46-47, OP showing 80
+    // phrases a line vs a bare STOP list): full-screen fills +16%, GPU-issued
+    // 5-pixel spans +17%; a cartridge-window bitmap costs about six times as
+    // much a phrase (job 135, issue 0011).
+    transfer += transfer * crate::m68k::op_stretch_ppm(bus, false) / 1_000_000;
     {
         // Bucket by shape so a per-blit breakdown is available without a trace.
         let key = (

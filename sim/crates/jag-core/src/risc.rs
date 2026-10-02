@@ -16,6 +16,11 @@ use crate::mem;
 mod isa;
 pub mod timing;
 
+/// Ticks, in tenths, an external access waits per unit of the OP's cartridge
+/// stretch (see the access path in `step_timed`; issue 0011, bench job 135).
+const OP_CART_WAIT_DRAM_X10: u64 = 215;
+const OP_CART_WAIT_EXT_X10: u64 = 285;
+
 pub use timing::{Fidelity, TimingStats};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1003,7 +1008,28 @@ impl Risc {
         // Blitter-register block ($F022xx) its measured extra bus cycle and
         // returns (0,0) for everything else internal (p_bcmdidle, 2026-07-21).
         if let Some(c) = mclass {
-            let (occ, lat) = self.pipe.ext_access(c, ea.unwrap(), contended, now);
+            let (mut occ, mut lat) = self.pipe.ext_access(c, ea.unwrap(), contended, now);
+            // A bitmap the OP fetches from the cartridge window holds the bus
+            // for most of each line, and every external access waits for a
+            // turn: a fixed base times the OP's stretch (share / (1 - share),
+            // crate::m68k::op_stretch_ppm), on the result for a load and on
+            // the occupancy for a store. Work inside the core never needs the
+            // bus and is not slowed. HARDWARE (platform bench job 135, issue
+            // 0011; fields, display off / 16bpp 320x240 in the cart / 8bpp):
+            //   1.5 M GPU DRAM loads   77 / 686 / 139  -> base ~21.5 ticks
+            //   150 k GPU cart loads   12 /  95 /  20  -> base ~28.5 ticks
+            if c != MemClass::Internal {
+                let stretch = crate::m68k::op_stretch_ppm(bus, true);
+                if stretch > 0 {
+                    let base_x10 = if c == MemClass::Dram { OP_CART_WAIT_DRAM_X10 } else { OP_CART_WAIT_EXT_X10 };
+                    let wait_ppm = base_x10 * stretch / 10;
+                    if is_load {
+                        lat += self.pipe.charge_op_stretch(1, wait_ppm);
+                    } else {
+                        occ += self.pipe.charge_op_stretch(1, wait_ppm);
+                    }
+                }
+            }
             cost += occ;
             if is_load {
                 ext_load_lat = lat;
@@ -1026,7 +1052,10 @@ impl Risc {
             // 68k tax this applies to stores too — the OP occupies the bus, it
             // does not thrash a row.
             if c == MemClass::Dram {
-                let optax = self.pipe.charge_op_tax(bus.tom.op.phrases_per_line);
+                // DRAM-resident bitmaps only: cartridge-window ones stretched
+                // the access above (issue 0011).
+                let dram_ppl = bus.tom.op.phrases_per_line.saturating_sub(bus.tom.op.cart_phrases_per_line);
+                let optax = self.pipe.charge_op_tax(dram_ppl);
                 cost += optax;
                 self.pipe.note_dram_stretch(optax as u64);
 

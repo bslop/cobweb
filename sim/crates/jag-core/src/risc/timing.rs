@@ -393,6 +393,7 @@ pub struct Pipeline {
     /// Fractional OP-tax carry (milli-ticks) so a sub-tick per-access cost
     /// accumulates instead of rounding to zero.
     op_tax_debt: u64,
+    op_stretch_debt: u64,
     /// Last DRAM row touched by this core. CAL: per-core rows ignore
     /// cross-master page thrash (OP/Blitter/68k); calibration will decide
     /// whether a shared row + contention model is needed.
@@ -413,6 +414,7 @@ impl Pipeline {
         self.flags_ready = 0;
         self.div_busy_until = 0;
         self.op_tax_debt = 0;
+        self.op_stretch_debt = 0;
         self.last_dram_row = None;
         self.last_dram_cycle = 0;
         self.last_dram_extra = 0;
@@ -520,6 +522,20 @@ impl Pipeline {
         let whole = self.op_tax_debt / 1000;
         if whole > 0 {
             self.op_tax_debt -= whole * 1000;
+            self.stats.contention += whole;
+        }
+        whole as u32
+    }
+
+    /// Charge `cost` x `ppm` millionths of a tick for waiting on the OP's
+    /// cartridge-window bus share. Accumulated in `op_stretch_debt` so small
+    /// waits are not rounded away; released as whole ticks, attributed to
+    /// `contention`.
+    pub fn charge_op_stretch(&mut self, cost: u32, ppm: u64) -> u32 {
+        self.op_stretch_debt += cost as u64 * ppm;
+        let whole = self.op_stretch_debt / 1_000_000;
+        if whole > 0 {
+            self.op_stretch_debt -= whole * 1_000_000;
             self.stats.contention += whole;
         }
         whole as u32
