@@ -6,6 +6,18 @@ assigned at release.
 
 ## Unreleased
 
+### 2026-10-02 — jsim: GameDrive CPU reads into the cart window, and a warning for GPU reads with no host
+
+Measured on the bench (jobs 190-200, `calib/results/2026-10-02-gd-reads.md`, platform
+issue 0012).
+
+- A CPU-mode `GD_FRead` into the cart window is exact on silicon only when the length is
+  a multiple of 32 bytes. jsim was exact at every length. Now the last `n % 32` bytes
+  land as byte stores and take the window's byte-write fill. A ROM that reads 8 bytes
+  into the window now fails here as it does on the cart.
+- A GPU-mode read (`GD_FREAD_GPU`, `GD_FREAD_GPU_ASYNC`) issued while the GPU is halted
+  still completes here. On silicon it never finishes, so jsim now warns once on stderr.
+
 ### 2026-10-02 — jcc68k: an undeclared identifier is an error (platform issue 0013)
 
 - A name used before its declaration was typed as an implicit `int f()`, so

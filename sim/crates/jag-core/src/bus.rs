@@ -405,7 +405,8 @@ pub struct Bus {
     /// cart and into DRAM, compared in longwords — is GREEN on silicon, i.e.
     /// the BIOS's own copy lands intact where a 68000 byte loop does not.
     /// (jsim read RED here until this existed, which is the divergence the
-    /// end-to-end probe caught.)
+    /// end-to-end probe caught.) Only whole 32-byte blocks: a CPU-mode read's
+    /// last n % 32 bytes are byte stores (platform bench job 198, `m68k.rs`).
     cart_dma: bool,
     pub jerry: Jerry,
     /// Count of bus accesses, for the debugger / profiler.

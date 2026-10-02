@@ -151,6 +151,30 @@ pub fn fn_of_trap(trap: u8) -> Option<u8> {
     FN_TRAP.iter().find(|(_, t)| *t == trap).map(|(f, _)| *f)
 }
 
+/// A GPU-mode `GD_FRead` (GPU or GPU async) moves its data in the GPU's
+/// interrupt handler. Here it completes without one; on silicon a read issued
+/// while the GPU is halted never completes, and the GameDrive is left
+/// mid-transfer until a power cycle (vendor `JagGD/README.md`; notes "the
+/// GameDrive GPU-async read", item 4). Warn once when the GPU isn't running.
+/// Hosts that work on silicon: platform `lib/gd` README, "GPU-mode reads"
+/// (bench jobs 190-200, platform issue 0012). Returns whether the GPU runs.
+pub fn check_gpu_read_host(bus: &crate::bus::Bus) -> bool {
+    let mut ctrl = [0u8; 4];
+    bus.peek(crate::mem::G_CTRL, &mut ctrl);
+    if u32::from_be_bytes(ctrl) & crate::mem::RISCGO != 0 {
+        return true;
+    }
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        eprintln!("jsim WARNING: a GPU-mode gd_fread was issued with the GPU halted. \
+                   It completes here, but on silicon the GPU's interrupt handler \
+                   moves the data: the read never finishes and the GameDrive needs \
+                   a power cycle. Start a GPU host first (GD_InitGPURead, G_DSPENA, \
+                   J_EXTENA, the GPU running).");
+    });
+    false
+}
+
 /// Build the synthetic GDBIOS block: a version word, a function count, then a
 /// 4-byte `trap #n ; rts` thunk at offset `4*n` for each supported call.
 fn build_bios_block() -> Vec<u8> {

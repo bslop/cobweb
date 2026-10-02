@@ -895,7 +895,11 @@ impl M68k {
         if std::env::var_os("JAGEMU_GD_DEBUG").is_some() {
             eprintln!("GDTRAP #{trap} d0={d0:#010X} d1={d1:#010X} a0={a0:#010X}");
         }
-        let result = match gd::fn_of_trap(trap)? {
+        let func = gd::fn_of_trap(trap)?;
+        if func == gd::FN_FREAD && matches!(d0 >> 16, 1 | 2) {
+            gd::check_gpu_read_host(bus);
+        }
+        let result = match func {
             // INIT and InitGPURead have no host-side state to set up; the point
             // of publishing InitGPURead is that the hardware-correct call
             // sequence must not fault here. See gamedrive::FN_TRAP.
@@ -950,9 +954,24 @@ impl M68k {
             }
             gd::FN_FREAD => match bus.gamedrive.as_mut()?.fread(d0 as u16, d1) {
                 Some(data) => {
+                    // Whole 32-byte blocks are a DEVICE write (Bus::write8_dma,
+                    // run 242 mode 12); the n % 32 bytes after them land as byte
+                    // stores, so in the cart window they take the byte-write
+                    // fill. Platform bench job 198 (platform issue 0012): a CPU
+                    // read into the window is exact for 32/64/256/512 bytes and
+                    // wrong for 2-30, 34, 62, 66, 254, 258, 510, 514; job 103's
+                    // 8 bytes read `01 01 03 03`. Only pass/fail per length was
+                    // measured, with a long-aligned destination: that a longer
+                    // read's whole blocks survive and only its tail is filled is
+                    // the inference this model makes. The GPU modes are unchanged.
+                    let whole = data.len() & !31;
                     for (i, b) in data.iter().enumerate() {
-                        // a DEVICE write: see Bus::write8_dma (run 242, mode 12)
-                        bus.write8_dma(a0.wrapping_add(i as u32), *b);
+                        let at = a0.wrapping_add(i as u32);
+                        if i < whole {
+                            bus.write8_dma(at, *b);
+                        } else {
+                            bus.write8(at, *b);
+                        }
                     }
                     bus.gamedrive.as_mut()?.set_async_pos(a0.wrapping_add(d1));
                     0 // upstream convention: 0 means SUCCESS, not a byte count
@@ -1270,5 +1289,78 @@ fn irq_delay_from_env() -> (u32, u32) {
                 (0, 0)
             }
         },
+    }
+}
+
+#[cfg(test)]
+mod gd_fread_tests {
+    use super::*;
+    use crate::bus::Bus;
+    use crate::gamedrive as gd;
+
+    /// GD_FREAD (CPU mode) of `n` bytes from offset 0 of a 1 KB numbered
+    /// file to `dst`, through the trap the bindings reach. Returns what landed
+    /// in the first n + 4 bytes at `dst`, which start out as `0xEE`.
+    fn cpu_read(dst: u32, n: u32) -> (Vec<u8>, Vec<u8>) {
+        let dir = std::env::temp_dir().join("jagemu_gd_fread_cart_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file: Vec<u8> = (0..1024u32).map(|i| (i * 7 + 3) as u8).collect();
+        std::fs::write(dir.join("PFDATA.BIN"), &file).unwrap();
+        let mut bus = Bus::new();
+        let mut s = gd::CartSdram::new();
+        s.set_write_enable(1);
+        bus.cart_sdram = Some(Box::new(s));
+        bus.gamedrive = Some(gd::GameDrive::new(&dir));
+        for i in 0..n + 4 {
+            bus.write32(dst + (i & !3), 0xEEEE_EEEE);
+        }
+        let h = bus.gamedrive.as_mut().unwrap().fopen("PFDATA.BIN");
+        let mut cpu = M68k::new();
+        cpu.d[0] = h & 0xFFFF; // flags 0 = GD_FREAD_CPU in the high half
+        cpu.d[1] = n;
+        cpu.a[0] = dst;
+        let trap = gd::FN_TRAP.iter().find(|(f, _)| *f == gd::FN_FREAD).unwrap().1;
+        assert!(cpu.gamedrive_trap(&mut bus, trap).is_some());
+        assert_eq!(cpu.d[0], 0, "GD_FRead reports success");
+        assert!(!gd::check_gpu_read_host(&bus), "no GPU host in this bus");
+        let got = (0..n + 4).map(|i| bus.read8(dst + i)).collect();
+        let mut want = file[..n as usize].to_vec();
+        want.extend_from_slice(&[0xEE; 4]);
+        (got, want)
+    }
+
+    /// Platform bench job 198 (platform issue 0012): into the cart window a
+    /// CPU-mode read is exact for whole 32-byte blocks and wrong for every
+    /// other length; into DRAM every length is exact. Job 103's 8-byte read
+    /// gave `01 01 03 03` for `00 01 02 03`, the byte-write fill.
+    #[test]
+    fn a_cpu_read_into_the_cart_window_is_exact_only_in_32_byte_blocks() {
+        for n in [32u32, 64, 256, 512] {
+            let (got, want) = cpu_read(0xA0_0000, n);
+            assert_eq!(got, want, "{n} bytes into the cart window");
+        }
+        for n in [2u32, 8, 30, 34, 62, 66, 254, 258, 510, 514] {
+            let (got, want) = cpu_read(0xA0_0000, n);
+            assert_ne!(got, want, "{n} bytes into the cart window must come back wrong");
+            let whole = (n & !31) as usize;
+            assert_eq!(got[..whole], want[..whole], "{n}: the whole blocks land");
+        }
+        let (got, _) = cpu_read(0xA0_0000, 8);
+        let file: Vec<u8> = (0..8u32).map(|i| (i * 7 + 3) as u8).collect();
+        assert_eq!(got[..8], [file[1], file[1], file[3], file[3], file[5], file[5], file[7], file[7]]);
+        for n in [2u32, 8, 30, 34, 66, 514] {
+            let (got, want) = cpu_read(0x10_0000, n);
+            assert_eq!(got, want, "{n} bytes into DRAM");
+        }
+    }
+
+    /// The host check behind the GPU-mode warning reads G_CTRL's GO bit.
+    #[test]
+    fn the_gpu_read_host_check_follows_g_ctrl() {
+        let mut bus = Bus::new();
+        assert!(!gd::check_gpu_read_host(&bus), "a halted GPU is no host");
+        bus.write32(crate::mem::G_PC, 0xF0_3100);
+        bus.write32(crate::mem::G_CTRL, crate::mem::RISCGO);
+        assert!(gd::check_gpu_read_host(&bus), "a running GPU can host");
     }
 }
