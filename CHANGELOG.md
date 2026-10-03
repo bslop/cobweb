@@ -6,6 +6,20 @@ assigned at release.
 
 ## Unreleased
 
+### 2026-10-03 — jsim: GameDrive reads take the 68000's time (platform issue 0011)
+
+Measured on the bench (job 211, `calib/results/2026-10-03-cpusd.md`).
+
+- A CPU-mode `GD_FRead` cost the 68000 20 clocks in jsim. On silicon it costs 12,900
+  clocks a call plus 47.6 a byte (1 MB in 32 KB calls: 227 fields). A sync GPU-mode
+  read costs 46.6 a byte (737,280 bytes: 155 fields). A game loading in the background
+  ran far ahead of silicon.
+- **Fix:** the 68000 now waits a read out (`gamedrive::read_cost`). It does so in small
+  slices, taking interrupts meanwhile, as silicon kept servicing VI during reads.
+- The delivered bytes no longer count as 68000 bus cycles.
+- All six read cases are within 4% of silicon. Async reads are unchanged: they return
+  at once, and `--sd-rate` times their delivery (about 4,700 bytes a field on the bench).
+
 ### 2026-10-03 — jsim: the 68000 on the MC68000 User's Manual timings (platform issue 0011)
 
 Measured on the bench (job 211, `calib/results/2026-10-03-cpusd.md`).

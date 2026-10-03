@@ -278,6 +278,12 @@ pub struct M68k {
     pub op_tax_cycles: u64,
     /// Nesting depth of interrupt handlers (for ISR-vs-main attribution).
     pub isr_depth: u32,
+    /// Clocks the 68000 still owes a GameDrive BIOS read it is inside (the
+    /// vendor code moves the bytes over SPI), and the interrupt depth it was
+    /// called at: interrupts are taken meanwhile, as on silicon, and the wait
+    /// resumes after their RTE. See `gamedrive::read_cost`.
+    pub gd_busy: u64,
+    gd_busy_depth: u32,
     pub instret: u64,
     /// Set when an unrecognized opcode is hit, for the debugger: (pc, opcode).
     pub last_illegal: Option<u32>,
@@ -327,6 +333,8 @@ impl M68k {
             cart_writes: 0,
             op_tax_cycles: 0,
             isr_depth: 0,
+            gd_busy: 0,
+            gd_busy_depth: 0,
             instret: 0,
             last_illegal: None,
             last_illegal_op: 0,
@@ -464,6 +472,21 @@ impl M68k {
     pub fn step(&mut self, bus: &mut Bus, dbg: &mut Debugger) -> u32 {
         bus.m68k_bus_cycles = 0;
         bus.m68k_write_cycles = 0;
+        // Inside a GameDrive BIOS read: wait it out in small slices, so a due
+        // interrupt is taken on time. The slices are not stretched by the
+        // display: silicon's reads slowed 0-7% under one (job 211), not by the
+        // OP's share.
+        if self.gd_busy > 0 && self.isr_depth == self.gd_busy_depth {
+            let lvl = self.pending_level;
+            let irq = lvl != 0 && self.irq_wait == 0 && (lvl == 7 || lvl > self.int_mask());
+            if !irq {
+                let c = self.gd_busy.min(64) as u32;
+                self.gd_busy -= c as u64;
+                self.cycles += c as u64;
+                self.irq_wait = self.irq_wait.saturating_sub(c);
+                return c;
+            }
+        }
         // Cleared here like `m68k_bus_cycles`: the bus counts every master's
         // DRAM cycles, and the GPU/DSP run between two 68000 steps. Left
         // standing, a GPU looping on DRAM was billed to the 68000's next
@@ -989,6 +1012,9 @@ impl M68k {
                 bus.gamedrive.as_mut()?.fread(d0 as u16, d1)
             } {
                 Some(data) => {
+                    // The bytes are the GameDrive's, not 68000 bus cycles: the
+                    // 68000's time for the read is `gamedrive::read_cost`.
+                    let held = (bus.m68k_bus_cycles, bus.m68k_write_cycles, bus.m68k_dram_cycles);
                     // Whole 32-byte blocks are a DEVICE write (Bus::write8_dma,
                     // run 242 mode 12); the n % 32 bytes after them land as byte
                     // stores, so in the cart window they take the byte-write
@@ -1009,6 +1035,7 @@ impl M68k {
                             bus.write8(at, *b);
                         }
                     }
+                    (bus.m68k_bus_cycles, bus.m68k_write_cycles, bus.m68k_dram_cycles) = held;
                     bus.gamedrive.as_mut()?.set_async_pos(a0.wrapping_add(d1));
                     0 // upstream convention: 0 means SUCCESS, not a byte count
                 }
@@ -1033,6 +1060,15 @@ impl M68k {
             _ => return None,
         };
         self.d[0] = result;
+        if func == gd::FN_FREAD && result == 0 {
+            let mode = (d0 >> 16) as u16;
+            let metered_async = mode == gd::FREAD_GPU_ASYNC
+                && bus.gamedrive.as_ref().is_some_and(|g| g.rate() > 0);
+            if !metered_async {
+                self.gd_busy = gd::read_cost(mode, d1);
+                self.gd_busy_depth = self.isr_depth;
+            }
+        }
         Some(20)
     }
 }
@@ -1358,6 +1394,7 @@ mod gd_fread_tests {
         let trap = gd::FN_TRAP.iter().find(|(f, _)| *f == gd::FN_FREAD).unwrap().1;
         assert!(cpu.gamedrive_trap(&mut bus, trap).is_some());
         assert_eq!(cpu.d[0], 0, "GD_FRead reports success");
+        assert_eq!(cpu.gd_busy, gd::read_cost(0, n), "the 68000 owes the read's time");
         let got = (0..n + 4).map(|i| bus.read8(dst + i)).collect();
         let mut want = file[..n as usize].to_vec();
         want.extend_from_slice(&[0xEE; 4]);
@@ -1388,4 +1425,43 @@ mod gd_fread_tests {
             assert_eq!(got, want, "{n} bytes into DRAM");
         }
     }
+
+    /// Bench job 211: a CPU-mode read costs 12,900 clocks plus 47.6 a byte, a
+    /// sync GPU-mode read 46.6 a byte; an async one returns at once.
+    #[test]
+    fn read_cost_follows_the_bench() {
+        assert_eq!(gd::read_cost(0, 32768), 12_900 + 32768 * 476 / 10);
+        assert_eq!(gd::read_cost(1, 737_280), 12_900 + 737_280 * 466 / 10);
+        assert_eq!(gd::read_cost(2, 65536), 0);
+        // 1 MB in 32 KB calls: 227 fields on silicon (221,652 clocks a field)
+        let f = 32.0 * gd::read_cost(0, 32768) as f64 / 221_652.0;
+        assert!((f - 227.0).abs() < 3.0, "{f}");
+    }
+
+    /// While the 68000 waits out a read, a due interrupt is taken on time and
+    /// the wait resumes after its RTE (silicon kept servicing VI during reads).
+    #[test]
+    fn a_read_wait_takes_interrupts() {
+        let mut bus = Bus::new();
+        bus.write32(64 * 4, 0x5000); // the Jaguar's level-2 vector
+        bus.write16(0x5000, 0x4E73); // rte
+        let mut cpu = M68k::new();
+        cpu.sr = 0x2000;
+        cpu.a[7] = 0x1_0000;
+        cpu.set_pc(0x4000);
+        cpu.gd_busy = 1000;
+        let mut dbg = crate::debug::Debugger::new();
+        assert_eq!(cpu.step(&mut bus, &mut dbg), 64);
+        assert_eq!(cpu.gd_busy, 936);
+        cpu.request_interrupt(2);
+        while cpu.pc != 0x5000 {
+            cpu.step(&mut bus, &mut dbg);
+        }
+        let owed = cpu.gd_busy;
+        cpu.step(&mut bus, &mut dbg); // the handler's rte: no wait inside it
+        assert_eq!((cpu.pc, cpu.gd_busy), (0x4000, owed));
+        cpu.step(&mut bus, &mut dbg);
+        assert!(cpu.gd_busy < owed, "the wait resumes after the RTE");
+    }
+
 }

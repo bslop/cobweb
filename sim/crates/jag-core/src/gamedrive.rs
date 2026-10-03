@@ -329,6 +329,34 @@ pub fn check_gpu_read_host(bus: &mut crate::bus::Bus, gpu: &crate::risc::Risc, f
     report_gpu_read_faults(bus, &faults, pc);
 }
 
+// ── WHAT A READ COSTS THE 68000 ─────────────────────────────────────────────
+//
+// HARDWARE (platform bench `bench/cpusd`, job 211, NTSC, no display). A
+// CPU-mode `GD_FRead` keeps the 68000 inside the vendor code, which clocks the
+// bytes over SPI. 1 MB in 32 KB calls took 227 fields and 512 KB in 4 KB calls
+// 120 (one seek a 64 KB): 12,900 clocks a call plus 47.6 a byte. A sync GPU-mode
+// read waits as long for the GPU to finish: 737,280 bytes, 155 fields, 46.6 a
+// byte. Under an 8bpp + 16bpp display the reads took 5-7% longer, which isn't
+// modelled. Before, jsim charged every read 20 clocks. An async read returns
+// at once; the metered model (`--sd-rate`) times its delivery instead, and
+// 737,280 bytes in 156 fields is about 4,700 bytes a field.
+
+/// Clocks per CPU-mode read call, before its bytes.
+pub const READ_CALL_CLOCKS: u64 = 12_900;
+/// Clocks per byte, tenths: CPU mode, and a sync GPU-mode read.
+pub const READ_CPU_BYTE_X10: u64 = 476;
+pub const READ_GPU_BYTE_X10: u64 = 466;
+
+/// The 68000 clocks a `GD_FRead` of `n` bytes in `mode` (0 CPU, 1 GPU, 2 GPU
+/// async) keeps it inside the BIOS.
+pub fn read_cost(mode: u16, n: u32) -> u64 {
+    match mode {
+        0 => READ_CALL_CLOCKS + n as u64 * READ_CPU_BYTE_X10 / 10,
+        1 => READ_CALL_CLOCKS + n as u64 * READ_GPU_BYTE_X10 / 10,
+        _ => 0,
+    }
+}
+
 /// Build the synthetic GDBIOS block: a version word, a function count, then a
 /// 4-byte `trap #n ; rts` thunk at offset `4*n` for each supported call.
 fn build_bios_block() -> Vec<u8> {
