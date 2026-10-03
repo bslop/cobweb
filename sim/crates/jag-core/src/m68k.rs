@@ -12,20 +12,30 @@
 use crate::bus::Bus;
 use crate::debug::Debugger;
 
-/// Extra 68000 cycles per bus cycle, tenths, by kind. HARDWARE (platform
-/// timing bench `bench/perf.s`, jagq jobs 45-47, NTSC Jaguar, GameDrive
-/// cart mode, code and data in DRAM, OP showing a bare STOP list): three
-/// mixes timed in VI fields, silicon vs this model at the old 0.3 / 0.5 -
-/// fetch-only DBRA loop 63 vs 53, a 16 x `move.l (a0)+` read stream 74 vs
-/// 38, a bytewise copy 113 vs 68. jsim was 1.19x / 1.95x / 1.66x too fast,
-/// in line with calib/NEXT_BENCH.md's own 1.23x / 1.44x / 1.60x. One data
-/// constant cannot fit both the read stream and the copy: writes cost about
-/// twice reads. Fit (exact on the three mixes): fetch 1.3, read 5.1, write
-/// 10.3. Check on a fourth mix not used in the fit (load/add/subq/bne loop):
-/// 85.8 fields predicted against 91 measured (was 62).
-const M68K_FETCH_WAIT_X10: u32 = 13;
-const M68K_READ_WAIT_X10: u32 = 51;
-const M68K_WRITE_WAIT_X10: u32 = 103;
+/// Extra 68000 cycles per bus access, tenths, by kind, on top of the MC68000
+/// User's Manual timings (`m68k/exec.rs`, which count 4 clocks an access).
+/// HARDWARE, NTSC Jaguar, code and data in DRAM, no display (OP on a bare STOP
+/// list), VI fields. Least-squares fit (relative error) on seven loops; the
+/// three constants can't make them all exact (worst -4.5%):
+///
+/// | loop | silicon | model |
+/// |---|---:|---:|
+/// | 60000 x 16 DBRA (fetch only) | 63 | 61.7 |
+/// | 48000 x 16 `move.l (a0)+,d1` | 74 | 74.6 |
+/// | 9000 x 64-byte `move.b (a0)+,(a1)+` copy | 113 | 108.0 |
+/// | 400000 x load/add/subq/bne | 91 | 88.8 |
+/// | 100000 x jcc68k integer arithmetic | 101 | 101.0 |
+/// | 10 x 64 KB jcc68k long copy | 121 | 125.0 |
+/// | 300 x 64 jcc68k struct updates with calls | 83 | 85.9 |
+///
+/// The first four are platform bench `bench/perf.s`, jagq jobs 45-47; the last
+/// three `bench/cpusd`, job 211 (platform issue 0011). Before 2026-10-03 the
+/// instruction timings were per-group constants (every MOVE 8) and these were
+/// 1.3 / 5.1 / 10.3, fitted around them: exact on the first three loops, but
+/// compiled code ran 11-21% slow.
+const M68K_FETCH_WAIT_X10: u32 = 12;
+const M68K_READ_WAIT_X10: u32 = 32;
+const M68K_WRITE_WAIT_X10: u32 = 58;
 
 /// Longest run of same-address 68000 DRAM operand reads that real silicon
 /// survives. **[HW]**, jag_viewpoint 2026-08-18: with the poll count as the
@@ -413,6 +423,8 @@ impl M68k {
     }
     #[inline]
     fn fetch32(&mut self, bus: &mut Bus) -> u32 {
+        // Two instruction-stream words: charged as fetches, not data reads.
+        self.fetch_ba += 2;
         bus.m68k_in_fetch = true;
         let l = bus.read32(self.pc);
         bus.m68k_in_fetch = false;

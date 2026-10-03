@@ -23,6 +23,73 @@ fn sign_extend(v: u32, size: Size) -> u32 {
     }
 }
 
+// ── Instruction timing: the MC68000 User's Manual tables (section 8) ────────
+// Clock periods with zero wait states, each bus access counted as 4. The
+// Jaguar's own bus cost comes on top, per access, in `M68k::step`
+// (M68K_*_WAIT_X10). Until 2026-10-03 these were coarse per-group constants
+// (every MOVE 8, every ADD 6, LEA 4, ...), and the wait constants had been
+// fitted around them: right on the loops they were fitted on, 11-21% slow on
+// compiled code (platform bench job 211, platform issue 0011).
+
+/// Effective-address calculation time (UM table 8-1), byte/word or long.
+fn ea_t(mode: u16, reg: u16, size: Size) -> u32 {
+    let l = size == Size::Long;
+    let (bw, lw) = match mode {
+        0 | 1 => (0, 0),
+        2 | 3 => (4, 8),
+        4 => (6, 10),
+        5 => (8, 12),
+        6 => (10, 14),
+        _ => match reg {
+            0 => (8, 12),  // abs.W
+            1 => (12, 16), // abs.L
+            2 => (8, 12),  // d16(PC)
+            3 => (10, 14), // d8(PC,Xn)
+            4 => (4, 8),   // #imm
+            _ => (0, 0),
+        },
+    };
+    if l { lw } else { bw }
+}
+
+/// A MOVE destination's write time: as `ea_t`, but -(An) costs no more than (An).
+fn move_dst_t(mode: u16, reg: u16, size: Size) -> u32 {
+    if mode == 4 { ea_t(2, reg, size) } else { ea_t(mode, reg, size) }
+}
+
+/// Register direct or immediate: the `.L` ALU forms that cost 2 more.
+fn reg_or_imm(mode: u16, reg: u16) -> bool {
+    mode == 0 || mode == 1 || (mode == 7 && reg == 4)
+}
+
+/// ADD/SUB/AND/OR/EOR (UM table 8-4): `<ea>,Dn` is 4 + ea (long 6 + ea, 8 from
+/// a register or an immediate); `Dn,<ea>` is 8 + ea (long 12 + ea), and EOR
+/// to a data register 4 (long 8).
+fn alu_t(to_ea: bool, mode: u16, reg: u16, size: Size) -> u32 {
+    let l = size == Size::Long;
+    match (to_ea, mode) {
+        (true, 0) => if l { 8 } else { 4 },
+        (true, _) => (if l { 12 } else { 8 }) + ea_t(mode, reg, size),
+        (false, _) if l && reg_or_imm(mode, reg) => 8,
+        (false, _) => (if l { 6 } else { 4 }) + ea_t(mode, reg, size),
+    }
+}
+
+/// Control-addressing time for JMP/JSR/LEA/PEA/MOVEM (UM table 8-9), by mode,
+/// as (An), d16(An), d8(An,Xn), abs.W, abs.L, d16(PC), d8(PC,Xn).
+fn ctl_t(mode: u16, reg: u16, t: [u32; 7]) -> u32 {
+    match (mode, reg) {
+        (2, _) | (3, _) | (4, _) => t[0],
+        (5, _) => t[1],
+        (6, _) => t[2],
+        (7, 0) => t[3],
+        (7, 1) => t[4],
+        (7, 2) => t[5],
+        (7, 3) => t[6],
+        _ => t[0],
+    }
+}
+
 impl M68k {
     pub(super) fn execute(&mut self, bus: &mut Bus, op: u16) -> u32 {
         match op >> 12 {
@@ -68,7 +135,7 @@ impl M68k {
         // BTST/BCHG/BCLR/BSET with immediate bit number: 0000 1000 ssmmm rrr
         if (op & 0xFF00) == 0x0800 {
             let bitnum = self.fetch16(bus) & 0xFF;
-            return self.bitop(bus, mode, reg, (op >> 6) & 3, bitnum as u32);
+            return self.bitop(bus, mode, reg, (op >> 6) & 3, bitnum as u32) + 4;
         }
         // Dynamic bit ops: 0000 ddd1 ttmmm rrr (handled in groupc style? no) —
         // bit ops with bit number in Dn have bit8 set.
@@ -129,10 +196,21 @@ impl M68k {
             6 => {
                 // CMPI
                 self.do_cmp(imm, d, size);
+                return match (mode, size) {
+                    (0, Size::Long) => 14,
+                    (0, _) => 8,
+                    (_, Size::Long) => 12 + ea_t(mode, reg, size),
+                    _ => 8 + ea_t(mode, reg, size),
+                };
             }
             _ => return self.illegal(bus, op),
         }
-        12
+        match (mode, size) {
+            (0, Size::Long) => 16,
+            (0, _) => 8,
+            (_, Size::Long) => 20 + ea_t(mode, reg, size),
+            _ => 12 + ea_t(mode, reg, size),
+        }
     }
 
     fn imm_to_sr_ccr(&mut self, opc: u16, size: Size, imm: u32, bus: &mut Bus, op: u16) -> u32 {
@@ -163,15 +241,20 @@ impl M68k {
         let v = self.ea_read(bus, ea, size);
         let mask = 1u32 << bit;
         self.set_flag(FLAG_Z, v & mask == 0);
+        // UM table 8-7, the dynamic (Dn bit number) form; static adds 4.
         let nv = match kind {
-            0 => return 6, // BTST: test only
+            0 => return if mode == 0 { 6 } else { 4 + ea_t(mode, reg, size) }, // BTST
             1 => v ^ mask, // BCHG
             2 => v & !mask, // BCLR
             3 => v | mask, // BSET
             _ => v,
         };
         self.ea_write(bus, ea, size, nv);
-        8
+        match (mode, kind) {
+            (0, 2) => 10,
+            (0, _) => 8,
+            _ => 8 + ea_t(mode, reg, size),
+        }
     }
 
     // ── MOVE / MOVEA ─────────────────────────────────────────────────────────
@@ -188,12 +271,12 @@ impl M68k {
             // MOVEA: word source sign-extends to 32; no flags.
             let val = sign_extend(v, size);
             self.a[dst_reg as usize] = val;
-            return 4;
+            return 4 + ea_t(src_mode, src_reg, size);
         }
         let dea = self.decode_ea(bus, dst_mode, dst_reg, size);
         self.ea_write(bus, dea, size, v);
         self.do_logic_flags(v, size); // MOVE sets N,Z; clears V,C
-        8
+        4 + ea_t(src_mode, src_reg, size) + move_dst_t(dst_mode, dst_reg, size)
     }
 
     fn moveq(&mut self, op: u16) -> u32 {
@@ -223,7 +306,7 @@ impl M68k {
             if let Ea::Mem(a) = ea {
                 self.a[an] = a;
             }
-            return 4;
+            return ctl_t(mode, reg, [4, 8, 12, 8, 12, 8, 12]);
         }
         // CHK Dn,<ea> (word)
         if op & 0xF1C0 == 0x4180 {
@@ -236,7 +319,7 @@ impl M68k {
                 self.set_flag(FLAG_N, v < 0);
                 return self.exception(bus, 6, false);
             }
-            return 10;
+            return 10 + ea_t(mode, reg, Size::Word);
         }
         // SWAP Dn (must precede PEA, which shares the 0x4840 prefix).
         if op & 0xFFF8 == 0x4840 {
@@ -254,7 +337,7 @@ impl M68k {
             if let Ea::Mem(a) = ea {
                 self.push32(bus, a);
             }
-            return 12;
+            return ctl_t(mode, reg, [12, 16, 20, 16, 20, 16, 20]);
         }
         // EXT.W / EXT.L (must precede MOVEM, which shares 0x4880/0x48C0).
         if op & 0xFFF8 == 0x4880 {
@@ -296,7 +379,7 @@ impl M68k {
             self.set_flag(FLAG_V, false);
             self.set_flag(FLAG_C, false);
             self.ea_write(bus, ea, Size::Byte, v | 0x80);
-            return 10;
+            return if mode == 0 { 4 } else { 14 + ea_t(mode, reg, Size::Byte) };
         }
         if op & 0xFF00 == 0x4A00 {
             let size = match size_from_bits(sizebits) {
@@ -306,7 +389,7 @@ impl M68k {
             let ea = self.decode_ea(bus, mode, reg, size);
             let v = self.ea_read(bus, ea, size);
             self.do_logic_flags(v, size);
-            return 4;
+            return 4 + ea_t(mode, reg, size);
         }
         // NEGX / CLR / NEG / NOT.
         let kind = (op >> 8) & 0xF;
@@ -342,7 +425,12 @@ impl M68k {
                 }
                 _ => unreachable!(),
             }
-            return 8;
+            return match (mode, size) {
+                (0, Size::Long) => 6,
+                (0, _) => 4,
+                (_, Size::Long) => 12 + ea_t(mode, reg, size),
+                _ => 8 + ea_t(mode, reg, size),
+            };
         }
         self.illegal(bus, op)
     }
@@ -356,6 +444,7 @@ impl M68k {
                 let ea = self.decode_ea(bus, mode, reg, Size::Word);
                 let sr = self.sr;
                 self.ea_write(bus, ea, Size::Word, sr as u32);
+                return if mode == 0 { 6 } else { 8 + ea_t(mode, reg, Size::Word) };
             }
             2 => {
                 // MOVE to CCR (word source, low byte)
@@ -374,7 +463,7 @@ impl M68k {
             }
             _ => return self.illegal(bus, op),
         }
-        12
+        12 + ea_t(mode, reg, Size::Word)
     }
 
     fn group4_e(&mut self, bus: &mut Bus, op: u16) -> u32 {
@@ -487,7 +576,7 @@ impl M68k {
                         self.push32(bus, self.pc);
                         self.pc = a;
                     }
-                    return 16;
+                    return ctl_t(mode, reg, [16, 18, 22, 18, 20, 18, 22]);
                 }
                 if op & 0xFFC0 == 0x4EC0 {
                     // JMP
@@ -495,7 +584,7 @@ impl M68k {
                     if let Ea::Mem(a) = ea {
                         self.pc = a;
                     }
-                    return 8;
+                    return ctl_t(mode, reg, [8, 10, 14, 10, 12, 10, 14]);
                 }
                 // LEA (0100 ddd1 11mmm rrr)
                 if op & 0xF1C0 == 0x41C0 {
@@ -504,7 +593,7 @@ impl M68k {
                     if let Ea::Mem(a) = ea {
                         self.a[an] = a;
                     }
-                    return 4;
+                    return ctl_t(mode, reg as u16, [4, 8, 12, 8, 12, 8, 12]);
                 }
                 // MOVEM memory→registers (0100 1100 1ssm mmrrr, dr=1)
                 if op & 0xFB80 == 0x4880 {
@@ -585,7 +674,13 @@ impl M68k {
                 }
             }
         }
-        8 + count * if size == Size::Long { 8 } else { 4 }
+        let per = if size == Size::Long { 8 } else { 4 };
+        let base = if to_regs {
+            ctl_t(mode, reg as u16, [12, 16, 18, 16, 20, 16, 18])
+        } else {
+            ctl_t(mode, reg as u16, [8, 12, 14, 12, 16, 8, 8])
+        };
+        base + count * per
     }
 
     // ── 0x5: ADDQ/SUBQ, Scc, DBcc ────────────────────────────────────────────
@@ -607,6 +702,7 @@ impl M68k {
                         self.pc = self.pc.wrapping_sub(2).wrapping_add(disp as u32);
                         return 10;
                     }
+                    return 14;
                 }
                 return 12;
             }
@@ -614,7 +710,10 @@ impl M68k {
             let ea = self.decode_ea(bus, mode, reg, Size::Byte);
             let v = if self.cond(cc) { 0xFF } else { 0x00 };
             self.ea_write(bus, ea, Size::Byte, v);
-            return 8;
+            return match mode {
+                0 => if v != 0 { 6 } else { 4 },
+                _ => 8 + ea_t(mode, reg, Size::Byte),
+            };
         }
         // ADDQ / SUBQ
         let size = size_from_bits(sizebits).unwrap();
@@ -641,7 +740,12 @@ impl M68k {
             self.do_add(data, d, size, false)
         };
         self.ea_write(bus, ea, size, r);
-        8
+        match (mode, size) {
+            (0, Size::Long) => 8,
+            (0, _) => 4,
+            (_, Size::Long) => 12 + ea_t(mode, reg, size),
+            _ => 8 + ea_t(mode, reg, size),
+        }
     }
 
     // ── 0x6: Bcc / BRA / BSR ─────────────────────────────────────────────────
@@ -673,6 +777,8 @@ impl M68k {
                 if self.cond(cc) {
                     self.pc = target;
                     10
+                } else if disp8 == 0 {
+                    12
                 } else {
                     8
                 }
@@ -707,13 +813,15 @@ impl M68k {
                 };
                 if overflow {
                     self.set_flag(FLAG_V, true);
-                    return 78;
+                    return 10 + ea_t(mode, reg, Size::Word);
                 }
                 self.d[dn] = ((rem & 0xFFFF) << 16) | (quot & 0xFFFF);
                 self.set_flag(FLAG_C, false);
                 self.set_flag(FLAG_V, false);
                 self.set_nz(quot & 0xFFFF, Size::Word);
-                140
+                // The UM gives the worst case (DIVU 140, DIVS 158) and says
+                // the best is within 10% of it.
+                (if signed { 158 } else { 140 }) + ea_t(mode, reg, Size::Word)
             }
             _ => {
                 // OR
@@ -735,7 +843,7 @@ impl M68k {
                     self.do_logic_flags(r, size);
                     self.d[dn] = (self.d[dn] & !size.mask()) | r;
                 }
-                6
+                alu_t(to_ea, mode, reg, size)
             }
         }
     }
@@ -757,7 +865,11 @@ impl M68k {
             } else {
                 self.a[dn].wrapping_sub(s)
             };
-            return 8;
+            return match size {
+                Size::Long if reg_or_imm(mode, reg) => 8,
+                Size::Long => 6 + ea_t(mode, reg, size),
+                _ => 8 + ea_t(mode, reg, size),
+            };
         }
 
         let size = match size_from_bits(opmode & 3) {
@@ -779,7 +891,7 @@ impl M68k {
                 self.do_sub(s, d, size, true)
             };
             self.d[dn] = (self.d[dn] & !size.mask()) | (r & size.mask());
-            return 8;
+            return if size == Size::Long { 8 } else { 4 };
         }
         let ea = self.decode_ea(bus, mode, reg, size);
         if to_ea {
@@ -801,7 +913,7 @@ impl M68k {
             };
             self.d[dn] = (self.d[dn] & !size.mask()) | (r & size.mask());
         }
-        6
+        alu_t(to_ea, mode, reg, size)
     }
 
     // ── 0xB: CMP / CMPA / CMPM / EOR ─────────────────────────────────────────
@@ -817,7 +929,7 @@ impl M68k {
             let ea = self.decode_ea(bus, mode, reg, size);
             let s = sign_extend(self.ea_read(bus, ea, size), size);
             self.do_cmp(s, self.a[dn], Size::Long);
-            return 6;
+            return 6 + ea_t(mode, reg, size);
         }
         let size = size_from_bits(opmode & 3).unwrap();
         if opmode & 4 != 0 {
@@ -831,20 +943,20 @@ impl M68k {
                 let s = self.ea_read(bus, sea, size);
                 let d = self.ea_read(bus, dea, size);
                 self.do_cmp(s, d, size);
-                return 12;
+                return if size == Size::Long { 20 } else { 12 };
             }
             let ea = self.decode_ea(bus, mode, reg, size);
             let d = self.ea_read(bus, ea, size);
             let r = (d ^ self.d[dn]) & size.mask();
             self.do_logic_flags(r, size);
             self.ea_write(bus, ea, size, r);
-            8
+            alu_t(true, mode, reg, size)
         } else {
             // CMP Dn
             let ea = self.decode_ea(bus, mode, reg, size);
             let s = self.ea_read(bus, ea, size);
             self.do_cmp(s, self.d[dn], size);
-            6
+            (if size == Size::Long { 6 } else { 4 }) + ea_t(mode, reg, size)
         }
     }
 
@@ -866,11 +978,15 @@ impl M68k {
                 } else {
                     s * d
                 };
+                // 38 + 2n: n = the source's 1 bits (MULU), or its 01/10 bit
+                // pairs with a 0 appended below (MULS).
+                let n = if opmode == 7 { ((s << 1) ^ s) & 0xFFFF } else { s }.count_ones();
+                let t = 38 + 2 * n + ea_t(mode, reg, Size::Word);
                 self.d[dn] = r;
                 self.set_flag(FLAG_C, false);
                 self.set_flag(FLAG_V, false);
                 self.set_nz(r, Size::Long);
-                74
+                t
             }
             _ => {
                 // EXG (opmode 5 with specific sub-encodings) else AND.
@@ -910,7 +1026,7 @@ impl M68k {
                     self.do_logic_flags(r, size);
                     self.d[dn] = (self.d[dn] & !size.mask()) | r;
                 }
-                6
+                alu_t(to_ea, mode, reg, size)
             }
         }
     }
@@ -928,7 +1044,7 @@ impl M68k {
             let v = self.ea_read(bus, ea, Size::Word);
             let r = self.shift_one(v, Size::Word, kind & 3, left);
             self.ea_write(bus, ea, Size::Word, r);
-            return 8;
+            return 8 + ea_t(mode, reg, Size::Word);
         }
         let size = size_from_bits(sizebits).unwrap();
         let reg = (op & 7) as usize;
@@ -958,7 +1074,7 @@ impl M68k {
             self.set_nz(v, size);
         }
         self.d[reg] = (self.d[reg] & !size.mask()) | (v & size.mask());
-        6 + 2 * count
+        (if size == Size::Long { 8 } else { 6 }) + 2 * count
     }
 
     /// One shift/rotate step (kind: 0=AS,1=LS,2=ROX,3=RO), updating C/X/V.

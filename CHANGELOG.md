@@ -6,6 +6,22 @@ assigned at release.
 
 ## Unreleased
 
+### 2026-10-03 — jsim: the 68000 on the MC68000 User's Manual timings (platform issue 0011)
+
+Measured on the bench (job 211, `calib/results/2026-10-03-cpusd.md`).
+
+- jsim ran jcc68k-compiled code 12-27% slower than silicon. Its 68000 instruction
+  timings were per-group constants (every MOVE 8 clocks, every ADD 6, LEA 4), and the
+  bus-wait constants had been fitted around them on three loops.
+- **Fix:** the instruction timings are now the User's Manual tables: per size and
+  addressing mode, MULU/MULS by operand bits, DBcc and Bcc forms, MOVEM per register.
+- `fetch32` (long immediates, absolute-long addresses) now counts as two instruction
+  fetches, not two data reads.
+- The waits are refitted on seven silicon loops (`bench/perf.s` jobs 45-47 and
+  `bench/cpusd` job 211): fetch 1.2, read 3.2, write 5.8 extra clocks an access (were
+  1.3 / 5.1 / 10.3). All seven are within 4.5%. On job 211's ROM, compiled code is now
+  within 0-5.5% of silicon under every display (was +12% to +27%).
+
 ### 2026-10-03 — jsim: GameDrive GPU-mode reads check their GPU host (platform issue 0014)
 
 On silicon a GPU-mode `GD_FRead` (`GD_FREAD_GPU`, `GD_FREAD_GPU_ASYNC`) moves its data in
