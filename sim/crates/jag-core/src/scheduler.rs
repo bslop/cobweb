@@ -106,6 +106,11 @@ impl Scheduler {
         dsp: &mut Risc,
         bus: &mut Bus,
     ) {
+        // A GPU-mode GameDrive read the 68000 just issued: check its host now,
+        // before the GPU runs on (gamedrive::check_gpu_read_host).
+        if bus.gamedrive.as_ref().is_some_and(|g| g.gpu_read_issued.is_some()) {
+            crate::gamedrive::check_gpu_read_host(bus, gpu, false);
+        }
         self.cycle_acc += cpu_cycles as i64;
         while self.cycle_acc >= self.cpu_cycles_per_half_line {
             self.cycle_acc -= self.cpu_cycles_per_half_line;
@@ -122,6 +127,9 @@ impl Scheduler {
                 // boundary is the coarsest granularity at which a loader's
                 // wait loop still behaves the same, and it keeps the model
                 // deterministic. No-op unless --sd-rate is set.
+                // Before it does: the host rules, which silicon needs for every
+                // block (platform issue 0014).
+                crate::gamedrive::check_gpu_read_host(bus, gpu, true);
                 crate::gamedrive::tick_frame(bus);
                 // Liveness: a core still running here has not stopped all field.
                 gpu.note_frame();

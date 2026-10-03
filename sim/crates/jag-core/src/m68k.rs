@@ -896,14 +896,33 @@ impl M68k {
             eprintln!("GDTRAP #{trap} d0={d0:#010X} d1={d1:#010X} a0={a0:#010X}");
         }
         let func = gd::fn_of_trap(trap)?;
-        if func == gd::FN_FREAD && matches!(d0 >> 16, 1 | 2) {
-            gd::check_gpu_read_host(bus);
+        // The BIOS call's return address (inside the bindings), for reports.
+        let site = {
+            let mut b = [0u8; 4];
+            bus.peek(self.a[7], &mut b);
+            u32::from_be_bytes(b)
+        };
+        let gpu_mode = func == gd::FN_FREAD && matches!(d0 >> 16, 1 | 2);
+        if func == gd::FN_FREAD && bus.gamedrive.as_ref().is_some_and(|g| g.async_active() != 0) {
+            // A read of any mode while an async one is outstanding: the
+            // hardware has one transfer (platform lib/gd README, rule 7).
+            gd::report_gpu_read_faults(bus, &[("gd_cpu_read_during_async", a0)], site);
+        }
+        if gpu_mode {
+            // The scheduler checks the host rules with the GPU in hand
+            // (gamedrive::check_gpu_read_host, platform issue 0014).
+            bus.gamedrive.as_mut()?.gpu_read_issued = Some(site);
         }
         let result = match func {
-            // INIT and InitGPURead have no host-side state to set up; the point
-            // of publishing InitGPURead is that the hardware-correct call
-            // sequence must not fault here. See gamedrive::FN_TRAP.
-            gd::FN_INIT | gd::FN_INITGPUREAD => 0,
+            // INIT has no host-side state to set up.
+            gd::FN_INIT => 0,
+            // InitGPURead writes GPU RAM as on silicon: the interrupt-1 vector
+            // at $F03010 and its 224-byte handler (gamedrive::init_gpu_read).
+            gd::FN_INITGPUREAD => {
+                bus.gamedrive.as_ref()?;
+                gd::init_gpu_read(bus, a0, d0 as u16);
+                0
+            }
             // ── the cartridge SDRAM (run 242) ───────────────────────────────
             // Register ABI read from JagGD/gdbios_bindings.s, NOT inferred:
             //   GD_ROMWriteEnable(u16 flags)      d0.w = flags
@@ -946,13 +965,17 @@ impl M68k {
                 if (d0 >> 16) == gd::FREAD_GPU_ASYNC as u32
                     && bus.gamedrive.as_ref().is_some_and(|g| g.rate() > 0) =>
             {
-                if bus.gamedrive.as_mut()?.fread_async_start(d0 as u16, a0, d1) {
+                if bus.gamedrive.as_mut()?.fread_async_start(d0 as u16, a0, d1, site) {
                     0
                 } else {
                     u32::MAX
                 }
             }
-            gd::FN_FREAD => match bus.gamedrive.as_mut()?.fread(d0 as u16, d1) {
+            gd::FN_FREAD => match if gpu_mode {
+                bus.gamedrive.as_mut()?.fread_blocks(d0 as u16, d1)
+            } else {
+                bus.gamedrive.as_mut()?.fread(d0 as u16, d1)
+            } {
                 Some(data) => {
                     // Whole 32-byte blocks are a DEVICE write (Bus::write8_dma,
                     // run 242 mode 12); the n % 32 bytes after them land as byte
@@ -963,7 +986,8 @@ impl M68k {
                     // 8 bytes read `01 01 03 03`. Only pass/fail per length was
                     // measured, with a long-aligned destination: that a longer
                     // read's whole blocks survive and only its tail is filled is
-                    // the inference this model makes. The GPU modes are unchanged.
+                    // the inference this model makes. The GPU modes deliver
+                    // whole 32-byte blocks (`fread_blocks`), so all of it.
                     let whole = data.len() & !31;
                     for (i, b) in data.iter().enumerate() {
                         let at = a0.wrapping_add(i as u32);
@@ -1322,7 +1346,6 @@ mod gd_fread_tests {
         let trap = gd::FN_TRAP.iter().find(|(f, _)| *f == gd::FN_FREAD).unwrap().1;
         assert!(cpu.gamedrive_trap(&mut bus, trap).is_some());
         assert_eq!(cpu.d[0], 0, "GD_FRead reports success");
-        assert!(!gd::check_gpu_read_host(&bus), "no GPU host in this bus");
         let got = (0..n + 4).map(|i| bus.read8(dst + i)).collect();
         let mut want = file[..n as usize].to_vec();
         want.extend_from_slice(&[0xEE; 4]);
@@ -1352,15 +1375,5 @@ mod gd_fread_tests {
             let (got, want) = cpu_read(0x10_0000, n);
             assert_eq!(got, want, "{n} bytes into DRAM");
         }
-    }
-
-    /// The host check behind the GPU-mode warning reads G_CTRL's GO bit.
-    #[test]
-    fn the_gpu_read_host_check_follows_g_ctrl() {
-        let mut bus = Bus::new();
-        assert!(!gd::check_gpu_read_host(&bus), "a halted GPU is no host");
-        bus.write32(crate::mem::G_PC, 0xF0_3100);
-        bus.write32(crate::mem::G_CTRL, crate::mem::RISCGO);
-        assert!(gd::check_gpu_read_host(&bus), "a running GPU can host");
     }
 }

@@ -118,7 +118,8 @@ const BIOS_BLOCK: usize = 512;
 /// which looks like corrupt data, not like a dispatch bug.
 pub const FN_TRAP: [(u8, u8); 15] = [
     (FN_INIT, 1),
-    // GD_InitGPURead. A no-op here, but it MUST have a thunk: on hardware the
+    // GD_InitGPURead. Writes GPU RAM as silicon does (`init_gpu_read`) and arms
+    // the host checks; it MUST have a thunk: on hardware the
     // async read modes do nothing until it installs the GPU interrupt handler,
     // so correct ROM code calls it first. With no entry, `jsr 8(%a6)` lands on
     // zeros — i.e. the hardware-correct sequence would be the one that crashes,
@@ -151,28 +152,181 @@ pub fn fn_of_trap(trap: u8) -> Option<u8> {
     FN_TRAP.iter().find(|(_, t)| *t == trap).map(|(f, _)| *f)
 }
 
-/// A GPU-mode `GD_FRead` (GPU or GPU async) moves its data in the GPU's
-/// interrupt handler. Here it completes without one; on silicon a read issued
-/// while the GPU is halted never completes, and the GameDrive is left
-/// mid-transfer until a power cycle (vendor `JagGD/README.md`; notes "the
-/// GameDrive GPU-async read", item 4). Warn once when the GPU isn't running.
-/// Hosts that work on silicon: platform `lib/gd` README, "GPU-mode reads"
-/// (bench jobs 190-200, platform issue 0012). Returns whether the GPU runs.
-pub fn check_gpu_read_host(bus: &crate::bus::Bus) -> bool {
-    let mut ctrl = [0u8; 4];
-    bus.peek(crate::mem::G_CTRL, &mut ctrl);
-    if u32::from_be_bytes(ctrl) & crate::mem::RISCGO != 0 {
-        return true;
+// ── GPU-MODE READS: THE HOST RULES (platform issues 0012, 0014) ─────────────
+//
+// On silicon a GPU-mode `GD_FRead` (`GD_FREAD_GPU`, `GD_FREAD_GPU_ASYNC`) moves
+// its data in the GPU's interrupt-1 handler, 32 bytes an interrupt: the cart
+// raises Jerry's external interrupt, Jerry passes it to the GPU, and the GPU
+// runs the vendor handler `GD_InitGPURead` installed. Here the bytes are
+// copied by the trap, with no GPU involved, so a ROM whose host is broken
+// passes in jsim and hangs the console until a power cycle (platform bench
+// jobs 158 and 190-200; vendor `JagGD/README.md`; platform `lib/gd` README,
+// "GPU-mode reads"). The vendor handler's code is closed, so delivery through
+// it isn't modelled. Instead every rule the hardware needs is CHECKED, at each
+// GPU-mode read and at every field while a metered async read is outstanding:
+// a warning per rule (once), and `--strict=gd-gpu` stops the run.
+
+/// The `StrictFault::kind`s of the GPU-read host rules (`--strict=gd-gpu`).
+pub const GPU_READ_FAULTS: &[&str] = &[
+    "gd_gpu_no_init",
+    "gd_gpu_vector_overwritten",
+    "gd_gpu_handler_overwritten",
+    "gd_gpu_halted",
+    "gd_gpu_no_dspena",
+    "gd_gpu_no_extena",
+    "gd_gpu_kernel_on_bank0",
+    "gd_gpu_bad_stack",
+    "gd_cpu_read_during_async",
+];
+
+/// What each fault means on silicon, for the warning.
+fn gpu_read_fault_text(kind: &str) -> &'static str {
+    match kind {
+        "gd_gpu_no_init" => "GD_InitGPURead was never called, so the GPU has no read handler",
+        "gd_gpu_vector_overwritten" => "the GPU interrupt-1 vector at $F03010 changed after GD_InitGPURead \
+             (a GPU upload over $F03000-$F0304F?); call it after every upload",
+        "gd_gpu_handler_overwritten" => "the 224-byte read handler GD_InitGPURead installed was overwritten",
+        "gd_gpu_halted" => "the GPU is halted: it takes no interrupt, so the read never finishes",
+        "gd_gpu_no_dspena" => "G_FLAGS lacks G_DSPENA (bit 5): the GPU ignores Jerry's interrupt",
+        "gd_gpu_no_extena" => "J_INT ($F10020) lacks J_EXTENA (bit 0): the cart's interrupt never reaches the GPU",
+        "gd_gpu_kernel_on_bank0" => "the GPU kernel runs on register bank 0, which the handler uses \
+             (r31 as its stack; r24-r31 with GD_GPU_READ_FAST): set REGPAGE from the GPU",
+        "gd_gpu_bad_stack" => "bank-0 r31, the handler's stack, isn't a long-aligned stack in GPU RAM or DRAM \
+             clear of $F03000-$F0304F and the handler",
+        "gd_cpu_read_during_async" => "a CPU-mode read was issued while a GPU async read is outstanding",
+        _ => "",
     }
-    static WARNED: std::sync::Once = std::sync::Once::new();
-    WARNED.call_once(|| {
-        eprintln!("jsim WARNING: a GPU-mode gd_fread was issued with the GPU halted. \
-                   It completes here, but on silicon the GPU's interrupt handler \
-                   moves the data: the read never finishes and the GameDrive needs \
-                   a power cycle. Start a GPU host first (GD_InitGPURead, G_DSPENA, \
-                   J_EXTENA, the GPU running).");
-    });
-    false
+}
+
+/// The interrupt-1 vector long `GD_InitGPURead` leaves at `$F03010`.
+/// MEASURED for `gpu_buf = $F03E00` (platform bench jobs 190-200):
+/// `$981E3E0C`, i.e. the first two words of `movei #(gpu_buf + 12),r30`. The low word for another `gpu_buf` follows that encoding (inferred).
+pub fn gpu_read_vector(gpu_buf: u32) -> u32 {
+    0x981E_0000 | (gpu_buf.wrapping_add(12) & 0xFFFF)
+}
+
+/// Bytes of GPU RAM `GD_InitGPURead` claims at `gpu_buf` (vendor README).
+pub const GPU_READ_HANDLER_BYTES: u32 = 224;
+/// GPU RAM, and the interrupt vectors at its start the BIOS patches.
+const GPU_RAM: std::ops::Range<u32> = 0xF0_3000..0xF0_4000;
+const GPU_VECTORS: std::ops::Range<u32> = 0xF0_3000..0xF0_3050;
+
+/// What `GD_InitGPURead` installed, as it was right after the call.
+#[derive(Clone)]
+pub struct GpuReadHost {
+    pub buf: u32,
+    pub fast: bool,
+    pub vector: u32,
+    pub handler: Vec<u8>,
+}
+
+/// FN_INITGPUREAD: write what silicon writes into GPU RAM, and remember it.
+/// The handler's own bytes are the vendor's (closed): its 224 bytes are filled
+/// with GPU `nop`s here, so a program sharing that RAM is clobbered as it
+/// would be on silicon.
+pub fn init_gpu_read(bus: &mut crate::bus::Bus, gpu_buf: u32, flags: u16) {
+    let buf = gpu_buf & !3;
+    for k in 0..GPU_READ_HANDLER_BYTES / 4 {
+        bus.write32(buf + 4 * k, 0xE400_E400);
+    }
+    let vector = gpu_read_vector(buf);
+    bus.write32(0xF0_3010, vector);
+    let mut handler = vec![0u8; GPU_READ_HANDLER_BYTES as usize];
+    bus.peek(buf, &mut handler);
+    if let Some(gd) = bus.gamedrive.as_mut() {
+        gd.host = Some(GpuReadHost { buf, fast: flags & 1 != 0, vector, handler });
+    }
+}
+
+fn peek32(bus: &crate::bus::Bus, a: u32) -> u32 {
+    let mut b = [0u8; 4];
+    bus.peek(a, &mut b);
+    u32::from_be_bytes(b)
+}
+
+/// The host rules a GPU-mode read needs, against the machine as it is now.
+/// Returns the broken ones as `(kind, address)`, most basic first.
+pub fn gpu_read_host_faults(bus: &crate::bus::Bus, gpu: &crate::risc::Risc) -> Vec<(&'static str, u32)> {
+    let mut out = Vec::new();
+    let host = bus.gamedrive.as_ref().and_then(|g| g.host.clone());
+    match &host {
+        None => out.push(("gd_gpu_no_init", 0xF0_3010)),
+        Some(h) => {
+            if peek32(bus, 0xF0_3010) != h.vector {
+                out.push(("gd_gpu_vector_overwritten", 0xF0_3010));
+            }
+            let mut now = vec![0u8; h.handler.len()];
+            bus.peek(h.buf, &mut now);
+            if let Some(k) = (0..now.len()).find(|&k| now[k] != h.handler[k]) {
+                out.push(("gd_gpu_handler_overwritten", h.buf + k as u32));
+            }
+        }
+    }
+    let running = peek32(bus, crate::mem::G_CTRL) & crate::mem::RISCGO != 0;
+    if !running {
+        out.push(("gd_gpu_halted", crate::mem::G_CTRL));
+    } else {
+        if gpu.flags & 0x20 == 0 {
+            out.push(("gd_gpu_no_dspena", crate::mem::G_FLAGS));
+        }
+        if gpu.flags & crate::mem::REGPAGE == 0 {
+            out.push(("gd_gpu_kernel_on_bank0", crate::mem::G_FLAGS));
+        }
+        // The interrupt pushes the return address through r31; PRESERVE then
+        // pushes 4 longs (vendor README).
+        let sp = gpu.regs[0][31];
+        let need = if host.as_ref().is_some_and(|h| h.fast) { 4 } else { 20 };
+        let lo = sp.wrapping_sub(need);
+        let inside = |r: &std::ops::Range<u32>| r.start <= lo && sp <= r.end;
+        let overlaps = |a: u32, b: u32| lo < b && a < sp;
+        let bad = sp & 3 != 0
+            || lo > sp
+            || !(inside(&GPU_RAM) || inside(&(0..0x20_0000)))
+            || overlaps(GPU_VECTORS.start, GPU_VECTORS.end)
+            || host.as_ref().is_some_and(|h| overlaps(h.buf, h.buf + GPU_READ_HANDLER_BYTES));
+        if bad {
+            out.push(("gd_gpu_bad_stack", sp));
+        }
+    }
+    let mut jint = [0u8; 2];
+    bus.peek(crate::mem::J_INT, &mut jint);
+    if u16::from_be_bytes(jint) & 1 == 0 {
+        out.push(("gd_gpu_no_extena", crate::mem::J_INT));
+    }
+    out
+}
+
+/// Report broken host rules: a warning per rule (once per run), and a strict
+/// fault (`--strict=gd-gpu`) at the first one. `pc` is the 68000 call site.
+pub fn report_gpu_read_faults(bus: &mut crate::bus::Bus, faults: &[(&'static str, u32)], pc: u32) {
+    for &(kind, addr) in faults {
+        let Some(gd) = bus.gamedrive.as_mut() else { return };
+        let bit = 1u32 << GPU_READ_FAULTS.iter().position(|k| *k == kind).unwrap_or(31);
+        if gd.warned & bit == 0 {
+            gd.warned |= bit;
+            eprintln!("jsim WARNING: GameDrive GPU-mode read at 68000 pc ${pc:06X}: {} \
+                       (address ${addr:06X}). It completes here; on silicon it never does, \
+                       and the GameDrive needs a power cycle. Rules: platform lib/gd README, \
+                       \"GPU-mode reads\".", gpu_read_fault_text(kind));
+        }
+        if bus.strict.gd_gpu {
+            bus.strict_trip_68k(kind, pc, addr);
+        }
+    }
+}
+
+/// Check the host rules if a GPU-mode read was issued since the last check,
+/// or at a field boundary (`field`) while an async read is outstanding. Called
+/// by the scheduler, which has the GPU at hand; the trap only has the bus.
+pub fn check_gpu_read_host(bus: &mut crate::bus::Bus, gpu: &crate::risc::Risc, field: bool) {
+    let Some(gd) = bus.gamedrive.as_mut() else { return };
+    let pc = match gd.gpu_read_issued.take() {
+        Some(pc) => pc,
+        None if field && gd.xfer.is_some() => gd.xfer_pc,
+        None => return,
+    };
+    let faults = gpu_read_host_faults(bus, gpu);
+    report_gpu_read_faults(bus, &faults, pc);
 }
 
 /// Build the synthetic GDBIOS block: a version word, a function count, then a
@@ -243,6 +397,14 @@ pub struct GameDrive {
     rate: u32,
     /// The transfer in flight, if any (at most one — the hardware has one DMA).
     xfer: Option<AsyncXfer>,
+    /// The 68000 PC of the async read in flight, for the host checks.
+    xfer_pc: u32,
+    /// What `GD_InitGPURead` installed (`init_gpu_read`), if it ran.
+    pub host: Option<GpuReadHost>,
+    /// Set by a GPU-mode read (its 68000 PC); the scheduler checks the host.
+    pub gpu_read_issued: Option<u32>,
+    /// GPU_READ_FAULTS already warned about (bit per kind).
+    warned: u32,
 }
 
 impl GameDrive {
@@ -261,6 +423,10 @@ impl GameDrive {
             async_pos: 0,
             rate: 0,
             xfer: None,
+            xfer_pc: 0,
+            host: None,
+            gpu_read_issued: None,
+            warned: 0,
         }
     }
 
@@ -285,10 +451,11 @@ impl GameDrive {
     /// handed to memory a frame at a time by `advance_frame`.
     ///
     /// Returns `false` if the handle is bad, in which case nothing starts.
-    pub fn fread_async_start(&mut self, handle: u16, dst: u32, n: u32) -> bool {
-        let Some(data) = self.fread(handle, n) else {
+    pub fn fread_async_start(&mut self, handle: u16, dst: u32, n: u32, pc: u32) -> bool {
+        let Some(data) = self.fread_blocks(handle, n) else {
             return false;
         };
+        self.xfer_pc = pc;
         self.async_pos = dst;
         self.xfer = Some(AsyncXfer {
             dst,
@@ -572,6 +739,25 @@ impl GameDrive {
     /// in ROM code**, whose meaning is unambiguous either way.
     pub fn async_pos(&self) -> u32 {
         self.async_pos
+    }
+
+    /// A GPU-mode read: `n` bytes, then the rest of the last 32-byte block. The
+    /// vendor handler moves whole 32-byte blocks (vendor README: "make sure any
+    /// buffer being read into can accomodate any over-read from the requested
+    /// size upto a 32 byte multiple"). The extra bytes are taken to be the
+    /// file's next bytes (zeros past its end) and the position moves by `n`:
+    /// both inferred, since only the over-read itself is documented.
+    pub fn fread_blocks(&mut self, handle: u16, n: u32) -> Option<Vec<u8>> {
+        let mut v = self.fread(handle, n)?;
+        let extra = (32 - n % 32) % 32;
+        if extra > 0 {
+            let f = self.files.get(&handle)?;
+            let start = f.pos.min(f.data.len());
+            let end = (start + extra as usize).min(f.data.len());
+            v.extend_from_slice(&f.data[start..end]);
+            v.resize((n + extra) as usize, 0);
+        }
+        Some(v)
     }
 
     /// FN_FREAD — copy `n` bytes into the caller's buffer. Returns **0 on
@@ -874,11 +1060,12 @@ mod tests {
         gd.set_rate(32);
 
         let h = gd.fopen("PACK.BIN") as u16;
-        assert!(gd.fread_async_start(h, 0x1000, 100));
+        assert!(gd.fread_async_start(h, 0x1000, 100, 0));
         assert_eq!(gd.async_active(), 1, "busy the moment it starts");
         assert_eq!(gd.async_pos(), 0x1000, "nothing delivered yet");
 
-        // 100 bytes at 32/frame = 4 frames (32, 32, 32, 4).
+        // 100 bytes asked, whole 32-byte blocks written (128; the file ends at
+        // 100, so zeros after it): 4 frames of 32.
         let mut got = Vec::new();
         let mut frames = 0;
         while let Some((at, chunk)) = gd.advance_frame() {
@@ -887,9 +1074,11 @@ mod tests {
             frames += 1;
         }
         assert_eq!(frames, 4);
-        assert_eq!(got, (0u8..100).collect::<Vec<u8>>());
+        let mut want: Vec<u8> = (0u8..100).collect();
+        want.resize(128, 0);
+        assert_eq!(got, want);
         assert_eq!(gd.async_active(), 0, "idle once drained");
-        assert_eq!(gd.async_pos(), 0x1000 + 100);
+        assert_eq!(gd.async_pos(), 0x1000 + 128);
     }
 
     /// `GD_FAsyncWait` must hand over everything outstanding at once, or a ROM
@@ -903,13 +1092,13 @@ mod tests {
         gd.set_rate(10);
 
         let h = gd.fopen("PACK.BIN") as u16;
-        gd.fread_async_start(h, 0x2000, 100);
+        gd.fread_async_start(h, 0x2000, 100, 0);
         let (_, first) = gd.advance_frame().unwrap();
         assert_eq!(first.len(), 10);
 
         let (at, rest) = gd.finish_async().unwrap();
         assert_eq!(at, 0x2000 + 10);
-        assert_eq!(rest.len(), 90);
+        assert_eq!(rest.len(), 118, "the rest of 128: whole 32-byte blocks");
         assert_eq!(gd.async_active(), 0);
         assert!(gd.finish_async().is_none(), "nothing left to drain");
     }
@@ -1156,5 +1345,124 @@ mod tests {
         let _ = hi;
         // firmware must satisfy `cmp.w #0x111,%d3 ; blt fail`
         assert!(FIRMWARE >= 0x111);
+    }
+}
+
+#[cfg(test)]
+mod gpu_read_host_tests {
+    use super::*;
+    use crate::bus::Bus;
+    use crate::risc::{Risc, RiscKind};
+
+    /// A machine with a GameDrive and the host the platform bench ran on
+    /// silicon (jobs 190-200): handler at $F03E00, kernel on bank 1 with
+    /// G_DSPENA, bank-0 r31 = $F03FF0, J_EXTENA, the GPU running.
+    fn good_host() -> (Bus, Risc) {
+        let dir = std::env::temp_dir().join("jagemu_gd_host_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut bus = Bus::new();
+        bus.gamedrive = Some(GameDrive::new(&dir));
+        init_gpu_read(&mut bus, 0xF0_3E00, 0);
+        bus.write16(crate::mem::J_INT, 1);
+        bus.write32(crate::mem::G_PC, 0xF0_3100);
+        bus.write32(crate::mem::G_CTRL, crate::mem::RISCGO);
+        let mut gpu = Risc::new(RiscKind::Gpu);
+        gpu.flags = 0x4020;
+        gpu.regs[0][31] = 0xF0_3FF0;
+        (bus, gpu)
+    }
+
+    fn kinds(bus: &Bus, gpu: &Risc) -> Vec<&'static str> {
+        gpu_read_host_faults(bus, gpu).into_iter().map(|(k, _)| k).collect()
+    }
+
+    #[test]
+    fn init_writes_the_measured_vector_and_claims_the_handler() {
+        let (mut bus, _) = good_host();
+        assert_eq!(bus.read32(0xF0_3010), 0x981E_3E0C, "silicon reads $981E3E0C here (jobs 190-200)");
+        assert_eq!(bus.read32(0xF0_3E00), 0xE400_E400);
+        assert_eq!(bus.read32(0xF0_3EDC), 0xE400_E400);
+    }
+
+    #[test]
+    fn the_silicon_host_breaks_no_rule() {
+        let (bus, gpu) = good_host();
+        assert_eq!(kinds(&bus, &gpu), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn each_broken_rule_is_named() {
+        let dir = std::env::temp_dir().join("jagemu_gd_host_test");
+        let mut bare = Bus::new();
+        bare.gamedrive = Some(GameDrive::new(&dir));
+        let k = kinds(&bare, &Risc::new(RiscKind::Gpu));
+        assert_eq!(k, ["gd_gpu_no_init", "gd_gpu_halted", "gd_gpu_no_extena"]);
+
+        let (mut bus, gpu) = good_host();
+        bus.write32(0xF0_3010, 0x1234_5678); // a kernel uploaded over the vectors
+        assert_eq!(kinds(&bus, &gpu), ["gd_gpu_vector_overwritten"]);
+
+        let (mut bus, gpu) = good_host();
+        bus.write32(0xF0_3E40, 0); // a kernel or data in the handler's 224 bytes
+        assert_eq!(gpu_read_host_faults(&bus, &gpu), [("gd_gpu_handler_overwritten", 0xF0_3E40)]);
+
+        let (mut bus, gpu) = good_host();
+        bus.write32(crate::mem::G_CTRL, 0);
+        assert_eq!(kinds(&bus, &gpu), ["gd_gpu_halted"]);
+
+        let (bus, mut gpu) = good_host();
+        gpu.flags = 0x4000;
+        assert_eq!(kinds(&bus, &gpu), ["gd_gpu_no_dspena"]);
+
+        let (bus, mut gpu) = good_host();
+        gpu.flags = 0x0020;
+        assert_eq!(kinds(&bus, &gpu), ["gd_gpu_kernel_on_bank0"]);
+
+        let (mut bus, gpu) = good_host();
+        bus.write16(crate::mem::J_INT, 0);
+        assert_eq!(kinds(&bus, &gpu), ["gd_gpu_no_extena"]);
+
+        for sp in [0u32, 0xF0_3FF2, 0xF0_3040, 0xF0_3E10, 0xF0_4010, 0x30_0000] {
+            let (bus, mut gpu) = good_host();
+            gpu.regs[0][31] = sp;
+            assert_eq!(kinds(&bus, &gpu), ["gd_gpu_bad_stack"], "r31 = {sp:#X}");
+        }
+        for sp in [0xF0_3E00u32, 0xF0_4000, 0x1F_0000] {
+            let (bus, mut gpu) = good_host();
+            gpu.regs[0][31] = sp;
+            assert_eq!(kinds(&bus, &gpu), Vec::<&str>::new(), "r31 = {sp:#X} is a fine stack");
+        }
+    }
+
+    #[test]
+    fn strict_gd_gpu_stops_at_the_first_broken_rule() {
+        let (mut bus, gpu) = good_host();
+        bus.write32(crate::mem::G_CTRL, 0);
+        let faults = gpu_read_host_faults(&bus, &gpu);
+        report_gpu_read_faults(&mut bus, &faults, 0x4242);
+        assert!(bus.strict_fault.is_none(), "off unless --strict=gd-gpu");
+        bus.strict.gd_gpu = true;
+        report_gpu_read_faults(&mut bus, &faults, 0x4242);
+        let f = bus.strict_fault.as_ref().expect("gd-gpu must trip");
+        assert_eq!((f.kind, f.pc, f.addr), ("gd_gpu_halted", 0x4242, crate::mem::G_CTRL));
+        assert!(crate::debug::Strict::parse("gd-gpu").unwrap().gd_gpu);
+    }
+
+    #[test]
+    fn gpu_mode_reads_deliver_whole_32_byte_blocks() {
+        let dir = std::env::temp_dir().join("jagemu_gd_blocks_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file: Vec<u8> = (0..100u8).collect();
+        std::fs::write(dir.join("PFBLOCK.BIN"), &file).unwrap();
+        let mut gd = GameDrive::new(&dir);
+        let h = gd.fopen("PFBLOCK.BIN") as u16;
+        let v = gd.fread_blocks(h, 40).unwrap();
+        assert_eq!(v, file[..64].to_vec(), "40 bytes asked, 64 written");
+        assert_eq!(gd.ftell(h), 40, "the position moves by what was asked");
+        let v = gd.fread_blocks(h, 50).unwrap(); // 40..90, then 90..100 and zeros
+        assert_eq!(v.len(), 64);
+        assert_eq!(v[..60], file[40..100]);
+        assert_eq!(v[60..], [0, 0, 0, 0]);
+        assert_eq!(gd.fread_blocks(h, 0).unwrap().len(), 0);
     }
 }

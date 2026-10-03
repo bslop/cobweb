@@ -6,6 +6,37 @@ assigned at release.
 
 ## Unreleased
 
+### 2026-10-03 — jsim: GameDrive GPU-mode reads check their GPU host (platform issue 0014)
+
+On silicon a GPU-mode `GD_FRead` (`GD_FREAD_GPU`, `GD_FREAD_GPU_ASYNC`) moves its data in
+the GPU's interrupt handler. jsim copies it in the trap, so a ROM with a broken host
+passed here and hung the console. The vendor handler is closed code, so delivery isn't
+modelled. jsim checks every rule instead.
+
+- **`GD_InitGPURead` writes GPU RAM as silicon does.** The interrupt-1 vector long at
+  `$F03010` (`$981E3E0C` for `$F03E00`, measured on bench jobs 190-200) and the 224
+  handler bytes at `gpu_buf` (filled with GPU `nop`s).
+- **At each GPU-mode read**, and at every field while a metered (`--sd-rate`) async read
+  is outstanding, it checks:
+  - init never called; the vector or the handler overwritten since
+  - the GPU halted
+  - `G_FLAGS` without `G_DSPENA`; the kernel on register bank 0
+  - bank-0 r31 not a usable stack (long-aligned, in GPU RAM or DRAM, clear of
+    `$F03000-$F0304F` and the handler; 20 bytes for PRESERVE, 4 for FAST)
+  - `J_INT` without `J_EXTENA`
+  - a read issued while an async one is outstanding
+- **Each broken rule warns once on stderr.** `--strict=gd-gpu`, which bare `--strict`
+  now includes, stops the run at the first one (`strict_fault` kind `gd_gpu_*`, exit 3).
+  The reported PC is the BIOS call's return address inside the bindings.
+- **GPU-mode reads write whole 32-byte blocks**, up to 31 bytes past `n`, as the vendor
+  README warns. The extra bytes are the file's next bytes, or zeros past its end; the
+  position moves by `n`.
+- **Checked against silicon:** the bench ROMs whose hosts worked on silicon (four hosts,
+  including the blit server) raise nothing. ROMs with no host, with the blit server
+  uploaded over the vectors, and with the GPU halted mid-read stop with the matching
+  fault.
+- Not modelled: the GPU time the handler takes per block.
+
 ### 2026-10-02 — jsim: GameDrive CPU reads into the cart window, and a warning for GPU reads with no host
 
 Measured on the bench (jobs 190-200, `calib/results/2026-10-02-gd-reads.md`, platform

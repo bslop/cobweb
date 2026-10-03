@@ -53,6 +53,11 @@ pub struct Strict {
     /// garbage on every field that list is shown (platform issue 0010, bench
     /// job 55). The list itself needs only phrase alignment.
     pub op_align: bool,
+    /// A GameDrive GPU-mode read (`GD_FREAD_GPU`, `GD_FREAD_GPU_ASYNC`) that
+    /// breaks a host rule: jsim completes it, silicon never does and the
+    /// GameDrive needs a power cycle (platform issues 0012, 0014;
+    /// `gamedrive::check_gpu_read_host`).
+    pub gd_gpu: bool,
     /// Faults that are counted but do not stop the run (`--strict-exempt`):
     /// a known-safe site, such as the mailbox read-back of a GPU halt.
     pub exempt: [Option<StrictExempt>; Strict::MAX_EXEMPT],
@@ -78,9 +83,10 @@ impl Strict {
         div0: true,
         int2: true,
         op_align: true,
+        gd_gpu: true,
         exempt: [None; Strict::MAX_EXEMPT],
     };
-    pub const NAMES: &'static str = "narrow,dram-stale,roundtrip,div0,int2,op-align";
+    pub const NAMES: &'static str = "narrow,dram-stale,roundtrip,div0,int2,op-align,gd-gpu";
     pub const MAX_EXEMPT: usize = 16;
 
     /// Parse a comma-separated list of `NAMES` (or `all`). Exemptions already
@@ -96,6 +102,7 @@ impl Strict {
                 "div0" => s.div0 = true,
                 "int2" => s.int2 = true,
                 "op-align" => s.op_align = true,
+                "gd-gpu" => s.gd_gpu = true,
                 other => return Err(format!("unknown strict check `{other}` (expected {})", Strict::NAMES)),
             }
         }
@@ -111,6 +118,7 @@ impl Strict {
             "div0" => &["div_by_zero"],
             "int2" => &["rte_without_int2"],
             "op-align" => &["op_bitmap_misaligned"],
+            "gd-gpu" => crate::gamedrive::GPU_READ_FAULTS,
             _ => return None,
         })
     }

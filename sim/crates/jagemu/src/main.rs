@@ -113,12 +113,14 @@ fn usage() {
          \x20      [--gpu-map g.map] [--dsp-map d.map] [--start S] [--top K] [--bucket N]\n\
          \x20      [--prof-json p.json]      # full per-PC profile; diff two with profdiff.py\n\
          \x20 jagemu run <rom> --watchdog N   # warn if a core runs N frames without clearing GO\n\
-         \x20 --strict[=narrow,dram-stale,roundtrip,div0,int2,op-align]   (any command that boots a ROM)\n\
+         \x20 --strict[=narrow,dram-stale,roundtrip,div0,int2,op-align,gd-gpu]   (any command that boots a ROM)\n\
          \x20                   stop at the first silicon fault jsim would run through:\n\
          \x20                   narrow GPU/DSP local-RAM access, JAGEMU_DRAM_STALE hit,\n\
          \x20                   store->load DRAM round trip, DIV by zero, a 68000 rte\n\
          \x20                   out of an interrupt that never wrote INT2, an unscaled\n\
-         \x20                   OP bitmap object at 8 mod 16. Bare = all.\n\
+         \x20                   OP bitmap object at 8 mod 16, a GameDrive GPU-mode\n\
+         \x20                   read whose GPU host breaks a rule (each also warns\n\
+         \x20                   once without --strict). Bare = all.\n\
          \x20                   The JSON's \"strict_fault\" names it (PC, address); exit 3\n\
          \x20 --strict-exempt=[check:]pc=LO[-HI] | [check:]addr=LO[-HI]   (repeatable)\n\
          \x20                   count but do not stop on a known-safe site (hex numbers),\n\
