@@ -6,6 +6,21 @@ assigned at release.
 
 ## Unreleased
 
+### 2026-10-03 — jsim: the 68000 nearly stalls under a phrase-mode blit (platform issue 0011)
+
+Measured on the bench (jobs 186, 211, 213-219, `calib/results/2026-10-03-cpusd.md`).
+
+- **The 68000 under a phrase-mode blit:** a fill or a copy leaves it about a tenth of its
+  speed, not a third (`BLIT_PHRASE_CONTENTION_X10`; pixel mode keeps x3). jsim had let
+  the 68000's blit calls overlap the blits, so fills ran 13-20% fast.
+- **Phrase-mode copies:** they now cost 5.9 ticks a DRAM access
+  (`BLIT_PHRASE_ACCESS_TICKS_X10`, was the pixel-mode 5.6). This is fitted on copies
+  with the old and the new lib/jag blit calls, which cost the 68000 ~8,000 cycles
+  apart.
+- **A cartridge-window source:** +12.7 ticks a source phrase (was 12.2).
+- **Result:** every Blitter row of job 211 is within 5.5% of silicon under every
+  display, and so are fills of four sizes and copies with either library.
+
 ### 2026-10-03 — jsim: GameDrive reads take the 68000's time (platform issue 0011)
 
 Measured on the bench (job 211, `calib/results/2026-10-03-cpusd.md`).

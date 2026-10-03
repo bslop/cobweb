@@ -125,6 +125,15 @@ pub fn op_stretch_ppm(bus: &Bus) -> u64 {
 /// x2.2 gave 120, x3.0 gives 128; the cap at the blit's remaining time is
 /// what keeps back-to-back fills right (23 vs 21-22), and limits the rest.
 const BLIT_CONTENTION_X10: u64 = 20;
+/// The same while a PHRASE-MODE blit runs (a fill or a copy): its page-mode
+/// streams leave the 68000 almost no bus. HARDWARE (platform bench
+/// `bench/blitfill` and `bench/blitcart`, jobs 213-215 and 219, lib/jag's blit
+/// server fed by the 68000): with x3 jsim ran 200 full-screen fills in 18
+/// fields against silicon's 22, and 400 of 320x100 in 26 against 30; the fill
+/// sizes fit a 68000 at a tenth of its speed, and faster library calls made
+/// 400 phrase copies 20 fields shorter on silicon, so the calls didn't overlap
+/// the copies either.
+const BLIT_PHRASE_CONTENTION_X10: u64 = 90;
 
 // Condition-code register bits (in the low byte of SR).
 const FLAG_C: u16 = 1 << 0;
@@ -607,7 +616,8 @@ impl M68k {
         // serviced every vertical interrupt on silicon.
         let mut blit_wait = 0u32;
         if total > 0 && bus.tom.blit_busy > 0 {
-            let want = (c0 + extra + op_extra) as u64 * BLIT_CONTENTION_X10 / 10;
+            let k = if bus.tom.blit_phrase_mode { BLIT_PHRASE_CONTENTION_X10 } else { BLIT_CONTENTION_X10 };
+            let want = (c0 + extra + op_extra) as u64 * k / 10;
             blit_wait = want.min(bus.tom.blit_busy.div_ceil(2)) as u32;
             self.blit_wait_cycles += blit_wait as u64;
         }
@@ -1462,6 +1472,28 @@ mod gd_fread_tests {
         assert_eq!((cpu.pc, cpu.gd_busy), (0x4000, owed));
         cpu.step(&mut bus, &mut dbg);
         assert!(cpu.gd_busy < owed, "the wait resumes after the RTE");
+    }
+
+
+    /// Bench jobs 213-219: a phrase-mode blit leaves the 68000 far less bus
+    /// than a pixel-mode one (x10 against x3 an instruction, capped by the
+    /// blit's time).
+    #[test]
+    fn a_phrase_blit_blocks_the_68000_more_than_other_blits() {
+        let cost = |phrase: bool| {
+            let mut bus = Bus::new();
+            bus.write16(0x4000, 0x2210); // move.l (a0),d1
+            let mut cpu = M68k::new();
+            cpu.sr = 0x2700;
+            cpu.a[0] = 0x8000;
+            cpu.set_pc(0x4000);
+            bus.tom.blit_busy = 1_000_000;
+            bus.tom.blit_phrase_mode = phrase;
+            let mut dbg = crate::debug::Debugger::new();
+            cpu.step(&mut bus, &mut dbg)
+        };
+        let (other, fill) = (cost(false), cost(true));
+        assert!(fill > 3 * other, "fill {fill} vs other {other}");
     }
 
 }

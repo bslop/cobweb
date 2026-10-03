@@ -187,6 +187,9 @@ pub struct Tom {
     /// instruction time while the GPU runs; scheduler wall time while it
     /// doesn't).
     pub blit_busy: u64,
+    /// The blit in flight is phrase-mode (page-mode streams): the 68000 gets
+    /// almost no bus meanwhile (`m68k::step`).
+    pub blit_phrase_mode: bool,
     /// Ticks remaining in the blitter's BUSY-ASSERTION window.
     ///
     /// On silicon the blitter takes several cycles after the `B_CMD` store
@@ -305,6 +308,7 @@ impl Tom {
             blit_shapes: std::collections::HashMap::new(),
             blit_by_master: [(0, 0, 0); Master::COUNT],
             blit_busy: 0,
+            blit_phrase_mode: false,
             blit_settle: 0,
             // Off unless explicitly asked for. Matches the existing
             // JAGEMU_BLIT_TRACE precedent rather than threading a parameter

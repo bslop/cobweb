@@ -48,8 +48,22 @@ const BLIT_LAUNCH_TICKS: u64 = 16;
 /// inside this window reads a stale IDLE — see `Tom::blit_settle`. Counted,
 /// not yet emulated.
 const BLIT_SETTLE_TICKS: u64 = 6;
-/// Ticks per DRAM phrase access ×10 (5.6), kept integer for exactness.
+/// Ticks per DRAM access ×10 in a pixel-mode blit (one access a pixel), kept
+/// integer for exactness. From another console's probe (2026-07-19, a 256-px
+/// copy, `blit_cost_matches_hardware_probe`). The bench console measures 5.73
+/// and 5.80 (platform bench jobs 186 and 211: full-screen pixel-mode copies,
+/// the OP's stretch out), so jsim's pixel-mode copies run ~3% fast there.
 const BLIT_ACCESS_TICKS_X10: u64 = 56;
+/// Ticks per DRAM phrase access ×10 in a phrase-mode blit that reads (a SRCEN
+/// copy). HARDWARE (platform bench jobs 186, 211, 219, lib/jag's blit server):
+/// 400 full-screen 16bpp phrase copies under a 320x200 16bpp display took 218
+/// fields with the 2026-10-02 library and 198 with the 2026-10-03 one, whose
+/// blit calls cost the 68000 ~8,000 cycles less: the calls don't overlap the
+/// copies (the 68000 nearly stalls during a phrase blit,
+/// `m68k::BLIT_PHRASE_CONTENTION_X10`). Fitted on both, and on job 211's 200
+/// copies with no display (96 fields): 11.8 ticks a source + destination
+/// phrase pair.
+const BLIT_PHRASE_ACCESS_TICKS_X10: u64 = 59;
 /// Ticks per destination phrase ×10 for a PHRASE-mode (XADDPHR) blit that
 /// only writes (no SRCEN, no DSTEN read): sequential page-mode writes.
 /// HARDWARE (platform timing bench, jagq jobs 46-47): 200 full-screen
@@ -58,17 +72,16 @@ const BLIT_ACCESS_TICKS_X10: u64 = 56;
 /// made them take 50.
 const BLIT_PHRASE_WRITE_TICKS_X10: u64 = 22;
 /// Extra ticks ×10 for each source access a SRCEN blit makes in the cartridge
-/// window, over the same access in DRAM. HARDWARE (platform bench, jagq job
-/// 186, `bench/blitcost`, GameDrive cartridge SDRAM, a 16bpp 320x200 display
-/// up): 400 full-screen 16bpp phrase copies took 422 fields from the cart vs
-/// 218 from DRAM, and 50 pixel-mode 319x200 copies 113 vs 96. With the OP's
-/// stretch taken out that is +12.2 ticks a source phrase and +2.0 a source
-/// pixel. Pixel mode reads 16 bits a pixel and phrase mode 64 a phrase, so the
+/// window, over the same access in DRAM. HARDWARE (platform bench, jagq jobs
+/// 186 and 219, GameDrive cartridge SDRAM, a 16bpp 320x200 display up): 400
+/// full-screen 16bpp phrase copies took 422 fields from the cart vs 218 from
+/// DRAM (402 vs 198 with the faster library calls), and 50 pixel-mode 319x200
+/// copies 113 vs 96: +12.7 ticks a source phrase (jsim lands within 3% of all
+/// four) and +2.0 a source pixel. Pixel mode reads 16 bits a pixel and phrase mode 64 a phrase, so the
 /// cart's cost follows the width read; 8bpp pixel reads are unmeasured and
-/// charged as 16. These are differences: the DRAM copy itself is still priced
-/// by `BLIT_ACCESS_TICKS_X10` (job 186 has phrase-mode DRAM copies ~14% slower
-/// than that on silicon, pixel-mode ~3%).
-const BLIT_CART_PHRASE_EXTRA_X10: u64 = 122;
+/// charged as 16. These are differences, on top of the DRAM copy's own price
+/// (`BLIT_PHRASE_ACCESS_TICKS_X10`, `BLIT_ACCESS_TICKS_X10`).
+const BLIT_CART_PHRASE_EXTRA_X10: u64 = 127;
 const BLIT_CART_PIXEL_EXTRA_X10: u64 = 20;
 
 /// Decode the 6-bit floating WIDTH field (4-bit exp, 2-bit mantissa + implied 1)
@@ -705,10 +718,11 @@ pub fn run(bus: &mut Bus, cmd: u32) {
     // non-SRCEN RMW 2x — COBWEB_BUG_blitter_overcharged round 2.)
     let dst_reads = if dsten && srcen { dst_phrases } else { 0 };
     let phrase_fill = gens[dst].xadd == 0 && !srcen && !dsten;
+    let access = if gens[dst].xadd == 0 { BLIT_PHRASE_ACCESS_TICKS_X10 } else { BLIT_ACCESS_TICKS_X10 };
     let mut transfer = if phrase_fill {
         dst_phrases * BLIT_PHRASE_WRITE_TICKS_X10 / 10
     } else {
-        (dst_phrases + dst_reads + src_phrases) * BLIT_ACCESS_TICKS_X10 / 10
+        (dst_phrases + dst_reads + src_phrases) * access / 10
     };
     // A source in the cartridge window costs more per access than DRAM
     // (BLIT_CART_*_EXTRA_X10, issue 0011).
@@ -738,6 +752,7 @@ pub fn run(bus: &mut Bus, cmd: u32) {
     bus.tom.last_blit_launch = BLIT_LAUNCH_TICKS;
     bus.tom.last_blit_ticks = BLIT_LAUNCH_TICKS + transfer;
     bus.tom.blit_busy += BLIT_LAUNCH_TICKS + transfer; // asynchronous: drains as wall time passes
+    bus.tom.blit_phrase_mode = gens[dst].xadd == 0;
     bus.tom.blit_settle = BLIT_SETTLE_TICKS; // silicon needs this long to show BUSY
 
     if std::env::var_os("JAGEMU_BLIT_YSTAT").is_some() {
@@ -888,7 +903,7 @@ mod tests {
         setup(&mut bus, 0x14_0000, 0x0000_4218);
         bus.write32(mem::B_CMD, 0x0180_0801);
         let dram = bus.tom.last_blit_ticks;
-        assert_eq!(dram, 16 + (32 + 32) * 56 / 10);
+        assert_eq!(dram, 16 + (32 + 32) * BLIT_PHRASE_ACCESS_TICKS_X10 / 10);
         setup(&mut bus, 0x90_0000, 0x0000_4218);
         bus.write32(mem::B_CMD, 0x0180_0801);
         assert_eq!(bus.tom.last_blit_ticks, dram + 32 * BLIT_CART_PHRASE_EXTRA_X10 / 10);
