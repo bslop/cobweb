@@ -125,6 +125,13 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
         if c == b'"' {
             let (bytes, n) = lex_string(&b[i..])?;
             bump(&mut i, &mut line, &mut col, n);
+            // Adjacent literals are one (C99 5.1.1.2, phase 6): `DIR "/F.BIN"`
+            // after a macro. Each token carries its NUL; drop the first's.
+            if let Some(Token { tok: Tok::Str(prev), .. }) = out.last_mut() {
+                prev.pop();
+                prev.extend_from_slice(&bytes);
+                continue;
+            }
             out.push(Token { tok: Tok::Str(bytes), line: sl, col: sc, file: file.clone() });
             continue;
         }

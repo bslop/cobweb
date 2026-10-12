@@ -6,6 +6,11 @@ assigned at release.
 
 ## Unreleased
 
+### 2026-10-12 — jcc68k: adjacent string literals join
+
+- jcc68k rejected `"ab" "cd"` (`expected ')'`), as in `DIR "/F.BIN"` after a macro. Adjacent
+  string literals are now one (C99 5.1.1.2, phase 6).
+
 ### 2026-10-12 — jas: `a+2` is the symbol `a` plus 2, not register a2
 
 - jas read a 68000 operand `a+N` or `d+N` as register aN / dN: the register number went

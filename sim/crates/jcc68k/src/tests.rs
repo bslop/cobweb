@@ -3602,3 +3602,20 @@ fn bench_issue_0009_cycles() {
         println!("{name:8} {:>12} cycles  result {:#x}", jag.cpu.cycles - c0, jag.bus.read32(0x100));
     }
 }
+
+/// Adjacent string literals are one literal (C99 5.1.1.2, phase 6), as after
+/// a macro: `DIR "/F.BIN"` (platform issue 0015's bench).
+#[test]
+fn adjacent_string_literals_concatenate() {
+    let src = r#"
+        static char a[] = "ab" "cd";
+        static const char *p = "/XX" "/F.BIN";
+        int main() {
+            const char *q = "x" "" "yz";
+            return (sizeof(a) == 5) + 2 * (a[2] == 'c' && a[4] == 0)
+                 + 4 * (p[3] == '/' && p[4] == 'F' && p[9] == 0)
+                 + 8 * (q[1] == 'y' && q[3] == 0);
+        }
+    "#;
+    assert_eq!(run(src), 15);
+}
