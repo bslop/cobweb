@@ -6,6 +6,14 @@ assigned at release.
 
 ## Unreleased
 
+### 2026-10-12 — jas: `a+2` is the symbol `a` plus 2, not register a2
+
+- jas read a 68000 operand `a+N` or `d+N` as register aN / dN: the register number went
+  through `str::parse`, which accepts a sign. jcc68k emits C globals without an underscore,
+  so with a global `char a[]`, `a[2]` assembled as `move.b a2,d0` and read the wrong
+  place (`a[0]` worked). Register numbers are now one digit 0-7. Every platform example and
+  bench builds byte-identical.
+
 ### 2026-10-12 — jsim: GameDrive writes, `GD_FWrite` and the write open modes (platform issue 0015)
 
 Measured on the bench (jobs 313-344, `calib/results/2026-10-12-gdwrite.md`).

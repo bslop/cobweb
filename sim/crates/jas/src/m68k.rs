@@ -77,20 +77,23 @@ impl Ea {
     }
 }
 
+/// The register number after `d`/`a`: one digit 0-7. Not `str::parse`, which
+/// takes a sign: `a+2` (a C global `a`, offset 2) read as register a2.
+fn regnum(n: &str) -> Option<u16> {
+    match n.as_bytes() {
+        [c @ b'0'..=b'7'] => Some((c - b'0') as u16),
+        _ => None,
+    }
+}
 fn dreg(s: &str) -> Option<u16> {
-    let s = s.trim();
-    let n = s.strip_prefix(['d', 'D'])?;
-    let r: u16 = n.parse().ok()?;
-    (r < 8).then_some(r)
+    regnum(s.trim().strip_prefix(['d', 'D'])?)
 }
 fn areg(s: &str) -> Option<u16> {
     let s = s.trim();
     if s.eq_ignore_ascii_case("sp") {
         return Some(7);
     }
-    let n = s.strip_prefix(['a', 'A'])?;
-    let r: u16 = n.parse().ok()?;
-    (r < 8).then_some(r)
+    regnum(s.strip_prefix(['a', 'A'])?)
 }
 /// Index of the `(` that matches the final `)` of `s` (which must end in `)`),
 /// scanning right-to-left with paren depth. Lets `EXPR(An)` split correctly even

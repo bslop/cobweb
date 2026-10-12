@@ -951,3 +951,21 @@ fn backwards_org_is_an_error() {
         out.diags
     );
 }
+
+/// A symbol named like a register letter, plus an offset, is the symbol:
+/// `a+2` was encoded as register a2 (`str::parse` takes a sign), so a C
+/// global `a` read `a[2]` from the wrong place (jcc68k emits C names bare).
+#[test]
+fn symbol_a_plus_offset_is_not_register_a2() {
+    let src = "\t.68000\n\t.text\n\tmove.b\ta+2,d0\n\tmove.w\td+4,d1\n\trts\n\t.data\na:\t.dc.b 1,2,3,4\nd:\t.dc.w 5,6,7\n";
+    let opts = Options { org: 0x4000, ..Default::default() };
+    let res = assemble(src, &opts);
+    assert_eq!(res.errors(), 0, "{:#?}", res.diags);
+    let a = res.symbols["a"];
+    let d = res.symbols["d"];
+    let w = |i: usize| u16::from_be_bytes([res.bytes[i], res.bytes[i + 1]]);
+    assert_eq!(w(0), 0x1039, "move.b abs.l,d0");
+    assert_eq!(((w(2) as u32) << 16) | w(4) as u32, a + 2);
+    assert_eq!(w(6), 0x3239, "move.w abs.l,d1");
+    assert_eq!(((w(8) as u32) << 16) | w(10) as u32, d + 4);
+}
