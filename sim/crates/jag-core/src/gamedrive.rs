@@ -75,6 +75,13 @@ const CMD_GETBIOS: u8 = 0x80;
 const SEEK_CUR: u16 = 1;
 const SEEK_END: u16 = 2;
 
+/// `GD_FOpen` modes (vendor gdbios.h). The values are FatFs's `FA_*` flags.
+pub const FOPEN_WRITE: u16 = 0x02;
+pub const FOPEN_CREATE_NEW: u16 = 0x04;
+pub const FOPEN_CREATE_ALWAYS: u16 = 0x08;
+pub const FOPEN_OPEN_ALWAYS: u16 = 0x10;
+pub const FOPEN_OPEN_APPEND: u16 = 0x30;
+
 /// `GD_FRead` flags: 0 CPU, 1 GPU, 2 GPU async. Only the async mode is metered.
 pub const FREAD_GPU_ASYNC: u16 = 2;
 
@@ -94,6 +101,8 @@ pub const FN_FOPEN: u8 = 10;
 pub const FN_FCLOSE: u8 = 11;
 pub const FN_FSEEK: u8 = 12;
 pub const FN_FREAD: u8 = 13;
+/// `GD_FileWrite .equ 14`: d0.w = handle, a0 = buffer, d1 = bytes (issue 0015).
+pub const FN_FWRITE: u8 = 14;
 pub const FN_FTELL: u8 = 15;
 pub const FN_FSIZE: u8 = 16;
 pub const FN_ASYNCPOS: u8 = 17;
@@ -116,7 +125,7 @@ const BIOS_BLOCK: usize = 512;
 /// through `fn_of_trap`. Two hand-maintained lists would silently drift, and a
 /// drifted entry means a file call quietly vectors to the wrong operation —
 /// which looks like corrupt data, not like a dispatch bug.
-pub const FN_TRAP: [(u8, u8); 15] = [
+pub const FN_TRAP: [(u8, u8); 16] = [
     (FN_INIT, 1),
     // GD_InitGPURead. Writes GPU RAM as silicon does (`init_gpu_read`) and arms
     // the host checks; it MUST have a thunk: on hardware the
@@ -135,6 +144,7 @@ pub const FN_TRAP: [(u8, u8); 15] = [
     (FN_FCLOSE, 11),
     (FN_FSEEK, 12),
     (FN_FREAD, 13),
+    (FN_FWRITE, 14),
     (FN_FTELL, 15),
     (FN_FSIZE, 0),        // 16 > 15: remapped
     (FN_ASYNCPOS, 2),     // 17 > 15: remapped
@@ -177,6 +187,7 @@ pub const GPU_READ_FAULTS: &[&str] = &[
     "gd_gpu_kernel_on_bank0",
     "gd_gpu_bad_stack",
     "gd_cpu_read_during_async",
+    "gd_write_during_async",
 ];
 
 /// What each fault means on silicon, for the warning.
@@ -194,6 +205,8 @@ fn gpu_read_fault_text(kind: &str) -> &'static str {
         "gd_gpu_bad_stack" => "bank-0 r31, the handler's stack, isn't a long-aligned stack in GPU RAM or DRAM \
              clear of $F03000-$F0304F and the handler",
         "gd_cpu_read_during_async" => "a CPU-mode read was issued while a GPU async read is outstanding",
+        "gd_write_during_async" => "a GD_FWrite was issued while a GPU async read is outstanding \
+             (the card has one transfer; finish or wait out the read first)",
         _ => "",
     }
 }
@@ -357,6 +370,38 @@ pub fn read_cost(mode: u16, n: u32) -> u64 {
     }
 }
 
+// Writes and the calls around them (platform issue 0015, bench `gdwrite`,
+// jobs 313, 323, 324, 344, timed against the DSP's sample clock): a
+// `GD_FWrite` costs about 27,000 clocks plus 308 a byte, within 8% from 2 bytes
+// to 8 KB (772 bytes: 20 ms; 8 KB: 194 ms; eight 1 KB calls cost the same as
+// one 8 KB call, which this model overstates by 8%). An open costs ~25,000
+// clocks; creating a new file ~35,000, truncating one (CREATE_ALWAYS on an
+// existing file) ~112,000; each directory in the path ~50,000 more when
+// opening an existing file (one measurement each way, job 324). A seek ~14,700. A close costs ~45,000 after an
+// overwrite and ~112,000 after the file was created or grew; nothing after
+// reads. Like reads, the 68000 takes its interrupts meanwhile (the VI count
+// kept pace during 194 ms writes).
+
+/// Clocks per `GD_FWrite` call, before its bytes, and per byte.
+pub const WRITE_CALL_CLOCKS: u64 = 27_000;
+pub const WRITE_BYTE_CLOCKS: u64 = 308;
+/// Clocks for `GD_FOpen` of an existing file; creating one; truncating one;
+/// and per directory in the path.
+pub const OPEN_CLOCKS: u64 = 25_000;
+pub const OPEN_NEW_CLOCKS: u64 = 35_000;
+pub const OPEN_TRUNCATE_CLOCKS: u64 = 112_000;
+pub const OPEN_DIR_CLOCKS: u64 = 50_000;
+/// Clocks for `GD_FSeek`.
+pub const SEEK_CLOCKS: u64 = 14_700;
+/// Clocks for `GD_FClose` of a file overwritten in place; created or grown.
+pub const CLOSE_WRITTEN_CLOCKS: u64 = 45_000;
+pub const CLOSE_GROWN_CLOCKS: u64 = 112_000;
+
+/// The 68000 clocks a `GD_FWrite` of `n` bytes keeps it inside the BIOS.
+pub fn write_cost(n: u32) -> u64 {
+    WRITE_CALL_CLOCKS + n as u64 * WRITE_BYTE_CLOCKS
+}
+
 /// Build the synthetic GDBIOS block: a version word, a function count, then a
 /// 4-byte `trap #n ; rts` thunk at offset `4*n` for each supported call.
 fn build_bios_block() -> Vec<u8> {
@@ -379,6 +424,12 @@ fn build_bios_block() -> Vec<u8> {
 struct OpenFile {
     data: Vec<u8>,
     pos: usize,
+    /// Opened with `FOPEN_WRITE`: the host file it is saved to on close.
+    write: Option<PathBuf>,
+    /// Written since it was opened.
+    dirty: bool,
+    /// Created by the open, or longer than it was.
+    grew: bool,
 }
 
 /// A `GD_FREAD_GPU_ASYNC` transfer in flight.
@@ -433,6 +484,8 @@ pub struct GameDrive {
     pub gpu_read_issued: Option<u32>,
     /// GPU_READ_FAULTS already warned about (bit per kind).
     warned: u32,
+    /// The 68000 clocks of the last open or close (`open_cost`, issue 0015).
+    pub last_cost: u64,
 }
 
 impl GameDrive {
@@ -455,6 +508,7 @@ impl GameDrive {
             host: None,
             gpu_read_issued: None,
             warned: 0,
+            last_cost: 0,
         }
     }
 
@@ -603,10 +657,17 @@ impl GameDrive {
         1
     }
 
-    /// FN_FOPEN — `name` is the NUL-terminated filename. Returns a handle, or
-    /// `-1` (as u32) if the file is missing. Matching is case-insensitive
-    /// because the SD side is FAT.
+    /// FN_FOPEN for reading — `name` is the NUL-terminated filename. Returns a
+    /// handle, or `-1` (as u32) if the file is missing.
     pub fn fopen(&mut self, name: &str) -> u32 {
+        self.fopen_mode(name, 0x01)
+    }
+
+    /// The card name `name` (case-insensitive, a leading slash card-absolute)
+    /// as a host path: the existing file if there is one, else the name joined
+    /// to its existing parent directory. Matching is case-insensitive because
+    /// the SD side is FAT.
+    fn resolve(&self, name: &str) -> (String, PathBuf) {
         // A LEADING SLASH IS CARD-ABSOLUTE, NOT HOST-ABSOLUTE. `PathBuf::join`
         // throws the root away when the argument starts with '/', so the naive
         // form opened `/MUSIC.PCM` on the HOST filesystem. ROMs routinely try
@@ -624,13 +685,16 @@ impl GameDrive {
             // Case-insensitive resolve, one component at a time so
             // subdirectories work (`/DATA/PACK.BIN`): FAT is case-insensitive
             // and the host is not.
+            // A missing last component (a file about to be created) keeps
+            // its name under the resolved directory.
             let mut p = self.root.clone();
             let mut ok = true;
-            for comp in want.split('/').filter(|c| !c.is_empty()) {
+            let comps: Vec<&str> = want.split('/').filter(|c| !c.is_empty()).collect();
+            for (i, comp) in comps.iter().enumerate() {
                 let mut hit = None;
                 if let Ok(rd) = std::fs::read_dir(&p) {
                     for e in rd.flatten() {
-                        if e.file_name().to_string_lossy().to_ascii_uppercase() == comp {
+                        if e.file_name().to_string_lossy().to_ascii_uppercase() == *comp {
                             hit = Some(e.path());
                             break;
                         }
@@ -638,11 +702,45 @@ impl GameDrive {
                 }
                 match hit {
                     Some(h) => p = h,
+                    None if i + 1 == comps.len() => p = p.join(comp),
                     None => { ok = false; break; }
                 }
             }
             if ok {
                 path = p;
+            }
+        }
+        (want, path)
+    }
+
+    /// FN_FOPEN — `mode` is the vendor's `GD_FOPEN_*` (FatFs `FA_*`) flags.
+    /// Returns a handle, or `-1` (as u32). Without `FOPEN_WRITE` the file is
+    /// only read; with it, what `gd_fwrite` writes is saved to the host file
+    /// on `gd_fclose` (issue 0015).
+    pub fn fopen_mode(&mut self, name: &str, mode: u16) -> u32 {
+        let (want, path) = self.resolve(name);
+        let exists = path.is_file();
+        let write = mode & FOPEN_WRITE != 0;
+        let create = mode & (FOPEN_CREATE_NEW | FOPEN_CREATE_ALWAYS | FOPEN_OPEN_ALWAYS) != 0;
+        let dirs = want.split('/').filter(|c| !c.is_empty()).count().saturating_sub(1) as u64;
+        let created = write && create && !exists;
+        // The directory cost was measured on an open of an existing file;
+        // the one create by path measured (job 324) cost no more than at the root.
+        self.last_cost = if created {
+            OPEN_NEW_CLOCKS
+        } else if write && exists && mode & FOPEN_CREATE_ALWAYS != 0 {
+            OPEN_TRUNCATE_CLOCKS + dirs * OPEN_DIR_CLOCKS
+        } else {
+            OPEN_CLOCKS + dirs * OPEN_DIR_CLOCKS
+        };
+        if write && (mode & FOPEN_CREATE_NEW != 0) && exists {
+            return u32::MAX;
+        }
+        if write && create && (!exists || mode & FOPEN_CREATE_ALWAYS != 0) {
+            // A new or truncated file. Its directory must exist: the model
+            // makes none.
+            if !path.parent().is_some_and(|d| d.is_dir()) || std::fs::write(&path, b"").is_err() {
+                return u32::MAX;
             }
         }
         if std::env::var_os("JAGEMU_GD_DEBUG").is_some() {
@@ -652,7 +750,9 @@ impl GameDrive {
             Ok(data) => {
                 let h = self.next_handle;
                 self.next_handle = self.next_handle.wrapping_add(1).max(1);
-                self.files.insert(h, OpenFile { data, pos: 0 });
+                let pos = if write && mode & FOPEN_OPEN_APPEND == FOPEN_OPEN_APPEND { data.len() } else { 0 };
+                let grew = write && (created || mode & FOPEN_CREATE_ALWAYS != 0);
+                self.files.insert(h, OpenFile { data, pos, write: write.then_some(path), dirty: false, grew });
                 h as u32
             }
             Err(_) => {
@@ -686,8 +786,41 @@ impl GameDrive {
         }
     }
 
+    /// FN_FCLOSE — a file opened for writing is saved to the host here.
     pub fn fclose(&mut self, handle: u16) -> u32 {
-        self.files.remove(&handle);
+        self.last_cost = match self.files.get(&handle) {
+            Some(f) if f.grew => CLOSE_GROWN_CLOCKS,
+            Some(f) if f.dirty => CLOSE_WRITTEN_CLOCKS,
+            _ => 0,
+        };
+        if let Some(OpenFile { data, write: Some(path), dirty: true, .. }) = self.files.remove(&handle) {
+            if std::fs::write(&path, &data).is_err() {
+                return u32::MAX;
+            }
+        }
+        0
+    }
+
+    /// FN_FWRITE — `bytes` at the file position, extending the file. Returns
+    /// 0, or `-1` for a bad handle or a file not opened with `FOPEN_WRITE`.
+    pub fn fwrite(&mut self, handle: u16, bytes: &[u8]) -> u32 {
+        let Some(f) = self.files.get_mut(&handle) else {
+            return u32::MAX;
+        };
+        if f.write.is_none() {
+            return u32::MAX;
+        }
+        let end = f.pos + bytes.len();
+        if f.data.len() < end {
+            f.data.resize(end, 0);
+            f.grew = true;
+        }
+        f.data[f.pos..end].copy_from_slice(bytes);
+        f.pos = end;
+        f.dirty = true;
+        if std::env::var_os("JAGEMU_GD_DEBUG").is_some() {
+            eprintln!("GD fwrite h={handle} n={} -> pos {end} of {}", bytes.len(), f.data.len());
+        }
         0
     }
 
@@ -1492,5 +1625,61 @@ mod gpu_read_host_tests {
         assert_eq!(v[..60], file[40..100]);
         assert_eq!(v[60..], [0, 0, 0, 0]);
         assert_eq!(gd.fread_blocks(h, 0).unwrap().len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod write_tests {
+    use super::*;
+
+    /// Issue 0015: the write and create open modes and GD_FWrite. A write
+    /// reaches the host file when the handle is closed.
+    #[test]
+    fn writes_reach_the_host_file_on_close() {
+        let dir = std::env::temp_dir().join("jagemu_gd_write_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("Sub")).unwrap();
+        std::fs::write(dir.join("PFWR.BIN"), b"0123456789").unwrap();
+        let mut gd = GameDrive::new(&dir);
+
+        // a read-only handle refuses writes
+        let h = gd.fopen("PFWR.BIN") as u16;
+        assert_eq!(gd.fwrite(h, b"xx"), u32::MAX);
+        gd.fclose(h);
+
+        // overwrite in place after a seek; nothing reaches the host before close
+        let h = gd.fopen_mode("pfwr.bin", FOPEN_WRITE) as u16;
+        assert_eq!(gd.fseek(h, 0, 2), 0);
+        assert_eq!(gd.fwrite(h, b"ab"), 0);
+        assert_eq!(gd.ftell(h), 4);
+        assert_eq!(std::fs::read(dir.join("PFWR.BIN")).unwrap(), b"0123456789");
+        assert_eq!(gd.fclose(h), 0);
+        assert_eq!(std::fs::read(dir.join("PFWR.BIN")).unwrap(), b"01ab456789");
+
+        // a write past the end extends the file
+        let h = gd.fopen_mode("PFWR.BIN", FOPEN_WRITE | FOPEN_OPEN_APPEND) as u16;
+        assert_eq!(gd.ftell(h), 10);
+        assert_eq!(gd.fwrite(h, b"XY"), 0);
+        gd.fclose(h);
+        assert_eq!(std::fs::read(dir.join("PFWR.BIN")).unwrap(), b"01ab456789XY");
+
+        // CREATE_NEW refuses an existing file; CREATE_ALWAYS truncates it
+        assert_eq!(gd.fopen_mode("PFWR.BIN", FOPEN_WRITE | FOPEN_CREATE_NEW), u32::MAX);
+        let h = gd.fopen_mode("PFWR.BIN", FOPEN_WRITE | FOPEN_CREATE_ALWAYS) as u16;
+        assert_eq!(std::fs::read(dir.join("PFWR.BIN")).unwrap(), b"");
+        assert_eq!(gd.fwrite(h, b"new"), 0);
+        gd.fclose(h);
+        assert_eq!(std::fs::read(dir.join("PFWR.BIN")).unwrap(), b"new");
+
+        // a new file in an existing directory (any case); none in a missing one
+        let h = gd.fopen_mode("/SUB/PFNEW.BIN", FOPEN_WRITE | FOPEN_CREATE_ALWAYS);
+        assert_ne!(h, u32::MAX);
+        assert_eq!(gd.fwrite(h as u16, b"s"), 0);
+        gd.fclose(h as u16);
+        assert_eq!(std::fs::read(dir.join("Sub").join("PFNEW.BIN")).unwrap(), b"s");
+        assert_eq!(gd.fopen_mode("/NODIR/PFNEW.BIN", FOPEN_WRITE | FOPEN_CREATE_ALWAYS), u32::MAX);
+        // a missing file without a create mode stays missing
+        assert_eq!(gd.fopen_mode("PFNONE.BIN", FOPEN_WRITE), u32::MAX);
+        assert!(!dir.join("PFNONE.BIN").exists());
     }
 }

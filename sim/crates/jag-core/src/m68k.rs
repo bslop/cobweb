@@ -920,6 +920,7 @@ impl M68k {
     /// | FCLOSE | 11 | d0.w=handle                         | 0 |
     /// | FSEEK  | 12 | d0=(flags<<16)|handle, d1=offset    | 0, or -1 |
     /// | FREAD  | 13 | d0=(flags<<16)|handle, a0=buf, d1=n | **0 = success** |
+    /// | FWRITE | 14 | d0.w=handle, a0=buf, d1=n           | **0 = success** |
     /// | FTELL  | 15 | d0.w=handle                         | position |
     /// | FSIZE  | 0  | d0.w=handle                         | size |
     /// | ASYNCPOS    | 2 | —                              | dst end (a guess) |
@@ -958,6 +959,17 @@ impl M68k {
             // (gamedrive::check_gpu_read_host, platform issue 0014).
             bus.gamedrive.as_mut()?.gpu_read_issued = Some(site);
         }
+        if func == gd::FN_FWRITE && bus.gamedrive.as_ref().is_some_and(|g| g.async_active() != 0) {
+            // The card has one transfer: a write under an outstanding async
+            // read is the read rule's case (platform issue 0015).
+            gd::report_gpu_read_faults(bus, &[("gd_write_during_async", a0)], site);
+        }
+        // The BIOS time of the calls around reads and writes (issue 0015).
+        let mut held = match func {
+            gd::FN_FSEEK => gd::SEEK_CLOCKS,
+            gd::FN_FWRITE => gd::write_cost(d1),
+            _ => 0,
+        };
         let result = match func {
             // INIT has no host-side state to set up.
             gd::FN_INIT => 0,
@@ -999,7 +1011,14 @@ impl M68k {
                     }
                     name.push(c as char);
                 }
-                bus.gamedrive.as_mut()?.fopen(&name)
+                bus.gamedrive.as_mut()?.fopen_mode(&name, d0 as u16)
+            }
+            // GD_FWrite (issue 0015): d0.w = handle, a0 = buffer, d1 = bytes.
+            gd::FN_FWRITE => {
+                bus.gamedrive.as_ref()?;
+                let mut bytes = vec![0u8; d1 as usize];
+                bus.peek(a0, &mut bytes);
+                bus.gamedrive.as_mut()?.fwrite(d0 as u16, &bytes)
             }
             gd::FN_FCLOSE => bus.gamedrive.as_mut()?.fclose(d0 as u16),
             // GD_FREAD_GPU_ASYNC (flags 2) is METERED when --sd-rate is set:
@@ -1070,6 +1089,13 @@ impl M68k {
             _ => return None,
         };
         self.d[0] = result;
+        if matches!(func, gd::FN_FOPEN | gd::FN_FCLOSE) {
+            held = bus.gamedrive.as_ref().map_or(0, |g| g.last_cost);
+        }
+        if held > 0 {
+            self.gd_busy = held;
+            self.gd_busy_depth = self.isr_depth;
+        }
         if func == gd::FN_FREAD && result == 0 {
             let mode = (d0 >> 16) as u16;
             let metered_async = mode == gd::FREAD_GPU_ASYNC
@@ -1409,6 +1435,54 @@ mod gd_fread_tests {
         let mut want = file[..n as usize].to_vec();
         want.extend_from_slice(&[0xEE; 4]);
         (got, want)
+    }
+
+    /// Issue 0015: GD_FOpen with a write mode, GD_FWrite and GD_FClose through
+    /// the traps the bindings reach, with the BIOS time measured on silicon.
+    #[test]
+    fn fwrite_through_the_trap_charges_the_bench_times() {
+        let dir = std::env::temp_dir().join("jagemu_gd_fwrite_trap_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("PFOLD.BIN"), [0u8; 16]).unwrap();
+        let mut bus = Bus::new();
+        bus.gamedrive = Some(gd::GameDrive::new(&dir));
+        let trap = |f: u8| gd::FN_TRAP.iter().find(|(g, _)| *g == f).unwrap().1;
+        let mut cpu = M68k::new();
+        let open = |cpu: &mut M68k, bus: &mut Bus, name: &str, mode: u32| {
+            for (i, c) in name.bytes().chain([0]).enumerate() {
+                bus.write8(0x10000 + i as u32, c);
+            }
+            cpu.a[0] = 0x10000;
+            cpu.d[0] = mode;
+            assert!(cpu.gamedrive_trap(bus, trap(gd::FN_FOPEN)).is_some());
+            cpu.d[0]
+        };
+
+        // overwrite in place: open, 4 bytes from DRAM, close
+        let h = open(&mut cpu, &mut bus, "PFOLD.BIN", gd::FOPEN_WRITE as u32);
+        assert_eq!(cpu.gd_busy, gd::OPEN_CLOCKS);
+        bus.write32(0x20000, 0x1234_5678);
+        cpu.d[0] = h;
+        cpu.d[1] = 4;
+        cpu.a[0] = 0x20000;
+        assert!(cpu.gamedrive_trap(&mut bus, trap(gd::FN_FWRITE)).is_some());
+        assert_eq!(cpu.d[0], 0, "GD_FWrite reports success");
+        assert_eq!(cpu.gd_busy, gd::write_cost(4));
+        cpu.d[0] = h;
+        assert!(cpu.gamedrive_trap(&mut bus, trap(gd::FN_FCLOSE)).is_some());
+        assert_eq!(cpu.gd_busy, gd::CLOSE_WRITTEN_CLOCKS);
+        assert_eq!(std::fs::read(dir.join("PFOLD.BIN")).unwrap()[..5], [0x12, 0x34, 0x56, 0x78, 0]);
+
+        // truncate an existing file, then create a new one: the dearer close
+        open(&mut cpu, &mut bus, "PFOLD.BIN", (gd::FOPEN_WRITE | gd::FOPEN_CREATE_ALWAYS) as u32);
+        assert_eq!(cpu.gd_busy, gd::OPEN_TRUNCATE_CLOCKS);
+        let h = open(&mut cpu, &mut bus, "PFNEW.BIN", (gd::FOPEN_WRITE | gd::FOPEN_CREATE_ALWAYS) as u32);
+        assert_eq!(cpu.gd_busy, gd::OPEN_NEW_CLOCKS);
+        cpu.d[0] = h;
+        assert!(cpu.gamedrive_trap(&mut bus, trap(gd::FN_FCLOSE)).is_some());
+        assert_eq!(cpu.gd_busy, gd::CLOSE_GROWN_CLOCKS);
+        assert!(dir.join("PFNEW.BIN").is_file());
     }
 
     /// Platform bench job 198 (platform issue 0012): into the cart window a

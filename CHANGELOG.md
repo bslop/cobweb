@@ -6,6 +6,22 @@ assigned at release.
 
 ## Unreleased
 
+### 2026-10-12 — jsim: GameDrive writes, `GD_FWrite` and the write open modes (platform issue 0015)
+
+Measured on the bench (jobs 313-344, `calib/results/2026-10-12-gdwrite.md`).
+
+- **BIOS call 14, `GD_FWrite`** (trap 14), and the write and create modes of `GD_FOpen`
+  (`WRITE`, `CREATE_NEW`, `CREATE_ALWAYS`, `OPEN_ALWAYS`, `OPEN_APPEND`, FatFs's values).
+  `--sd` writes into the host directory: a file opened for writing is saved when it is closed.
+  New files are created at the root or in an existing directory; the model makes none.
+- **Times as on silicon:** a write costs 27,000 clocks plus 308 a byte (8 KB: 194 ms); an
+  open 25,000 (35,000 creating a file, 112,000 truncating one); a seek 14,700; a close
+  45,000 after an overwrite, 112,000 after a create. Opens, seeks and closes were free.
+- **A warning** (and `--strict=gd-gpu` stops) for a write issued while a GPU-mode async read
+  is outstanding.
+- Not modelled: what a power cut leaves. On silicon an 8 KB rewrite cut mid-way left a prefix
+  of new 512-byte sectors over the old file, never a torn sector.
+
 ### 2026-10-12 — jsim: the DSP's I2S interrupt runs without `--audio` (platform issue 0015)
 
 - The I2S sample interrupt fired only while jagemu recorded audio (`jagemu audio`,
