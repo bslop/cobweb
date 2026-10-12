@@ -6,6 +6,16 @@ assigned at release.
 
 ## Unreleased
 
+### 2026-10-12 — jsim: the DSP's I2S interrupt runs without `--audio` (platform issue 0015)
+
+- The I2S sample interrupt fired only while jagemu recorded audio (`jagemu audio`,
+  `audiocheck`, or `--audio`). Under `run`, `screenshot`, `dump` and `peek`, a DSP mixer
+  never ran: lib/jag's stream ring never drained, its underrun and sample counters stayed 0,
+  and a game pacing itself on them stalled or misjudged its time. On silicon the interrupt
+  fires whenever SMODE drives the I2S clock, so jsim now does the same; `--audio` only adds
+  the recording. Found by the platform bench `bench/gdwrite`, whose sample counter read 0
+  in jagemu.
+
 ### 2026-10-03 — jsim: the 68000 nearly stalls under a phrase-mode blit (platform issue 0011)
 
 Measured on the bench (jobs 186, 211, 213-219, `calib/results/2026-10-03-cpusd.md`).

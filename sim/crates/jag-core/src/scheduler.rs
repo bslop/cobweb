@@ -185,7 +185,12 @@ impl Scheduler {
 
         // Audio: at the sample rate, fire the DSP I2S interrupt (so sound
         // engines compute the next sample) and capture the current output.
-        if bus.audio_capture {
+        // On silicon the interrupt fires whenever the console drives the I2S
+        // clock (SMODE bit 0, internal), listened to or not. Gating it on
+        // capture froze every DSP mixer under run/screenshot/dump/peek
+        // without --audio: lib/jag's stream ring never drained and its sample
+        // counter stayed 0 (platform bench gdwrite, issue 0015).
+        if bus.audio_capture || bus.jerry.win.r32(mem::SMODE) & 1 != 0 {
             self.tick_audio(risc_ticks, dsp, bus);
         }
 
@@ -283,8 +288,9 @@ impl Scheduler {
         );
     }
 
-    /// Sample the audio output at the I2S frame rate. The rate is derived from
-    /// SCLK (`sysclk / (64*(SCLK+1))` for 16-bit stereo I2S), defaulting to
+    /// Tick the DSP's I2S interrupt at the I2S frame rate and, with capture
+    /// on, sample the audio output. The rate is derived from SCLK
+    /// (`sysclk / (64*(SCLK+1))` for 16-bit stereo I2S), defaulting to
     /// ~44.1 kHz when SCLK is unset. Captures L_I2S/R_I2S, falling back to the
     /// PWM DACs when I2S is silent.
     fn tick_audio(&mut self, ticks: i64, dsp: &mut Risc, bus: &mut Bus) {
@@ -317,6 +323,9 @@ impl Scheduler {
             self.audio_counter += period;
             // Tick the DSP's per-sample I2S interrupt.
             dsp.raise_int(mem::DSP_INT_I2S);
+            if !bus.audio_capture {
+                continue;
+            }
             // Capture the current stereo sample.
             // The DSP writes the DACs with a 32-bit JRISC `store`, and the
             // sample lands in the LOW half; reading the register as 16 bits
@@ -385,6 +394,29 @@ mod tests {
         assert!(bus.audio.iter().any(|&s| s == 1234), "left channel not captured");
         assert!(bus.audio.iter().any(|&s| s == 5678), "right channel not captured");
         assert_eq!(bus.audio_rate, 44_097);
+    }
+
+    /// Without capture the DSP still gets its I2S interrupt once SMODE drives
+    /// the clock, as on silicon (a DSP mixer must run under `run`), and
+    /// nothing is recorded; with the clock off, no interrupt.
+    #[test]
+    fn i2s_ticks_without_capture_when_smode_drives_the_clock() {
+        let mut bus = Bus::new();
+        let mut sched = Scheduler::ntsc();
+        let mut cpu = M68k::new();
+        let mut gpu = Risc::new(RiscKind::Gpu);
+        let mut dsp = Risc::new(RiscKind::Dsp);
+        for _ in 0..200 {
+            sched.advance(100, &mut cpu, &mut gpu, &mut dsp, &mut bus);
+        }
+        assert_eq!(dsp.int_latch & (1 << mem::DSP_INT_I2S), 0, "no I2S clock, no interrupt");
+        bus.jerry.win.w32(mem::SMODE, 0x15);
+        bus.jerry.win.w32(mem::SCLK, 26);
+        for _ in 0..200 {
+            sched.advance(100, &mut cpu, &mut gpu, &mut dsp, &mut bus);
+        }
+        assert_ne!(dsp.int_latch & (1 << mem::DSP_INT_I2S), 0, "the DSP's I2S interrupt");
+        assert!(bus.audio.is_empty(), "nothing captured without capture on");
     }
 
     /// Encode a JRISC instruction word: opcode[15:10] reg1[9:5] reg2[4:0].

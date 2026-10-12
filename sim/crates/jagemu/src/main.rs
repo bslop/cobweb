@@ -37,14 +37,12 @@ fn main() -> ExitCode {
     if rest.iter().any(|a| a == "--full-window") {
         jag_core::tom::set_full_window(true);
     }
-    // ⭐ `--audio` IS GLOBAL, NOT `run`-ONLY. The I2S interrupt fires only when
-    // `bus.audio_capture` is set (scheduler.rs), and only `run` and `ctl` ever
-    // stored this flag - so `dump`/`peek`/`shot` of a sound build silently
-    // observed a FROZEN audio engine. jag_resident lost a run to it: a BGM ring
-    // whose refill is driven by the DSP's play pointer looked broken because
-    // AUD_TICKS never advanced, and the control (a build previously verified
-    // here) read 0 as well. `boot_input` already calls apply_audio(); it just
-    // had nothing to apply. Setting it here makes every subcommand honour it.
+    // ⭐ `--audio` IS GLOBAL, NOT `run`-ONLY: every subcommand records audio
+    // with it (`boot_input` calls apply_audio()). It no longer decides whether
+    // a sound engine runs: the DSP's I2S interrupt now fires whenever SMODE
+    // drives the clock, as on silicon (scheduler.rs). Before that, `dump`/
+    // `peek`/`shot` of a sound build without `--audio` observed a FROZEN
+    // audio engine: a ring refilled from the DSP's play pointer never drained.
     if rest.iter().any(|a| a == "--audio") {
         AUDIO_ON.store(true, std::sync::atomic::Ordering::Relaxed);
     }
