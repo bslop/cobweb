@@ -7,8 +7,11 @@
 //! an assignment whose right side reads its own target. Every jump gets an
 //! explicit `nop` delay slot — correct by construction and left for jopt to
 //! fill. Every `load` and `div` is followed by a read of its destination
-//! (`or rN,rN`), which the scoreboard holds until the result lands, so no later
-//! write can race the in-flight result (writes are not scoreboarded). The
+//! (`move rN,rN`), which the scoreboard holds until the result lands, so no
+//! later write can race the in-flight result (writes are not scoreboarded).
+//! The read is a MOVE, not `or rN,rN`: silicon drops a MOVE that writes the
+//! register an ALU op wrote just before it (platform issue 0016), and `emit`
+//! puts a `nop` between any such pair it is asked for. The
 //! output is fed straight back
 //! through jas, which re-runs the hazard pass, so any codegen slip surfaces as
 //! a compile error rather than silent wrong silicon.
@@ -85,10 +88,33 @@ struct Gen {
     next_var: u16,
     label: usize,
     uses_div: bool,
+    /// The register the last emitted instruction wrote, if an ALU op.
+    alu_dst: Option<String>,
 }
+
+/// ALU mnemonics (result written a cycle after a MOVE's) and the move family
+/// that loses to them; see `Gen::emit`.
+const ALU_MN: &[&str] = &[
+    "add", "addc", "addq", "addqt", "sub", "subc", "subq", "subqt", "neg", "and", "or", "xor",
+    "not", "shlq", "shrq", "sharq", "sh", "sha", "ror", "rorq", "mult", "imult", "abs", "sat8",
+    "sat16", "sat24", "normi", "mtoi", "pack", "unpack", "mmult", "addqmod", "subqmod", "mirror",
+    "sat32s", "bset", "bclr",
+];
+const MOVE_MN: &[&str] = &["move", "moveq", "movefa"];
 
 impl Gen {
     fn emit(&mut self, s: &str) {
+        // [HW] platform issue 0016: `add r7,r8 / moveq #5,r8` leaves the sum
+        // in r8 on silicon. Keep a MOVE off the heels of an ALU op that wrote
+        // the same register.
+        let (mn, ops) = s.split_once(' ').unwrap_or((s, ""));
+        let ops: Vec<&str> = ops.split(',').map(str::trim).collect();
+        let dst = ops.last().copied().unwrap_or("").to_string();
+        let reads_dst = ops.len() > 1 && ops[0] == dst;
+        if MOVE_MN.contains(&mn) && !reads_dst && self.alu_dst.as_deref() == Some(dst.as_str()) {
+            self.out.push_str("        nop\n");
+        }
+        self.alu_dst = ALU_MN.contains(&mn).then_some(dst);
         self.out.push_str("        ");
         self.out.push_str(s);
         self.out.push('\n');
@@ -163,7 +189,7 @@ impl Gen {
                     _ => "load",
                 };
                 self.emit(&format!("{mn} (r{dst}),r{dst}"));
-                self.emit(&format!("or r{dst},r{dst}")); // wait out the load
+                self.emit(&format!("move r{dst},r{dst}")); // wait out the load
                 Ok(())
             }
             Expr::Un(op, x) => {
@@ -211,7 +237,7 @@ impl Gen {
                     Op::Div => {
                         self.uses_div = true;
                         self.emit(&format!("div r{sc},r{dst}"));
-                        self.emit(&format!("or r{dst},r{dst}")); // wait out the divide
+                        self.emit(&format!("move r{dst},r{dst}")); // wait out the divide
                         return Ok(());
                     }
                     Op::SDiv => {
@@ -229,7 +255,7 @@ impl Gen {
                         self.emit(&format!("abs r{dst}"));
                         self.emit(&format!("abs r{sc}"));
                         self.emit(&format!("div r{sc},r{dst}"));
-                        self.emit(&format!("or r{dst},r{dst}")); // wait out the divide
+                        self.emit(&format!("move r{dst},r{dst}")); // wait out the divide
                         self.emit(&format!("xor r{s},r{dst}"));
                         self.emit(&format!("sub r{s},r{dst}"));
                         return Ok(());
@@ -372,6 +398,7 @@ pub fn generate(prog: &[Stmt]) -> Result<(String, Vec<(String, u16)>), CompileEr
         next_var: *VAR_REGS.start(),
         label: 0,
         uses_div: false,
+        alu_dst: None,
     };
     for s in prog {
         g.stmt(s)?;

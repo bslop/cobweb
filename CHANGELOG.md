@@ -6,6 +6,34 @@ assigned at release.
 
 ## Unreleased
 
+### 2026-10-14 — jsim, jas, jcc: a MOVE lost behind an ALU write; G_HIDATA latches every bus read (platform issue 0016)
+
+Measured on the bench (jobs 395-400, `calib/results/2026-10-14-gpuhaz.md`). jsim ran both
+in program order, so kernels that were right in jagemu were wrong on the console.
+
+- **A MOVE right behind an ALU op writing the same register is dropped** on the GPU and the
+  DSP: `add r7,r8 / move r6,r8` leaves the sum in r8, and so do `moveq`, `movefa` and
+  `move pc`, after `add`, `sub`, `addq`, `addqt`, `shlq`, `mult`, `imult` or `or`. A
+  conditional jump that falls through makes its delay slot and the next instruction
+  adjacent; a taken jump, `movei`, a load or any instruction between is safe. jsim drops the
+  write under `--fidelity silicon` and counts `alu_move_waw` (with its first PC) under every
+  fidelity, with a warning; `--strict=alu-move` stops there. jas rejects the pair.
+- **The bug-13 guard `or rN,rN` followed straight by a MOVE to rN is that hazard**
+  (`load / or r8,r8 / moveq #5,r8` keeps the loaded value on silicon). jas's fix-it for
+  bug 13 now suggests `move rN,rN`, and jcc settles its loads and divides with
+  `move rN,rN` and puts a `nop` between any ALU op and a MOVE to the same register it
+  would emit. The jas test that accepted `or r2,r2 / moveq #3,r2` now rejects it.
+- **Every GPU load from the main bus writes G_HIDATA**: DRAM, the cartridge, DSP RAM,
+  Tom's video registers and Jerry's registers (not GPU RAM, the Blitter registers or the
+  GPU's own registers). It gets the upper half of the 64-bit bus when the load lands: the
+  load's own byte lanes (a long at A%8 = 0 all four, at A%8 = 4 none), and in the others
+  whatever was last there, including the GPU's own stores (their data repeated) and other
+  masters' traffic. jsim models the GPU's part under `--fidelity silicon`, and STOREP now
+  takes the newest G_HIDATA (a load in flight at the STOREP included), as on silicon. It
+  counts `hidata_clobbers` (a G_HIDATA read or STOREP after such a load, with the PCs of
+  both) under every fidelity, with a warning; `--strict=hidata` stops there.
+- `RISC_ISA.md` §9 rules 9 and 10 and AGENTS.md state both.
+
 ### 2026-10-12 — jcc68k: adjacent string literals join
 
 - jcc68k rejected `"ab" "cd"` (`expected ')'`), as in `DIR "/F.BIN"` after a macro. Adjacent

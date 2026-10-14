@@ -144,7 +144,12 @@ domain May 14, 1999 — the platform itself is legally open.
 - Scoreboard protects **reads only**. Two unprotected-write bugs define hard
   codegen invariants:
   - **Never write a register twice without an intervening read** (bug 13; WAW
-    completes out of order). Canonical guard: `or rn,rn`.
+    completes out of order). Canonical guard: `move rn,rn` (`or rn,rn` works,
+    but a MOVE straight after it to rn is dropped: see the next item).
+  - **A MOVE right behind an ALU write of the same register is dropped** [HW,
+    platform issue 0016]: ALU ops write at cycle 3, MOVEs at cycle 2, and the ALU
+    value wins. A conditional jump's delay slot and its fall-through instruction
+    count as adjacent.
   - **Indexed stores don't scoreboard their data register** (bug 2) — unsafe when
     data comes from DIV or an external load; interpose a dependent op.
   - Same class: consecutive DIVs < 16 clocks apart using the first quotient (bug 25).

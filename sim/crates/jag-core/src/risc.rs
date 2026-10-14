@@ -87,6 +87,27 @@ pub struct Risc {
     /// with the same load latency the register result gets.
     pub hidata_next: u32,
     pub hidata_ready: u64,
+    /// The upper half (bits 63..32) of the 64-bit data bus as the GPU's own
+    /// accesses last left it, byte lanes in big-endian order. **[HW]** Every
+    /// GPU read outside its own RAM and registers copies this into G_HIDATA
+    /// when it lands (platform issue 0016, bench jobs 395-397): a read drives
+    /// only its own byte lanes (a long at A%8 = 0 all four, at A%8 = 4 none, a
+    /// word or byte its own), and the rest keep what was there. A store drives
+    /// all four with its data repeated. Silicon's undriven lanes also carry the
+    /// 68000's, the Object Processor's and the Blitter's traffic; jsim keeps
+    /// only the GPU's, so where silicon shows another master's bytes jsim
+    /// shows the GPU's last ones.
+    bus_hi: u32,
+    /// Such a read has replaced G_HIDATA since the last LOADP or G_HIDATA
+    /// store (`Stats::hidata_clobbers` counts the next use), and its PC.
+    hidata_dirty: bool,
+    hidata_dirty_pc: u32,
+    /// The instruction just executed latched G_HIDATA: the timed step sets
+    /// `hidata_ready` to when its load lands.
+    hidata_latched: bool,
+    /// The register (bank * 32 + n) the previous instruction wrote, if it was
+    /// an ALU-class op; see `Stats::alu_move_waw`.
+    last_alu_write: Option<u8>,
     pub modulo: u32,      // D_MOD for ADDQMOD/SUBQMOD (DSP)
     pub mac: i64,         // MAC accumulator (40-bit on DSP, modeled as i64)
     /// IMULTN/IMACN read their operand REGISTERS one cycle after issue on
@@ -269,6 +290,11 @@ impl Risc {
             hidata: 0,
             hidata_next: 0,
             hidata_ready: 0,
+            bus_hi: 0,
+            hidata_dirty: false,
+            hidata_dirty_pc: 0,
+            hidata_latched: false,
+            last_alu_write: None,
             modulo: 0,
             mac: 0,
             mac_pending: None,
@@ -363,9 +389,13 @@ impl Risc {
 
     /// Latch the first strict fault (PC and address) on this core.
     pub(crate) fn strict_trip(&mut self, kind: &'static str, addr: u32) {
-        if self.strict_fault.is_none() && !self.strict.exempts(kind, self.pc, addr) {
+        self.strict_trip_at(kind, self.pc, addr);
+    }
+
+    fn strict_trip_at(&mut self, kind: &'static str, pc: u32, addr: u32) {
+        if self.strict_fault.is_none() && !self.strict.exempts(kind, pc, addr) {
             let master = if self.kind.is_dsp() { "dsp" } else { "gpu" };
-            self.strict_fault = Some(crate::debug::StrictFault { kind, master, pc: self.pc, addr });
+            self.strict_fault = Some(crate::debug::StrictFault { kind, master, pc, addr });
         }
     }
 
@@ -379,6 +409,11 @@ impl Risc {
         self.hidata = 0;
         self.hidata_next = 0;
         self.hidata_ready = 0;
+        self.bus_hi = 0;
+        self.hidata_dirty = false;
+        self.hidata_dirty_pc = 0;
+        self.hidata_latched = false;
+        self.last_alu_write = None;
         self.modulo = 0;
         self.mac = 0;
         self.mac_pending = None;
@@ -407,6 +442,95 @@ impl Risc {
             self.hidata = self.hidata_next;
         }
         self.hidata
+    }
+
+    /// Does a GPU access to `addr` go over the main data bus? Everything but
+    /// Tom's GPU/Blitter block and the GPU's own RAM ($F02000-$F03FFF) does,
+    /// Tom's video registers included. [HW] bench jobs 396-397: loads of
+    /// DRAM, the cartridge, DSP RAM, $F00004 and a Jerry register latched
+    /// G_HIDATA; loads of GPU RAM and of B_CMD did not.
+    #[inline]
+    fn on_main_bus(addr: u32) -> bool {
+        !(0x00F0_2000..0x00F0_4000).contains(&(addr & 0x00FF_FFFF))
+    }
+
+    /// A GPU load of `bytes` (1, 2 or 4) from `addr` returned `v`: drive its
+    /// byte lanes of the bus's upper half, and latch G_HIDATA (see `bus_hi`).
+    pub(super) fn gpu_bus_read(&mut self, addr: u32, bytes: u32, v: u32) {
+        if self.kind.is_dsp() || !Self::on_main_bus(addr) {
+            return;
+        }
+        let off = addr & 7 & !(bytes - 1);
+        if off < 4 {
+            let shift = (4 - off - bytes) * 8;
+            let mask = (u32::MAX >> (32 - bytes * 8)) << shift;
+            self.bus_hi = (self.bus_hi & !mask) | ((v << shift) & mask);
+        }
+        self.hidata_dirty = true;
+        self.hidata_dirty_pc = self.pc.wrapping_sub(2);
+        if self.fidelity == Fidelity::Silicon {
+            self.hidata_next = self.bus_hi;
+            self.hidata_latched = true;
+        }
+    }
+
+    /// A GPU store of `bytes` of `v` to `addr`: the data, repeated across
+    /// the word, drives every byte lane of the bus's upper half ([HW] bench
+    /// job 397: a long stored at A%8 = 4, a word and a byte all did). It
+    /// does not latch G_HIDATA.
+    pub(super) fn gpu_bus_write(&mut self, addr: u32, bytes: u32, v: u32) {
+        if self.kind.is_dsp() || !Self::on_main_bus(addr) {
+            return;
+        }
+        self.bus_hi = match bytes {
+            4 => v,
+            2 => (v & 0xFFFF) * 0x0001_0001,
+            _ => (v & 0xFF) * 0x0101_0101,
+        };
+    }
+
+    /// A LOADP from `addr` brought `hi` (or a store to G_HIDATA wrote it):
+    /// G_HIDATA holds the program's value again.
+    pub(super) fn hidata_set(&mut self, addr: Option<u32>, hi: u32) {
+        if let Some(a) = addr {
+            if Self::on_main_bus(a) {
+                self.bus_hi = hi;
+            }
+        }
+        self.hidata_dirty = false;
+    }
+
+    /// G_HIDATA is used (read, or written out by STOREP): count it if a read
+    /// replaced the program's value since it was set.
+    pub(super) fn hidata_use(&mut self) {
+        if !self.hidata_dirty {
+            return;
+        }
+        let pc = self.pc.wrapping_sub(2);
+        let st = &mut self.pipe.stats;
+        if st.hidata_clobbers == 0 {
+            st.hidata_clobber_first_pc = pc;
+            st.hidata_clobber_load_pc = self.hidata_dirty_pc;
+        }
+        st.hidata_clobbers += 1;
+        if self.strict.hidata {
+            let at = self.hidata_dirty_pc;
+            self.strict_trip_at("hidata_clobbered", pc, at);
+        }
+    }
+
+    /// ALU-class register writers: the result is written a cycle after a
+    /// MOVE's would be (TRM: ALU at cycle 3, MOVE at cycle 2), so a MOVE right
+    /// behind one to the same register loses (see `Stats::alu_move_waw`).
+    /// Measured: ADD, SUB, ADDQ, ADDQT, SHLQ, MULT, IMULT; the rest by the
+    /// TRM's timing table.
+    fn alu_writer(op: u8, dsp: bool) -> bool {
+        match op {
+            0..=12 | 14..=17 | 22..=29 | 32 | 33 | 54 | 55 | 56 | 63 => true,
+            62 => !dsp,
+            42 | 48 => dsp,
+            _ => false,
+        }
     }
 
     /// Is `addr` inside this core's local SRAM?
@@ -546,7 +670,10 @@ impl Risc {
                 0x00 => self.flags,
                 0x10 => self.pc,
                 0x14 => self.ctrl,
-                0x18 if !self.kind.is_dsp() => self.hidata_now(),
+                0x18 if !self.kind.is_dsp() => {
+                    self.hidata_use();
+                    self.hidata_now()
+                }
                 0x18 => self.modulo,
                 0x1C => self.div_remainder,
                 _ => self.win_r32(bus, addr),
@@ -583,11 +710,14 @@ impl Risc {
                         self.strict_trip("dram_stale", a);
                     }
                     if self.dram_stale_subst {
+                        self.gpu_bus_read(a, 4, po);
                         return po;
                     }
                 }
             }
-            bus.read32(a)
+            let v = bus.read32(a);
+            self.gpu_bus_read(a, 4, v);
+            v
         }
     }
 
@@ -630,6 +760,7 @@ impl Risc {
                     self.hidata = val;
                     self.hidata_next = val;
                     self.hidata_ready = 0;
+                    self.hidata_set(None, val);
                 }
                 0x18 => self.modulo = val,
                 0x1C => self.div_offset = val & mem::DIV_OFFSET != 0,
@@ -649,6 +780,7 @@ impl Risc {
                 self.posted_head = (self.posted_head + 1) % Self::POSTED_N;
             }
             bus.write32(a, val);   // JRISC ignores the low 2 bits
+            self.gpu_bus_write(a, 4, val);
         }
     }
 
@@ -680,6 +812,7 @@ impl Risc {
             // real silicon. `slot_movei` is documented hardware-fatal, so a
             // false one costs a session chasing a hazard that is not there.
             self.prev_was_jump = false;
+            self.last_alu_write = None;
         }
 
         // CPU→RISC forced interrupt: the 68k (or the other RISC) sets FORCEINT0
@@ -720,8 +853,8 @@ impl Risc {
             // jump's delay slot, which must run before the transfer). Done before
             // the breakpoint check so an interrupt-vector target (e.g. an ISR
             // entry) is caught rather than executed past.
-            if self.pending_jump.is_none() {
-                self.service_interrupt(bus);
+            if self.pending_jump.is_none() && self.service_interrupt(bus) {
+                self.last_alu_write = None;
             }
             // PC breakpoint: stop before executing the marked instruction so the
             // caller can inspect registers at exactly that point. Not taken in a
@@ -870,6 +1003,15 @@ impl Risc {
         // attribute every stalled tick to the instruction that paid for it.
         let pc0 = self.pc;
         let stats0 = self.prof.as_ref().map(|_| self.pipe.stats.clone());
+        // A MOVE-class write right behind an ALU-class write of the same
+        // register is dropped on silicon (`Stats::alu_move_waw`). Peeked
+        // here, before either path fetches: code lives in RAM.
+        let iw = bus.read16(pc0);
+        let (op, r1, r2) = (((iw >> 10) & 0x3F) as u8, ((iw >> 5) & 0x1F) as usize, (iw & 0x1F) as usize);
+        let bank = self.cur_bank();
+        let dst = (bank * 32 + r2) as u8;
+        let mover = matches!(op, 35 | 37 | 51) || (op == 34 && r1 != r2);
+        let alu_kept = (mover && self.last_alu_write == Some(dst)).then(|| self.regs[bank][r2]);
         let mut cost = if self.fidelity == Fidelity::Functional {
             let iw = self.fetch16(bus);
             let op = ((iw >> 10) & 0x3F) as u8;
@@ -880,6 +1022,21 @@ impl Risc {
         } else {
             self.step_timed(bus, in_slot)
         };
+        self.hidata_latched = false;
+        if let Some(kept) = alu_kept {
+            let st = &mut self.pipe.stats;
+            if st.alu_move_waw == 0 {
+                st.alu_move_waw_first_pc = pc0;
+            }
+            st.alu_move_waw += 1;
+            if self.fidelity == Fidelity::Silicon {
+                self.regs[bank][r2] = kept;
+            }
+            if self.strict.alu_move {
+                self.strict_trip_at("alu_move_waw", pc0, r2 as u32);
+            }
+        }
+        self.last_alu_write = Self::alu_writer(op, self.kind.is_dsp()).then_some(dst);
         self.instret += 1;
         if self.regpage_settle > 0 {
             self.regpage_settle -= 1;
@@ -892,6 +1049,7 @@ impl Risc {
         // (delay-slot) instruction has run.
         if let Some(target) = was_pending {
             self.pc = target;
+            self.last_alu_write = None;
             if self.fidelity != Fidelity::Functional {
                 self.pipe.taken_jump();
                 cost += timing::Lat::JUMP_REFILL;
@@ -1152,7 +1310,7 @@ impl Risc {
                 // LOADP's high long (G_HIDATA) lands with the same latency as
                 // the register half, but unscoreboarded — a read before this
                 // tick sees the stale value, as on silicon.
-                if op == 42 && is_gpu {
+                if op == 42 && is_gpu || self.hidata_latched {
                     self.hidata_ready = end - 1 + lat;
                 }
             } else if !matches!(op, 34 | 35 | 36 | 37 | 38 | 51 | 19) {

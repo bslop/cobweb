@@ -14,6 +14,9 @@
 //!   a 3-word instruction in the single slot is unverified on hardware).
 //! * **nop+nop after a jump** (warning): the old two-NOP convention wasting a
 //!   real delay slot.
+//! * **A MOVE right behind an ALU op writing the same register**: silicon
+//!   drops the MOVE's write (platform issue 0016), including a conditional
+//!   jump's delay slot followed by its fall-through instruction.
 //!
 //! The model is linear (one pass, straight-line) — it does not follow branches
 //! (though an UNCONDITIONAL jump does end the fall-through, and the shadow
@@ -202,6 +205,17 @@ fn classify(e: &Emitted) -> Option<Acc> {
     Some(Acc { reads, write, slow, indexed_store_data, rmw_dst_only, op })
 }
 
+/// ALU-class register writers (TRM: written at cycle 3, a MOVE at cycle 2).
+/// Mirrors jag-core's `Risc::alu_writer`.
+fn alu_writer(op: u8, dsp: bool) -> bool {
+    match op {
+        0..=12 | 14..=17 | 22..=29 | 32 | 33 | 54 | 55 | 56 | 63 => true,
+        62 => !dsp,
+        42 | 48 => dsp,
+        _ => false,
+    }
+}
+
 fn is_jump(op: u8) -> bool {
     op == 52 || op == 53
 }
@@ -213,6 +227,8 @@ pub fn check(emitted: &[Emitted]) -> Vec<Diag> {
     let mut pending: HashMap<u8, Pend> = HashMap::new();
     // the IMULTN/IMACN of the previous instruction: (line, r1, r2)
     let mut mac_prev: Option<(usize, u8, u8)> = None;
+    // the previous instruction, if an ALU op: (line, the register it wrote)
+    let mut alu_prev: Option<(usize, u8)> = None;
 
     // Only instruction-bearing entries participate; keep their indices so we can
     // look at the delay slot (the next instruction).
@@ -406,6 +422,46 @@ pub fn check(emitted: &[Emitted]) -> Vec<Diag> {
             mac_prev = Some((e.line, acc.reads[0], acc.reads[1]));
         }
 
+        // [HW] An ALU op writes its register a cycle later than a MOVE does,
+        // so a MOVE right behind one to the same register is DROPPED: the
+        // register keeps the ALU result (platform issue 0016, bench jobs
+        // 395-400, GPU and DSP alike). `add r7,r8 / moveq #5,r8` leaves the
+        // sum; so does `or r8,r8 / moveq #5,r8`, the bug-13 guard followed by
+        // the overwrite it guards. A conditional jump that falls through runs
+        // its delay slot and the next instruction back to back, so a slot
+        // computing for the taken path must not feed a fall-through MOVE.
+        // MOVEI, a load, a taken jump or any instruction between are safe.
+        let mover = matches!(acc.op, 35 | 37 | 51) || (acc.op == 34 && !acc.reads.contains(&acc.write.unwrap_or(32)));
+        if let (Some((aline, ar)), true) = (alu_prev.take(), mover) {
+            if acc.write == Some(ar) {
+                let what = match acc.op {
+                    35 => "moveq",
+                    37 => "movefa",
+                    51 => "move pc",
+                    _ => "move",
+                };
+                diags.push(Diag::error(
+                    e.line,
+                    format!(
+                        "{what} to r{ar} right after the ALU op at line {aline} that writes it — \
+                         silicon drops the {what} and r{ar} keeps the ALU result (platform issue 0016; \
+                         a conditional jump's delay slot and its fall-through instruction count as adjacent)"
+                    ),
+                ).with_fix(format!(
+                    "put an instruction between the two, or give one of them another register \
+                     (to settle a load before overwriting it, use `move r{ar},r{ar}`, not `or r{ar},r{ar}`)"
+                )));
+            }
+        }
+        if alu_writer(acc.op, e.target == crate::Target::Dsp) {
+            alu_prev = acc.write.map(|w| (e.line, w));
+        }
+        // The delay slot of an UNCONDITIONAL jump is never followed by the
+        // next instruction.
+        if clear_after == Some(i) {
+            alu_prev = None;
+        }
+
         // Write-after-write into a shadow (bug 13): writing a register still in
         // flight from a slow producer, when this instruction did NOT also read
         // it — but only if the write lands inside the shadow.
@@ -421,7 +477,7 @@ pub fn check(emitted: &[Emitted]) -> Vec<Diag> {
                                  (TRM bug 13: writes are not scoreboarded — the slow value lands LAST)",
                                 p.line
                             ),
-                        ).with_fix(format!("read r{w} first (`or r{w},r{w}` or `move r{w},r{w}` — any read settles it) or reorder so the slow result is consumed before overwrite")));
+                        ).with_fix(format!("read r{w} first (`move r{w},r{w}` — any read settles it; not `or r{w},r{w}` straight before a MOVE, see issue 0016) or reorder so the slow result is consumed before overwrite")));
                     }
                 }
             }

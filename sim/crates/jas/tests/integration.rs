@@ -339,16 +339,65 @@ fn rejects_waw_into_load_shadow() {
 
 #[test]
 fn accepts_waw_guarded_by_read() {
-    // reading r2 (or r2,r2) settles the scoreboard before the overwrite.
+    // reading r2 (or r2,r2) settles the scoreboard before the overwrite, but
+    // the overwrite must not be a MOVE straight after the `or`: silicon drops
+    // a MOVE right behind an ALU op writing the same register (platform issue
+    // 0016, bench jobs 398-400: `load / or r8,r8 / moveq #5,r8` left the
+    // loaded value). One instruction between is enough.
     let out = assemble(
         "        .gpu\n\
          \x20       movei #$100000,r3\n\
          \x20       load (r3),r2\n\
          \x20       or r2,r2\n\
+         \x20       nop\n\
          \x20       moveq #3,r2\n",
         &Options::default(),
     );
     assert_eq!(out.errors(), 0, "{:#?}", out.diags);
+    let errs = errors_of(
+        "        .gpu\n\
+         \x20       movei #$100000,r3\n\
+         \x20       load (r3),r2\n\
+         \x20       or r2,r2\n\
+         \x20       moveq #3,r2\n",
+    );
+    assert_eq!(errs.len(), 1, "got: {errs:?}");
+    assert!(errs[0].contains("issue 0016") && !errs[0].contains("bug 13"), "got: {errs:?}");
+}
+
+#[test]
+fn rejects_move_right_after_alu_write() {
+    // [HW] platform issue 0016 (bench jobs 395-400): on the GPU and the DSP
+    // the MOVE's write is lost; a conditional jump's delay slot and its
+    // fall-through instruction are adjacent too.
+    for (body, what) in [
+        ("add r7,r8\n        move r6,r8\n", "move"),
+        ("shlq #1,r8\n        moveq #5,r8\n", "moveq"),
+        ("imult r7,r8\n        movefa r6,r8\n", "movefa"),
+        ("addqt #1,r8\n        move pc,r8\n", "move pc"),
+        ("jr ne,x\n        add r7,r8\n        move r6,r8\nx:      nop\n", "move"),
+    ] {
+        for core in [".gpu", ".dsp"] {
+            let errs = errors_of(&format!("        {core}\n        {body}"));
+            assert!(
+                errs.iter().any(|e| e.contains(&format!("{what} to r8 right after the ALU op"))),
+                "{core} {body:?}: {errs:?}"
+            );
+        }
+    }
+    // safe: something between, MOVEI, a read of r8, another register, and
+    // the slot of an UNCONDITIONAL jump (the next instruction never follows it)
+    for body in [
+        "add r7,r8\n        nop\n        move r6,r8\n",
+        "add r7,r8\n        movei #$1234,r8\n",
+        "add r7,r8\n        move r8,r9\n",
+        "add r7,r8\n        move r6,r9\n",
+        "jr t,x\n        add r7,r8\nx:      move r6,r8\n",
+        "jr eq,x\n        add r7,r8\n        nop\nx:      move r6,r8\n",
+    ] {
+        let errs = errors_of(&format!("        .gpu\n        {body}"));
+        assert!(errs.is_empty(), "{body:?}: {errs:?}");
+    }
 }
 
 #[test]

@@ -216,6 +216,26 @@ pub struct TimingStats {
     /// Bug-13 write-after-write hazards (a write raced a pending load/div).
     /// Under `Silicon` the slow value lands last, as on hardware.
     pub waw_hazards: u64,
+    /// A MOVE, MOVEQ, MOVEFA or MOVE PC writing the register the instruction
+    /// just before it (an ALU-class op: ADD, SUBQ, SHLQ, MULT, ...) wrote.
+    /// **[HW]** Silicon drops the move's write: the ALU result, written a
+    /// cycle later, is what the register holds, on the GPU and the DSP alike
+    /// (platform issue 0016, bench jobs 395-397). A conditional jump that falls
+    /// through makes its delay slot and the next instruction adjacent; a taken
+    /// jump, or any instruction between the two, does not. Under `Silicon` the
+    /// move's write is discarded; every profile counts it.
+    pub alu_move_waw: u64,
+    pub alu_move_waw_first_pc: u32,
+    /// G_HIDATA reads and STOREPs whose high long is no longer what the last
+    /// LOADP or G_HIDATA store left, because a GPU read outside the GPU's own
+    /// RAM and registers came between. **[HW]** Every such read copies the
+    /// upper half of the 64-bit data bus into G_HIDATA (platform issue 0016,
+    /// bench jobs 395-397). Under `Silicon` jsim models the latch; every
+    /// profile counts the use. First use PC, and the PC of the read that
+    /// overwrote it.
+    pub hidata_clobbers: u64,
+    pub hidata_clobber_first_pc: u32,
+    pub hidata_clobber_load_pc: u32,
     /// Register-touching instructions executed inside the 3-instruction
     /// settle window after a store to the core's own FLAGS register changed
     /// REGPAGE. Silicon applies the bank flip with a short delay, so these

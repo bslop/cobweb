@@ -68,7 +68,15 @@ Two cautions when reading a RISC profile:
 - **JRISC has exactly ONE delay slot** after JUMP/JR, always executed.
   Never place MOVEI or another jump in it.
 - **Writes are not scoreboarded**: never write a register that has a
-  pending load or DIV result without an intervening read (bug 13).
+  pending load or DIV result without an intervening read (bug 13). Make
+  that read `move rN,rN`, or keep an instruction between it and the write.
+- **A MOVE right behind an ALU op writing the same register is lost**
+  (`add r7,r8 / move r6,r8` leaves the sum; `or r8,r8 / moveq #5,r8` too).
+  A conditional jump's delay slot and its fall-through instruction are
+  adjacent (issue 0016, `RISC_ISA.md` §9 rule 9).
+- **Any GPU load from the main bus overwrites G_HIDATA**: read G_HIDATA
+  before it, and keep such loads out of a G_HIDATA store → STOREP window
+  (issue 0016, `RISC_ISA.md` §9 rule 10).
 - **Indexed stores don't scoreboard their DATA register** — touch the
   register (`or rN,rN`) after a DIV/load before storing it via `(R14+n)`.
 - **JR reaches only ±15 words** — long back-edges need `movei` + `jump (rN)`.

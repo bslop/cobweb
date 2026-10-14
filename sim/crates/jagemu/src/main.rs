@@ -111,14 +111,16 @@ fn usage() {
          \x20      [--gpu-map g.map] [--dsp-map d.map] [--start S] [--top K] [--bucket N]\n\
          \x20      [--prof-json p.json]      # full per-PC profile; diff two with profdiff.py\n\
          \x20 jagemu run <rom> --watchdog N   # warn if a core runs N frames without clearing GO\n\
-         \x20 --strict[=narrow,dram-stale,roundtrip,div0,int2,op-align,gd-gpu]   (any command that boots a ROM)\n\
+         \x20 --strict[=narrow,dram-stale,roundtrip,div0,int2,op-align,gd-gpu,alu-move,hidata]   (any command that boots a ROM)\n\
          \x20                   stop at the first silicon fault jsim would run through:\n\
          \x20                   narrow GPU/DSP local-RAM access, JAGEMU_DRAM_STALE hit,\n\
          \x20                   store->load DRAM round trip, DIV by zero, a 68000 rte\n\
          \x20                   out of an interrupt that never wrote INT2, an unscaled\n\
          \x20                   OP bitmap object at 8 mod 16, a GameDrive GPU-mode\n\
-         \x20                   read whose GPU host breaks a rule (each also warns\n\
-         \x20                   once without --strict). Bare = all.\n\
+         \x20                   read whose GPU host breaks a rule, a MOVE right after\n\
+         \x20                   an ALU op writing the same register, a G_HIDATA use\n\
+         \x20                   after a load replaced it (each also warns once\n\
+         \x20                   without --strict). Bare = all.\n\
          \x20                   The JSON's \"strict_fault\" names it (PC, address); exit 3\n\
          \x20 --strict-exempt=[check:]pc=LO[-HI] | [check:]addr=LO[-HI]   (repeatable)\n\
          \x20                   count but do not stop on a known-safe site (hex numbers),\n\
@@ -458,6 +460,31 @@ fn report_hazard_diagnostics(jag: &Jaguar) {
                 t.div_by_zero, t.div_by_zero_first_pc, t.div_by_zero_last_pc
             );
         }
+    }
+    for (name, t) in [("Tom GPU", &jag.gpu.pipe.stats), ("Jerry DSP", &jag.dsp.pipe.stats)] {
+        if t.alu_move_waw > 0 {
+            eprintln!(
+                "jagemu: WARNING — {name} executed {} MOVE/MOVEQ/MOVEFA/MOVE PC write(s) to the \
+                 register the instruction just before it (an ALU op) wrote (first at PC ${:06X}). \
+                 Silicon drops the move's write and keeps the ALU result (platform issue 0016); \
+                 a conditional jump that falls through puts its delay slot right before the next \
+                 instruction. --fidelity silicon models it; other fidelities run the move. Put \
+                 an instruction between the two, or use another register.",
+                t.alu_move_waw, t.alu_move_waw_first_pc
+            );
+        }
+    }
+    if jag.gpu.pipe.stats.hidata_clobbers > 0 {
+        let t = &jag.gpu.pipe.stats;
+        eprintln!(
+            "jagemu: WARNING — Tom GPU used G_HIDATA {} time(s) (a read, or a STOREP) after a \
+             load from outside its own RAM and registers replaced it (first use at PC ${:06X}, \
+             the load at PC ${:06X}). On silicon every such load copies the upper half of the \
+             64-bit bus into G_HIDATA, so the LOADP's high long (or the value stored there) is \
+             gone (platform issue 0016). --fidelity silicon models it; other fidelities keep \
+             the old value. Read G_HIDATA before any such load, or do those loads first.",
+            t.hidata_clobbers, t.hidata_clobber_first_pc, t.hidata_clobber_load_pc
+        );
     }
     for (name, t) in [("Tom GPU", &jag.gpu.pipe.stats), ("Jerry DSP", &jag.dsp.pipe.stats)] {
         if t.narrow_sram > 0 {
@@ -2540,15 +2567,17 @@ fn state_json(jag: &Jaguar) -> String {
     )
 }
 
-/// Stall attribution + hazard counters from the jsim truth layer. All zeros
-/// under the default `functional` fidelity.
+/// Stall attribution + hazard counters from the jsim truth layer. The stall
+/// counters are zero under the default `functional` fidelity; the hazard
+/// detectors that do not need timing (alu_move_waw, hidata_clobbers, the
+/// round trips, ...) count under every fidelity.
 fn timing_json(t: &TimingStats) -> String {
     format!(
         "{{\"stall_alu\":{},\"stall_load\":{},\"stall_div\":{},\"stall_flags\":{},\
          \"stall_div_busy\":{},\"jump_refill\":{},\"fetch_external\":{},\"mem_external\":{},\
          \"waw_hazards\":{},\"regpage_hazard\":{},\"indexed_store_stale\":{},\"slot_movei\":{},\"slot_jump\":{},\
          \"bigpemu_divergence\":{},\"contention\":{},\"dram_under_blit\":{},\"blit\":{},\
-         \"unaligned_risc32\":{},\"dram_stale\":{},\"dram_stale_pc\":\"0x{:06X}\",\"blit_count\":{},\"blit_launch\":{},\"blit_transfer\":{},\"blit_wait\":{},\"div_by_zero\":{},\"div_by_zero_first_pc\":\"0x{:06X}\",\"div_by_zero_last_pc\":\"0x{:06X}\",\"store_load_roundtrips\":{},\"store_load_first_pc\":\"0x{:06X}\",\"store_load_last_pc\":\"0x{:06X}\",\"store_load_last_addr\":\"0x{:06X}\",\"store_load_min_gap\":{},\"park_spin_max\":{},\"int2_starved\":{}}}",
+         \"unaligned_risc32\":{},\"dram_stale\":{},\"dram_stale_pc\":\"0x{:06X}\",\"blit_count\":{},\"blit_launch\":{},\"blit_transfer\":{},\"blit_wait\":{},\"div_by_zero\":{},\"div_by_zero_first_pc\":\"0x{:06X}\",\"div_by_zero_last_pc\":\"0x{:06X}\",\"store_load_roundtrips\":{},\"store_load_first_pc\":\"0x{:06X}\",\"store_load_last_pc\":\"0x{:06X}\",\"store_load_last_addr\":\"0x{:06X}\",\"store_load_min_gap\":{},\"park_spin_max\":{},\"int2_starved\":{},\"alu_move_waw\":{},\"alu_move_waw_first_pc\":\"0x{:06X}\",\"hidata_clobbers\":{},\"hidata_clobber_first_pc\":\"0x{:06X}\",\"hidata_clobber_load_pc\":\"0x{:06X}\"}}",
         t.stall_alu,
         t.stall_load,
         t.stall_div,
@@ -2583,6 +2612,11 @@ fn timing_json(t: &TimingStats) -> String {
         t.store_load_min_gap,
         t.park_spin_max,
         t.int2_starved,
+        t.alu_move_waw,
+        t.alu_move_waw_first_pc,
+        t.hidata_clobbers,
+        t.hidata_clobber_first_pc,
+        t.hidata_clobber_load_pc,
     )
 }
 

@@ -362,10 +362,12 @@ pub(super) fn execute(core: &mut Risc, bus: &mut Bus, iw: u16) {
         }
         39 => {
             let v = if core.note_narrow_sram(s) { Risc::NARROW_POISON & 0xFF } else { bus.read8(s) as u32 };
+            core.gpu_bus_read(s, 1, v);
             core.set_reg(b, r2, v);
         }
         40 => {
             let v = if core.note_narrow_sram(s) { Risc::NARROW_POISON & 0xFFFF } else { bus.read16(s) as u32 };
+            core.gpu_bus_read(s, 2, v);
             core.set_reg(b, r2, v);
         }
         41 => {
@@ -383,7 +385,9 @@ pub(super) fn execute(core: &mut Risc, bus: &mut Bus, iw: u16) {
                 // address. hidata (bits 63..32) ← [A]; Rd (bits 31..0) ← [A+4].
                 // The high long lands LATE and unscoreboarded (see
                 // Risc::hidata_now) — stage it rather than applying instantly.
-                core.hidata_next = bus.read32(s);
+                let hi = bus.read32(s);
+                core.hidata_next = hi;
+                core.hidata_set(Some(s), hi);
                 core.set_reg(b, r2, bus.read32(s.wrapping_add(4)));
             }
         }
@@ -403,11 +407,13 @@ pub(super) fn execute(core: &mut Risc, bus: &mut Bus, iw: u16) {
             // STOREB — addr=reg1, data=reg2 (dropped on silicon, see above)
             if !core.note_narrow_sram(s) {
                 bus.write8(s, d as u8);
+                core.gpu_bus_write(s, 1, d);
             }
         }
         46 => {
             if !core.note_narrow_sram(s) {
                 bus.write16(s, d as u16);
+                core.gpu_bus_write(s, 2, d);
             }
         }
         47 => {
@@ -423,9 +429,15 @@ pub(super) fn execute(core: &mut Risc, bus: &mut Bus, iw: u16) {
             } else {
                 // STOREP — 64-bit, big-endian: the HIGH long lands at the lower
                 // address. hidata (bits 63..32) → [A]; Rd (bits 31..0) → [A+4].
-                let hi = core.hidata_now(); // stale if still in a LOADP shadow
+                // The write goes on the bus after every earlier read has
+                // landed, so it takes the newest G_HIDATA, in flight or not
+                // ([HW] bench jobs 396-397: a load issued just before the
+                // STOREP put its latched lanes in the high long).
+                core.hidata_use();
+                let hi = core.hidata_next;
                 bus.write32(s, hi);
                 bus.write32(s.wrapping_add(4), d);
+                core.gpu_bus_write(s, 4, hi);
             }
         }
         49 => {

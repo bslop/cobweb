@@ -558,6 +558,38 @@ hazard). Observable rules:
    - non-`IMACN`/`RESMAC` after `IMULTN`/`IMACN`.
    - `LOAD`/`STORE` immediately before `MMULT`.
 
+9. **A MOVE right behind an ALU write of the same register is dropped.**
+   [HW] platform issue 0016, bench jobs 395-400, GPU and DSP alike: in
+   `add r7,r8 / move r6,r8` the register ends up holding the sum. ALU ops write
+   at cycle 3 and MOVEs at cycle 2, so the two writes meet and the ALU's wins.
+   Measured losers: `move`, `moveq`, `movefa`, `move pc` behind `add`, `sub`,
+   `addq`, `addqt`, `shlq`, `mult`, `imult`, `or` (the bug-13 guard `or rN,rN`
+   too), with or without a stall on the ALU op; a reader right after the pair
+   sees the ALU value, and the move's value never appears. Safe: `movei`, a
+   load, a `move` that reads its own destination, a different register, any
+   instruction between, and the target of a TAKEN jump. A conditional jump
+   that falls through runs its delay slot and the next instruction back to
+   back, so the rule covers them. jsim: dropped under `--fidelity silicon`,
+   counted as `alu_move_waw` under every fidelity; jas: an error.
+
+10. **G_HIDATA latches every GPU read from the main bus.** [HW] platform issue
+    0016, bench jobs 395-400. Any GPU load (`load`, `loadw`, `loadb`, indexed)
+    from outside Tom's GPU/Blitter block and GPU RAM ($F02000-$F03FFF) — DRAM,
+    the cartridge, DSP RAM, Tom's video registers, Jerry's registers — copies
+    bits 63..32 of the data bus into G_HIDATA when it lands. A read drives only
+    its own byte lanes: a long at A%8 = 0 all four, at A%8 = 4 none, a word or a
+    byte its own; the other lanes hold whatever was last on the bus, the GPU's
+    own earlier accesses or the 68000's, the OP's and the Blitter's (on silicon
+    those bytes vary from run to run). A GPU store drives all four upper lanes
+    with its data repeated (a word twice, a byte four times) but does not latch.
+    Reading G_HIDATA while the load is in flight returns the old value; STOREP
+    takes the newest one, from a load still in flight too. Loads from GPU RAM,
+    the Blitter registers and the GPU's own registers never latch; no other
+    master writes G_HIDATA. So nothing may load from the bus between a `loadp`
+    and its G_HIDATA read, or between a G_HIDATA store and its `storep`.
+    jsim: latched under `--fidelity silicon` (undriven lanes hold the GPU's
+    own last bytes), counted as `hidata_clobbers` under every fidelity.
+
 ---
 
 ## 10. Control / status register (`G_CTRL` / `D_CTRL`)

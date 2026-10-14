@@ -58,6 +58,14 @@ pub struct Strict {
     /// GameDrive needs a power cycle (platform issues 0012, 0014;
     /// `gamedrive::check_gpu_read_host`).
     pub gd_gpu: bool,
+    /// A MOVE-class write right after an ALU-class write of the same
+    /// register: silicon keeps the ALU result (platform issue 0016). The
+    /// fault's address is the register number.
+    pub alu_move: bool,
+    /// A G_HIDATA read or STOREP whose high long a GPU read outside the GPU's
+    /// own RAM and registers has replaced since the LOADP or G_HIDATA store
+    /// (platform issue 0016). The fault's address is that read's PC.
+    pub hidata: bool,
     /// Faults that are counted but do not stop the run (`--strict-exempt`):
     /// a known-safe site, such as the mailbox read-back of a GPU halt.
     pub exempt: [Option<StrictExempt>; Strict::MAX_EXEMPT],
@@ -84,9 +92,11 @@ impl Strict {
         int2: true,
         op_align: true,
         gd_gpu: true,
+        alu_move: true,
+        hidata: true,
         exempt: [None; Strict::MAX_EXEMPT],
     };
-    pub const NAMES: &'static str = "narrow,dram-stale,roundtrip,div0,int2,op-align,gd-gpu";
+    pub const NAMES: &'static str = "narrow,dram-stale,roundtrip,div0,int2,op-align,gd-gpu,alu-move,hidata";
     pub const MAX_EXEMPT: usize = 16;
 
     /// Parse a comma-separated list of `NAMES` (or `all`). Exemptions already
@@ -103,6 +113,8 @@ impl Strict {
                 "int2" => s.int2 = true,
                 "op-align" => s.op_align = true,
                 "gd-gpu" => s.gd_gpu = true,
+                "alu-move" => s.alu_move = true,
+                "hidata" => s.hidata = true,
                 other => return Err(format!("unknown strict check `{other}` (expected {})", Strict::NAMES)),
             }
         }
@@ -119,6 +131,8 @@ impl Strict {
             "int2" => &["rte_without_int2"],
             "op-align" => &["op_bitmap_misaligned"],
             "gd-gpu" => crate::gamedrive::GPU_READ_FAULTS,
+            "alu-move" => &["alu_move_waw"],
+            "hidata" => &["hidata_clobbered"],
             _ => return None,
         })
     }
