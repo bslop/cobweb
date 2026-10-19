@@ -46,6 +46,19 @@ fn main() -> ExitCode {
     if rest.iter().any(|a| a == "--audio") {
         AUDIO_ON.store(true, std::sync::atomic::Ordering::Relaxed);
     }
+    // --no-i2s: global too. The DSP's I2S interrupt never fires, so a DSP
+    // mixer never runs (platform issue 0018: picture and logic checks of a
+    // sound build ran ~3x slower once it did). Nothing to record then.
+    if rest.iter().any(|a| a == "--no-i2s") {
+        if matches!(cmd, "audio" | "audiocheck") || rest.iter().any(|a| a == "--audio") {
+            let e = "--no-i2s stops the DSP's sample interrupt, so there is no sound to record: \
+                     drop it for `audio`, `audiocheck` and --audio";
+            eprintln!("jagemu: error: {e}");
+            println!("{{\"ok\":false,\"error\":{}}}", jstr(e));
+            return ExitCode::FAILURE;
+        }
+        NO_I2S.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     // --strict / --strict=<list>: global, like --audio, so every command
     // that boots a ROM stops on the first silicon fault (see strict_arg).
     match strict_arg(rest) {
@@ -122,6 +135,14 @@ fn usage() {
          \x20                   after a load replaced it (each also warns once\n\
          \x20                   without --strict). Bare = all.\n\
          \x20                   The JSON's \"strict_fault\" names it (PC, address); exit 3\n\
+         \x20 --no-i2s           (any command that boots a ROM) never fire the DSP's I2S\n\
+         \x20                   sample interrupt, so a DSP mixer never runs and runs of a\n\
+         \x20                   sound build take as long as before cobweb 2026-10-12. Only\n\
+         \x20                   for picture, position and state checks: the DSP's bus\n\
+         \x20                   traffic, a stream ring draining, sample counters and\n\
+         \x20                   anything paced on them stop, so frame times, fields per\n\
+         \x20                   picture and any wait on the sound engine differ from\n\
+         \x20                   silicon. Not with audio, audiocheck or --audio.\n\
          \x20 --strict-exempt=[check:]pc=LO[-HI] | [check:]addr=LO[-HI]   (repeatable)\n\
          \x20                   count but do not stop on a known-safe site (hex numbers),\n\
          \x20                   e.g. --strict-exempt=roundtrip:pc=F03124\n\
@@ -328,12 +349,11 @@ static BLIT_HIST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool:
 /// is impossible to make silently; `--blit-top 0` prints the tail itself.
 static BLIT_TOP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(20);
 
-/// Set by `--audio` on `jagemu run`. The DSP's I2S interrupt is only ticked
-/// while audio capture is on (scheduler.rs), so WITHOUT this flag a
-/// `run --pc-histogram --core dsp` of a sound kernel profiles a core that is
-/// spinning on an interrupt that structurally cannot arrive — the audio path
-/// is invisible to every profiling and watch command. This makes it reachable.
+/// Set by `--audio`: record the audio output. (The DSP's I2S interrupt runs
+/// with or without it whenever SMODE drives the clock; see scheduler.rs.)
 static AUDIO_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Set by `--no-i2s`: never tick the DSP's I2S interrupt (`Bus::i2s_off`).
+static NO_I2S: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 // ☠ cycles_per_field WAS DIVIDING BY THE WHOLE RUN, BOOT INCLUDED.
 // The counter exists precisely to be the honest cost metric a step-function
@@ -399,6 +419,7 @@ fn strict_arg(args: &[String]) -> Result<jag_core::Strict, String> {
 fn new_machine() -> Jaguar {
     let mut jag = Jaguar::new();
     jag.set_strict(STRICT.get().copied().unwrap_or_default());
+    jag.bus.i2s_off = NO_I2S.load(std::sync::atomic::Ordering::Relaxed);
     jag
 }
 

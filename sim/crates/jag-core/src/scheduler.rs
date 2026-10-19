@@ -189,8 +189,9 @@ impl Scheduler {
         // clock (SMODE bit 0, internal), listened to or not. Gating it on
         // capture froze every DSP mixer under run/screenshot/dump/peek
         // without --audio: lib/jag's stream ring never drained and its sample
-        // counter stayed 0 (platform bench gdwrite, issue 0015).
-        if bus.audio_capture || bus.jerry.win.r32(mem::SMODE) & 1 != 0 {
+        // counter stayed 0 (platform bench gdwrite, issue 0015). `i2s_off`
+        // (jagemu --no-i2s) turns it off for runs that don't test sound.
+        if !bus.i2s_off && (bus.audio_capture || bus.jerry.win.r32(mem::SMODE) & 1 != 0) {
             self.tick_audio(risc_ticks, dsp, bus);
         }
 
@@ -417,6 +418,24 @@ mod tests {
         }
         assert_ne!(dsp.int_latch & (1 << mem::DSP_INT_I2S), 0, "the DSP's I2S interrupt");
         assert!(bus.audio.is_empty(), "nothing captured without capture on");
+    }
+
+    /// `i2s_off` (jagemu --no-i2s, platform issue 0018) keeps the interrupt
+    /// off even with SMODE driving the clock.
+    #[test]
+    fn i2s_off_never_ticks_the_interrupt() {
+        let mut bus = Bus::new();
+        let mut sched = Scheduler::ntsc();
+        let mut cpu = M68k::new();
+        let mut gpu = Risc::new(RiscKind::Gpu);
+        let mut dsp = Risc::new(RiscKind::Dsp);
+        bus.i2s_off = true;
+        bus.jerry.win.w32(mem::SMODE, 0x15);
+        bus.jerry.win.w32(mem::SCLK, 26);
+        for _ in 0..200 {
+            sched.advance(100, &mut cpu, &mut gpu, &mut dsp, &mut bus);
+        }
+        assert_eq!(dsp.int_latch & (1 << mem::DSP_INT_I2S), 0, "--no-i2s: no interrupt");
     }
 
     /// Encode a JRISC instruction word: opcode[15:10] reg1[9:5] reg2[4:0].

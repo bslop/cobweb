@@ -430,6 +430,10 @@ pub struct Bus {
     /// Captured stereo audio (interleaved L,R 16-bit) when `audio_capture` is on.
     pub audio: Vec<i16>,
     pub audio_capture: bool,
+    /// Never tick the DSP's I2S interrupt (`jagemu --no-i2s`): a DSP mixer
+    /// then never runs, as before platform issue 0015. For checks that do
+    /// not test sound or timing (platform issue 0018).
+    pub i2s_off: bool,
     /// Sample rate of the captured audio (Hz), for the WAV header.
     pub audio_rate: u32,
     /// Write-watchpoint ranges `[lo, hi]` (inclusive). When non-empty, every
@@ -590,6 +594,7 @@ impl Bus {
             strict_fault: None,
             audio: Vec::new(),
             audio_capture: false,
+            i2s_off: false,
             audio_rate: 44_100,
             watches: Vec::new(),
             watch_log: Vec::new(),

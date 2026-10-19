@@ -6,6 +6,16 @@ assigned at release.
 
 ## Unreleased
 
+### 2026-10-19 — jagemu: `--no-i2s`, a run without the DSP's sample interrupt (platform issue 0018)
+
+- Since 2026-10-12 the DSP's I2S interrupt fires whenever SMODE drives the clock, as on
+  silicon, so a DSP mixer runs in every command. For picture, position and state checks of
+  a sound build that costs time. `--no-i2s` (any command that boots a ROM) never fires the
+  interrupt, as before 2026-10-12 outside `--audio`.
+- What it changes, stated in the help: no DSP bus traffic from the mixer, no draining
+  stream ring, no sample counter, so frame times, fields per picture and any wait on the
+  sound engine differ from silicon. It refuses `audio`, `audiocheck` and `--audio`.
+
 ### 2026-10-19 — jsim: the 2026-10-14 MOVE-after-ALU check no longer re-reads every instruction
 
 - The check added for platform issue 0016 read each instruction word a second time
