@@ -105,9 +105,13 @@ pub struct Risc {
     /// The instruction just executed latched G_HIDATA: the timed step sets
     /// `hidata_ready` to when its load lands.
     hidata_latched: bool,
-    /// The register (bank * 32 + n) the previous instruction wrote, if it was
-    /// an ALU-class op; see `Stats::alu_move_waw`.
-    last_alu_write: Option<u8>,
+    /// The register (bank * 32 + n) the previous instruction wrote and the
+    /// value it left there, if it was an ALU-class op; see
+    /// `Stats::alu_move_waw`.
+    last_alu_write: Option<(u8, u32)>,
+    /// The instruction word the step being executed fetched (both paths set
+    /// it), so the step can be classified without reading memory again.
+    step_iw: u16,
     pub modulo: u32,      // D_MOD for ADDQMOD/SUBQMOD (DSP)
     pub mac: i64,         // MAC accumulator (40-bit on DSP, modeled as i64)
     /// IMULTN/IMACN read their operand REGISTERS one cycle after issue on
@@ -295,6 +299,7 @@ impl Risc {
             hidata_dirty_pc: 0,
             hidata_latched: false,
             last_alu_write: None,
+            step_iw: 0,
             modulo: 0,
             mac: 0,
             mac_pending: None,
@@ -1003,17 +1008,10 @@ impl Risc {
         // attribute every stalled tick to the instruction that paid for it.
         let pc0 = self.pc;
         let stats0 = self.prof.as_ref().map(|_| self.pipe.stats.clone());
-        // A MOVE-class write right behind an ALU-class write of the same
-        // register is dropped on silicon (`Stats::alu_move_waw`). Peeked
-        // here, before either path fetches: code lives in RAM.
-        let iw = bus.read16(pc0);
-        let (op, r1, r2) = (((iw >> 10) & 0x3F) as u8, ((iw >> 5) & 0x1F) as usize, (iw & 0x1F) as usize);
         let bank = self.cur_bank();
-        let dst = (bank * 32 + r2) as u8;
-        let mover = matches!(op, 35 | 37 | 51) || (op == 34 && r1 != r2);
-        let alu_kept = (mover && self.last_alu_write == Some(dst)).then(|| self.regs[bank][r2]);
         let mut cost = if self.fidelity == Fidelity::Functional {
             let iw = self.fetch16(bus);
+            self.step_iw = iw;
             let op = ((iw >> 10) & 0x3F) as u8;
             self.prev_was_jump = matches!(op, 52 | 53);
             self.park_touched_mem |= Self::is_mem_op(op);
@@ -1023,20 +1021,30 @@ impl Risc {
             self.step_timed(bus, in_slot)
         };
         self.hidata_latched = false;
-        if let Some(kept) = alu_kept {
-            let st = &mut self.pipe.stats;
-            if st.alu_move_waw == 0 {
-                st.alu_move_waw_first_pc = pc0;
-            }
-            st.alu_move_waw += 1;
-            if self.fidelity == Fidelity::Silicon {
-                self.regs[bank][r2] = kept;
-            }
-            if self.strict.alu_move {
-                self.strict_trip_at("alu_move_waw", pc0, r2 as u32);
+        // A MOVE-class write right behind an ALU-class write of the same
+        // register is dropped on silicon (`Stats::alu_move_waw`): put the ALU
+        // result back.
+        let iw = self.step_iw;
+        let (op, r1, r2) = (((iw >> 10) & 0x3F) as u8, ((iw >> 5) & 0x1F) as usize, (iw & 0x1F) as usize);
+        let dst = (bank * 32 + r2) as u8;
+        if let Some((reg, kept)) = self.last_alu_write.take() {
+            if reg == dst && (matches!(op, 35 | 37 | 51) || (op == 34 && r1 != r2)) {
+                let st = &mut self.pipe.stats;
+                if st.alu_move_waw == 0 {
+                    st.alu_move_waw_first_pc = pc0;
+                }
+                st.alu_move_waw += 1;
+                if self.fidelity == Fidelity::Silicon {
+                    self.regs[bank][r2] = kept;
+                }
+                if self.strict.alu_move {
+                    self.strict_trip_at("alu_move_waw", pc0, r2 as u32);
+                }
             }
         }
-        self.last_alu_write = Self::alu_writer(op, self.kind.is_dsp()).then_some(dst);
+        if Self::alu_writer(op, self.kind.is_dsp()) {
+            self.last_alu_write = Some((dst, self.regs[bank][r2]));
+        }
         self.instret += 1;
         if self.regpage_settle > 0 {
             self.regpage_settle -= 1;
@@ -1278,6 +1286,7 @@ impl Risc {
 
         let iw2 = self.fetch16(bus);
         debug_assert_eq!(iw, iw2);
+        self.step_iw = iw2;
         isa::execute(self, bus, iw2);
 
         if let Some((reg, saved)) = stale_subst {

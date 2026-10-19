@@ -6,6 +6,15 @@ assigned at release.
 
 ## Unreleased
 
+### 2026-10-19 — jsim: the 2026-10-14 MOVE-after-ALU check no longer re-reads every instruction
+
+- The check added for platform issue 0016 read each instruction word a second time
+  through the bus before executing it. That made every RISC instruction slower (a DSP
+  mixer build ran 22-42% longer than under 2026-10-12), and for GPU or DSP code running
+  from DRAM it counted a 68000 bus cycle per instruction. The check now uses the word
+  the step itself fetched; results are unchanged (the `bench/gpuhaz` probe gives the same
+  110 values).
+
 ### 2026-10-14 — jsim, jas, jcc: a MOVE lost behind an ALU write; G_HIDATA latches every bus read (platform issue 0016)
 
 Measured on the bench (jobs 395-400, `calib/results/2026-10-14-gpuhaz.md`). jsim ran both
